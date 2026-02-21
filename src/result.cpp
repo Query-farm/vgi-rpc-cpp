@@ -39,14 +39,11 @@ Result Result::void_result() {
     return Result(std::move(ab));
 }
 
-Result Result::error(std::shared_ptr<arrow::Schema> schema,
-                     const std::string& exception_type,
-                     const std::string& message,
-                     const std::string& server_id,
-                     const std::string& request_id) {
-    auto batch = make_empty_batch(schema);
-
-    // Build error metadata
+std::shared_ptr<arrow::KeyValueMetadata> make_error_metadata(
+    const std::string& exception_type,
+    const std::string& message,
+    const std::string& server_id,
+    const std::string& request_id) {
     auto md = std::make_shared<arrow::KeyValueMetadata>();
     md->Append(keys::LOG_LEVEL, log_level_to_string(LogLevel::EXCEPTION));
     md->Append(keys::LOG_MESSAGE, message);
@@ -62,10 +59,17 @@ Result Result::error(std::shared_ptr<arrow::Schema> schema,
     if (!request_id.empty()) {
         md->Append(keys::REQUEST_ID, request_id);
     }
+    return md;
+}
 
+Result Result::error(std::shared_ptr<arrow::Schema> schema,
+                     const std::string& exception_type,
+                     const std::string& message,
+                     const std::string& server_id,
+                     const std::string& request_id) {
     AnnotatedBatch ab;
-    ab.batch = std::move(batch);
-    ab.custom_metadata = std::move(md);
+    ab.batch = make_empty_batch(schema);
+    ab.custom_metadata = make_error_metadata(exception_type, message, server_id, request_id);
     return Result(std::move(ab));
 }
 

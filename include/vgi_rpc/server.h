@@ -77,6 +77,9 @@ public:
         const std::string& doc = "",
         std::shared_ptr<arrow::Schema> header_schema = nullptr);
 
+    // Set a deterministic server ID (defaults to random_hex(12) if not set).
+    ServerBuilder& server_id(std::string id);
+
     // Enable __describe__ introspection.
     // The describe response is a snapshot captured at build() time.
     ServerBuilder& enable_describe(const std::string& protocol_name = "");
@@ -91,6 +94,7 @@ private:
     bool describe_enabled_ = false;
     bool built_ = false;
     std::string protocol_name_;
+    std::string server_id_;
 };
 
 // NOT thread-safe.  Designed for single-threaded pipe-based operation

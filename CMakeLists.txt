@@ -45,7 +45,6 @@ target_link_libraries(vgi_rpc PUBLIC
 )
 
 add_subdirectory(examples)
-add_subdirectory(conformance)
 
 # ── Install & Package Config ───────────────────────────────────────────
 include(GNUInstallDirs)
@@ -87,11 +86,20 @@ install(FILES
     DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/vgi_rpc
 )
 
+configure_file(cmake/vgi_rpc.pc.in vgi_rpc.pc @ONLY)
+install(FILES "${CMAKE_CURRENT_BINARY_DIR}/vgi_rpc.pc"
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig
+)
+
+# ── Benchmarks (opt-in) ───────────────────────────────────────────────
+option(VGI_RPC_BUILD_BENCHMARKS "Build vgi_rpc benchmarks" OFF)
+
 # ── Tests (opt-in) ────────────────────────────────────────────────────
 option(VGI_RPC_BUILD_TESTS "Build vgi_rpc unit tests" OFF)
 if(VGI_RPC_BUILD_TESTS)
     enable_testing()
     add_subdirectory(tests)
+    add_subdirectory(conformance)
 
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if(Python3_FOUND)

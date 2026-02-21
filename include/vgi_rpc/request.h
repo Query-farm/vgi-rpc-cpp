@@ -1,3 +1,7 @@
+/// Typed read-only view over an incoming RPC request batch.
+/// Wraps a single-row Arrow RecordBatch and its custom metadata, providing
+/// get<T>(name) / get_optional<T>(name) for extracting typed parameters by
+/// column name. Throws on type mismatch or missing required parameters.
 #pragma once
 
 #include <cstdint>
@@ -68,5 +72,10 @@ template <> std::optional<int32_t> Request::get_optional<int32_t>(std::string_vi
 template <> std::optional<bool> Request::get_optional<bool>(std::string_view name) const;
 template <> std::optional<std::string> Request::get_optional<std::string>(std::string_view name) const;
 template <> std::optional<std::vector<uint8_t>> Request::get_optional<std::vector<uint8_t>>(std::string_view name) const;
+
+// Optional list type specializations
+template <> std::optional<std::vector<std::string>> Request::get_optional<std::vector<std::string>>(std::string_view name) const;
+template <> std::optional<std::vector<int64_t>> Request::get_optional<std::vector<int64_t>>(std::string_view name) const;
+template <> std::optional<std::vector<double>> Request::get_optional<std::vector<double>>(std::string_view name) const;
 
 }  // namespace vgi_rpc

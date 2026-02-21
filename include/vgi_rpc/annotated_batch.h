@@ -1,3 +1,7 @@
+/// A RecordBatch paired with optional per-batch custom metadata.
+/// AnnotatedBatch is the primary unit passed through the IPC wire protocol —
+/// use the static factories data() and with_metadata() to construct, and
+/// type() to classify a received batch (DATA, LOG, ERROR, etc.).
 #pragma once
 
 #include <memory>

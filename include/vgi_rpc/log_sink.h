@@ -1,3 +1,6 @@
+/// Buffered collector for log messages emitted during request handling.
+/// Messages are accumulated via emit() and flushed as AnnotatedBatch vectors
+/// (zero-row batches with log metadata) to be sent ahead of the result.
 #pragma once
 
 #include <memory>

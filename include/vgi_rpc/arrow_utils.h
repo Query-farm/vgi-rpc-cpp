@@ -1,3 +1,6 @@
+/// Helpers for converting Apache Arrow error types to C++ exceptions.
+/// unwrap() extracts a value from arrow::Result<T> or throws on failure.
+/// VGI_RPC_THROW_NOT_OK() checks an arrow::Status and throws std::runtime_error.
 #pragma once
 
 #include <stdexcept>

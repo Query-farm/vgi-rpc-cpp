@@ -290,6 +290,89 @@ TEST_CASE("ServerBuilder: duplicate method name throws", "[server]") {
         std::logic_error);
 }
 
+// ── ServerBuilder::server_id() Test ──────────────────────────────────
+
+TEST_CASE("ServerBuilder: custom server_id is used", "[server]") {
+    ServerBuilder builder;
+    builder.server_id("my-test-id");
+    builder.add_void("test", empty_schema(),
+        [](const Request&, CallContext&) {});
+    auto server = builder.build();
+    REQUIRE(server->server_id() == "my-test-id");
+}
+
+TEST_CASE("ServerBuilder: default server_id is random", "[server]") {
+    ServerBuilder builder;
+    builder.add_void("test", empty_schema(),
+        [](const Request&, CallContext&) {});
+    auto server = builder.build();
+    REQUIRE_FALSE(server->server_id().empty());
+}
+
+// ── Null Schema Validation Tests ─────────────────────────────────────
+
+TEST_CASE("ServerBuilder: null params_schema in add_unary throws", "[server]") {
+    ServerBuilder builder;
+    REQUIRE_THROWS_AS(
+        builder.add_unary("bad", nullptr, empty_schema(),
+            [](const Request&, CallContext&) -> Result {
+                return Result::void_result();
+            }),
+        std::invalid_argument);
+}
+
+TEST_CASE("ServerBuilder: null result_schema in add_unary throws", "[server]") {
+    ServerBuilder builder;
+    REQUIRE_THROWS_AS(
+        builder.add_unary("bad", empty_schema(), nullptr,
+            [](const Request&, CallContext&) -> Result {
+                return Result::void_result();
+            }),
+        std::invalid_argument);
+}
+
+TEST_CASE("ServerBuilder: null params_schema in add_void throws", "[server]") {
+    ServerBuilder builder;
+    REQUIRE_THROWS_AS(
+        builder.add_void("bad", nullptr,
+            [](const Request&, CallContext&) {}),
+        std::invalid_argument);
+}
+
+TEST_CASE("ServerBuilder: null params_schema in add_producer throws", "[server]") {
+    auto schema = arrow::schema({arrow::field("x", arrow::int32())});
+    ServerBuilder builder;
+    REQUIRE_THROWS_AS(
+        builder.add_producer("bad", nullptr, schema,
+            [](const Request&, CallContext&) -> Stream { return {}; }),
+        std::invalid_argument);
+}
+
+TEST_CASE("ServerBuilder: null output_schema in add_producer throws", "[server]") {
+    ServerBuilder builder;
+    REQUIRE_THROWS_AS(
+        builder.add_producer("bad", empty_schema(), nullptr,
+            [](const Request&, CallContext&) -> Stream { return {}; }),
+        std::invalid_argument);
+}
+
+TEST_CASE("ServerBuilder: null schemas in add_exchange throw", "[server]") {
+    auto schema = arrow::schema({arrow::field("x", arrow::int32())});
+    ServerBuilder builder;
+    REQUIRE_THROWS_AS(
+        builder.add_exchange("bad", nullptr, schema, schema,
+            [](const Request&, CallContext&) -> Stream { return {}; }),
+        std::invalid_argument);
+    REQUIRE_THROWS_AS(
+        builder.add_exchange("bad", schema, nullptr, schema,
+            [](const Request&, CallContext&) -> Stream { return {}; }),
+        std::invalid_argument);
+    REQUIRE_THROWS_AS(
+        builder.add_exchange("bad", schema, schema, nullptr,
+            [](const Request&, CallContext&) -> Stream { return {}; }),
+        std::invalid_argument);
+}
+
 // ── Describe Introspection Tests ─────────────────────────────────────
 
 TEST_CASE("describe: lists registered methods", "[server][describe]") {

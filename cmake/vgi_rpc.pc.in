@@ -1,0 +1,10 @@
+prefix=@CMAKE_INSTALL_PREFIX@
+libdir=${prefix}/@CMAKE_INSTALL_LIBDIR@
+includedir=${prefix}/@CMAKE_INSTALL_INCLUDEDIR@
+
+Name: vgi_rpc
+Description: C++20 RPC framework built on Apache Arrow IPC
+Version: @PROJECT_VERSION@
+Requires: arrow
+Libs: -L${libdir} -lvgi_rpc
+Cflags: -I${includedir}

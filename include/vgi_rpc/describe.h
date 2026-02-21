@@ -1,3 +1,6 @@
+/// Introspection support for the __describe__ built-in method.
+/// register_describe() adds a handler that returns method schemas, types,
+/// and documentation for all registered methods on the server.
 #pragma once
 
 #include <string>

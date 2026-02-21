@@ -5,8 +5,6 @@
 #include "vgi_rpc/log_sink.h"
 #include "vgi_rpc/output_collector.h"
 
-#include <nlohmann/json.hpp>
-
 #include <arrow/array.h>
 #include <arrow/io/stdio.h>
 #include <arrow/ipc/reader.h>
@@ -16,6 +14,7 @@
 #include <arrow/util/key_value_metadata.h>
 
 #include <algorithm>
+#include <cstdio>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -33,15 +32,7 @@ void write_stream_error(
     const std::string& server_id,
     const std::string& request_id) {
     auto error_batch = make_empty_batch(schema);
-    auto md = std::make_shared<arrow::KeyValueMetadata>();
-    md->Append(keys::LOG_LEVEL, log_level_to_string(LogLevel::EXCEPTION));
-    md->Append(keys::LOG_MESSAGE, message);
-    nlohmann::json extra;
-    extra["exception_type"] = exception_type;
-    extra["exception_message"] = message;
-    md->Append(keys::LOG_EXTRA, extra.dump());
-    if (!server_id.empty()) md->Append(keys::SERVER_ID, server_id);
-    if (!request_id.empty()) md->Append(keys::REQUEST_ID, request_id);
+    auto md = make_error_metadata(exception_type, message, server_id, request_id);
     VGI_RPC_THROW_NOT_OK(writer->WriteRecordBatch(*error_batch, md));
 }
 
@@ -205,7 +196,11 @@ void Server::serve_stream(const MethodInfo& method_info,
         // The client sends an IPC stream (ticks for producer, data for exchange)
         // even after reading the error. We must consume it so the pipe stays clean
         // for the next request.
-        try { read_ipc_stream(input); } catch (...) {}
+        try {
+            read_ipc_stream(input);
+        } catch (const std::exception& e) {
+            fprintf(stderr, "vgi_rpc: warning: error draining input after factory error: %s\n", e.what());
+        } catch (...) {}
     };
 
     try {
@@ -342,6 +337,8 @@ void Server::serve_stream(const MethodInfo& method_info,
     try {
         VGI_RPC_THROW_NOT_OK(output_writer->Close());
         VGI_RPC_THROW_NOT_OK(output->Flush());
+    } catch (const std::exception& e) {
+        fprintf(stderr, "vgi_rpc: warning: error closing stream writer: %s\n", e.what());
     } catch (...) {}
 
     // Drain remaining input

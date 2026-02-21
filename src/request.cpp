@@ -134,13 +134,14 @@ std::optional<std::vector<uint8_t>> get_optional_binary(
     throw std::runtime_error("Type mismatch for bytes parameter: " + std::string(name));
 }
 
-// Generic list extraction: ListArray → vector<T>
-template <typename ValueArrayType, typename T>
-std::vector<T> get_list_values(const std::shared_ptr<arrow::Array>& col,
-                               std::string_view name,
-                               const char* expected_type) {
-    auto list_arr = std::dynamic_pointer_cast<arrow::ListArray>(col);
-    if (!list_arr) throw std::runtime_error("Type mismatch: expected list for parameter: " + std::string(name));
+// Generic list extraction helper: extracts vector<T> from a typed list array.
+template <typename ListArrayType, typename ValueArrayType, typename T>
+bool try_get_list_values(const std::shared_ptr<arrow::Array>& col,
+                         std::string_view name,
+                         const char* expected_type,
+                         std::vector<T>& out) {
+    auto list_arr = std::dynamic_pointer_cast<ListArrayType>(col);
+    if (!list_arr) return false;
     if (list_arr->IsNull(0)) throw std::runtime_error("Parameter is null: " + std::string(name));
 
     auto values = std::dynamic_pointer_cast<ValueArrayType>(list_arr->values());
@@ -149,32 +150,124 @@ std::vector<T> get_list_values(const std::shared_ptr<arrow::Array>& col,
 
     auto start = list_arr->value_offset(0);
     auto end = list_arr->value_offset(1);
-    std::vector<T> result;
-    result.reserve(end - start);
+    out.reserve(end - start);
     for (auto i = start; i < end; ++i) {
-        result.push_back(values->Value(i));
+        out.push_back(values->Value(i));
     }
-    return result;
+    return true;
 }
 
-// Specialization for string lists (uses GetString instead of Value)
-std::vector<std::string> get_string_list_values(
-    const std::shared_ptr<arrow::Array>& col, std::string_view name) {
-    auto list_arr = std::dynamic_pointer_cast<arrow::ListArray>(col);
-    if (!list_arr) throw std::runtime_error("Type mismatch: expected list for parameter: " + std::string(name));
-    if (list_arr->IsNull(0)) throw std::runtime_error("Parameter is null: " + std::string(name));
+// Try ListArray then LargeListArray → vector<T>
+template <typename ValueArrayType, typename T>
+std::vector<T> get_list_values(const std::shared_ptr<arrow::Array>& col,
+                               std::string_view name,
+                               const char* expected_type) {
+    std::vector<T> result;
+    if (try_get_list_values<arrow::ListArray, ValueArrayType, T>(col, name, expected_type, result))
+        return result;
+    if (try_get_list_values<arrow::LargeListArray, ValueArrayType, T>(col, name, expected_type, result))
+        return result;
+    throw std::runtime_error("Type mismatch: expected list for parameter: " + std::string(name));
+}
 
-    auto values = std::dynamic_pointer_cast<arrow::StringArray>(list_arr->values());
-    if (!values) throw std::runtime_error("Type mismatch: expected list<string> for parameter: " + std::string(name));
+// String list extraction helper: extracts vector<string> from a typed list array.
+// Tries both StringArray and LargeStringArray for child values.
+template <typename ListArrayType>
+bool try_get_string_list_values(const std::shared_ptr<arrow::Array>& col,
+                                std::string_view name,
+                                std::vector<std::string>& out) {
+    auto list_arr = std::dynamic_pointer_cast<ListArrayType>(col);
+    if (!list_arr) return false;
+    if (list_arr->IsNull(0)) throw std::runtime_error("Parameter is null: " + std::string(name));
 
     auto start = list_arr->value_offset(0);
     auto end = list_arr->value_offset(1);
-    std::vector<std::string> result;
-    result.reserve(end - start);
-    for (auto i = start; i < end; ++i) {
-        result.push_back(values->GetString(i));
+
+    if (auto values = std::dynamic_pointer_cast<arrow::StringArray>(list_arr->values())) {
+        out.reserve(end - start);
+        for (auto i = start; i < end; ++i) out.push_back(values->GetString(i));
+        return true;
     }
-    return result;
+    if (auto values = std::dynamic_pointer_cast<arrow::LargeStringArray>(list_arr->values())) {
+        out.reserve(end - start);
+        for (auto i = start; i < end; ++i) out.push_back(values->GetString(i));
+        return true;
+    }
+    throw std::runtime_error("Type mismatch: expected list<string> for parameter: " + std::string(name));
+}
+
+// Try ListArray then LargeListArray for string lists
+std::vector<std::string> get_string_list_values(
+    const std::shared_ptr<arrow::Array>& col, std::string_view name) {
+    std::vector<std::string> result;
+    if (try_get_string_list_values<arrow::ListArray>(col, name, result))
+        return result;
+    if (try_get_string_list_values<arrow::LargeListArray>(col, name, result))
+        return result;
+    throw std::runtime_error("Type mismatch: expected list for parameter: " + std::string(name));
+}
+
+// Optional list extraction: returns nullopt on null instead of throwing.
+template <typename ValueArrayType, typename T>
+std::optional<std::vector<T>> get_optional_list_values(
+    const std::shared_ptr<arrow::Array>& col, std::string_view name,
+    const char* expected_type) {
+    // Try ListArray
+    if (auto list_arr = std::dynamic_pointer_cast<arrow::ListArray>(col)) {
+        if (list_arr->IsNull(0)) return std::nullopt;
+        auto values = std::dynamic_pointer_cast<ValueArrayType>(list_arr->values());
+        if (!values) throw std::runtime_error(
+            std::string("Type mismatch: expected list<") + expected_type + "> for parameter: " + std::string(name));
+        auto start = list_arr->value_offset(0);
+        auto end = list_arr->value_offset(1);
+        std::vector<T> result;
+        result.reserve(end - start);
+        for (auto i = start; i < end; ++i) result.push_back(values->Value(i));
+        return result;
+    }
+    // Try LargeListArray
+    if (auto list_arr = std::dynamic_pointer_cast<arrow::LargeListArray>(col)) {
+        if (list_arr->IsNull(0)) return std::nullopt;
+        auto values = std::dynamic_pointer_cast<ValueArrayType>(list_arr->values());
+        if (!values) throw std::runtime_error(
+            std::string("Type mismatch: expected list<") + expected_type + "> for parameter: " + std::string(name));
+        auto start = list_arr->value_offset(0);
+        auto end = list_arr->value_offset(1);
+        std::vector<T> result;
+        result.reserve(end - start);
+        for (auto i = start; i < end; ++i) result.push_back(values->Value(i));
+        return result;
+    }
+    throw std::runtime_error("Type mismatch: expected list for parameter: " + std::string(name));
+}
+
+// Optional string list extraction: returns nullopt on null.
+std::optional<std::vector<std::string>> get_optional_string_list_values(
+    const std::shared_ptr<arrow::Array>& col, std::string_view name) {
+    auto extract = [&](auto list_arr) -> std::optional<std::vector<std::string>> {
+        if (list_arr->IsNull(0)) return std::nullopt;
+        auto start = list_arr->value_offset(0);
+        auto end = list_arr->value_offset(1);
+        if (auto values = std::dynamic_pointer_cast<arrow::StringArray>(list_arr->values())) {
+            std::vector<std::string> result;
+            result.reserve(end - start);
+            for (auto i = start; i < end; ++i) result.push_back(values->GetString(i));
+            return result;
+        }
+        if (auto values = std::dynamic_pointer_cast<arrow::LargeStringArray>(list_arr->values())) {
+            std::vector<std::string> result;
+            result.reserve(end - start);
+            for (auto i = start; i < end; ++i) result.push_back(values->GetString(i));
+            return result;
+        }
+        throw std::runtime_error("Type mismatch: expected list<string> for parameter: " + std::string(name));
+    };
+
+    if (auto list_arr = std::dynamic_pointer_cast<arrow::ListArray>(col))
+        return extract(list_arr);
+    if (auto list_arr = std::dynamic_pointer_cast<arrow::LargeListArray>(col))
+        return extract(list_arr);
+    throw std::runtime_error("Type mismatch: expected list for parameter: " + std::string(name));
 }
 
 }  // anonymous namespace
@@ -280,6 +373,34 @@ std::optional<std::vector<uint8_t>> Request::get_optional<std::vector<uint8_t>>(
     auto col = batch_->GetColumnByName(std::string(name));
     if (!col || col->length() == 0) return std::nullopt;
     return get_optional_binary(col, name);
+}
+
+// =========================================================================
+// get_optional<T>() — list types
+// =========================================================================
+
+template <>
+std::optional<std::vector<std::string>>
+Request::get_optional<std::vector<std::string>>(std::string_view name) const {
+    auto col = batch_->GetColumnByName(std::string(name));
+    if (!col || col->length() == 0) return std::nullopt;
+    return get_optional_string_list_values(col, name);
+}
+
+template <>
+std::optional<std::vector<int64_t>>
+Request::get_optional<std::vector<int64_t>>(std::string_view name) const {
+    auto col = batch_->GetColumnByName(std::string(name));
+    if (!col || col->length() == 0) return std::nullopt;
+    return get_optional_list_values<arrow::Int64Array, int64_t>(col, name, "int64");
+}
+
+template <>
+std::optional<std::vector<double>>
+Request::get_optional<std::vector<double>>(std::string_view name) const {
+    auto col = batch_->GetColumnByName(std::string(name));
+    if (!col || col->length() == 0) return std::nullopt;
+    return get_optional_list_values<arrow::DoubleArray, double>(col, name, "double");
 }
 
 }  // namespace vgi_rpc

@@ -1,3 +1,6 @@
+/// Log severity levels and the Message struct for client-visible logging.
+/// Levels range from TRACE to EXCEPTION; EXCEPTION signals an error response.
+/// Use log_level_to_string/log_level_from_string for wire-format conversion.
 #pragma once
 
 #include <string>

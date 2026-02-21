@@ -86,23 +86,8 @@ std::optional<IpcStreamContents> read_ipc_stream(
     contents.schema = reader->schema();
 
     while (true) {
-        // Use ReadNext() which returns Result<RecordBatchWithMetadata>
         auto result = reader->ReadNext();
         if (!result.ok()) {
-            // If ReadNext with metadata is not implemented, fall back
-            if (result.status().IsNotImplemented()) {
-                std::shared_ptr<arrow::RecordBatch> batch;
-                auto status = reader->ReadNext(&batch);
-                if (!status.ok()) {
-                    throw std::runtime_error("Error reading IPC batch: " + status.ToString());
-                }
-                if (!batch) break;
-                AnnotatedBatch ab;
-                ab.batch = batch;
-                ab.custom_metadata = nullptr;
-                contents.batches.push_back(std::move(ab));
-                continue;
-            }
             throw std::runtime_error("Error reading IPC batch: " +
                                      result.status().ToString());
         }

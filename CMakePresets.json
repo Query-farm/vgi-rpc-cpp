@@ -18,7 +18,8 @@
       "displayName": "Release",
       "inherits": "default",
       "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "Release"
+        "CMAKE_BUILD_TYPE": "Release",
+        "VGI_RPC_BUILD_TESTS": "OFF"
       }
     },
     {

@@ -1,3 +1,6 @@
+/// Constructs RPC response batches returned from unary method handlers.
+/// Use Result::value() to return data, Result::void_result() for void methods,
+/// and Result::error() to signal an exception to the client.
 #pragma once
 
 #include <memory>
@@ -7,11 +10,20 @@
 #include <arrow/array.h>
 #include <arrow/record_batch.h>
 #include <arrow/type.h>
+#include <arrow/util/key_value_metadata.h>
 
 #include "vgi_rpc/annotated_batch.h"
 #include "vgi_rpc/export.h"
 
 namespace vgi_rpc {
+
+// Build the standard error metadata used for both unary error results
+// and mid-stream error batches.
+VGI_RPC_EXPORT std::shared_ptr<arrow::KeyValueMetadata> make_error_metadata(
+    const std::string& exception_type,
+    const std::string& message,
+    const std::string& server_id = "",
+    const std::string& request_id = "");
 
 class VGI_RPC_EXPORT Result {
 public:

@@ -214,6 +214,168 @@ TEST_CASE("get<vector<double>> from list column", "[request]") {
     REQUIRE(result == std::vector<double>{1.5, 2.5});
 }
 
+// ── LargeListArray support ───────────────────────────────────────────
+
+TEST_CASE("get<vector<string>> from large_list column", "[request]") {
+    auto list_type = arrow::large_list(arrow::utf8());
+    arrow::LargeListBuilder list_builder(arrow::default_memory_pool(),
+                                         std::make_shared<arrow::StringBuilder>());
+    auto& value_builder = dynamic_cast<arrow::StringBuilder&>(*list_builder.value_builder());
+
+    REQUIRE(list_builder.Append().ok());
+    REQUIRE(value_builder.Append("x").ok());
+    REQUIRE(value_builder.Append("y").ok());
+    auto arr = *list_builder.Finish();
+
+    auto schema = arrow::schema({arrow::field("tags", list_type)});
+    auto batch = arrow::RecordBatch::Make(schema, 1, {arr});
+    auto md = std::make_shared<arrow::KeyValueMetadata>();
+    md->Append(keys::METHOD, "test");
+    md->Append(keys::REQUEST_VERSION, "1");
+    Request req(batch, md);
+
+    auto result = req.get<std::vector<std::string>>("tags");
+    REQUIRE(result == std::vector<std::string>{"x", "y"});
+}
+
+TEST_CASE("get<vector<int64_t>> from large_list column", "[request]") {
+    auto list_type = arrow::large_list(arrow::int64());
+    arrow::LargeListBuilder list_builder(arrow::default_memory_pool(),
+                                         std::make_shared<arrow::Int64Builder>());
+    auto& value_builder = dynamic_cast<arrow::Int64Builder&>(*list_builder.value_builder());
+
+    REQUIRE(list_builder.Append().ok());
+    REQUIRE(value_builder.Append(100).ok());
+    REQUIRE(value_builder.Append(200).ok());
+    auto arr = *list_builder.Finish();
+
+    auto schema = arrow::schema({arrow::field("nums", list_type)});
+    auto batch = arrow::RecordBatch::Make(schema, 1, {arr});
+    auto md = std::make_shared<arrow::KeyValueMetadata>();
+    md->Append(keys::METHOD, "test");
+    md->Append(keys::REQUEST_VERSION, "1");
+    Request req(batch, md);
+
+    auto result = req.get<std::vector<int64_t>>("nums");
+    REQUIRE(result == std::vector<int64_t>{100, 200});
+}
+
+TEST_CASE("get<vector<double>> from large_list column", "[request]") {
+    auto list_type = arrow::large_list(arrow::float64());
+    arrow::LargeListBuilder list_builder(arrow::default_memory_pool(),
+                                         std::make_shared<arrow::DoubleBuilder>());
+    auto& value_builder = dynamic_cast<arrow::DoubleBuilder&>(*list_builder.value_builder());
+
+    REQUIRE(list_builder.Append().ok());
+    REQUIRE(value_builder.Append(9.5).ok());
+    auto arr = *list_builder.Finish();
+
+    auto schema = arrow::schema({arrow::field("vals", list_type)});
+    auto batch = arrow::RecordBatch::Make(schema, 1, {arr});
+    auto md = std::make_shared<arrow::KeyValueMetadata>();
+    md->Append(keys::METHOD, "test");
+    md->Append(keys::REQUEST_VERSION, "1");
+    Request req(batch, md);
+
+    auto result = req.get<std::vector<double>>("vals");
+    REQUIRE(result == std::vector<double>{9.5});
+}
+
+// ── get_optional<vector<T>> ─────────────────────────────────────────
+
+TEST_CASE("get_optional<vector<string>> returns value when present", "[request]") {
+    auto list_type = arrow::list(arrow::utf8());
+    arrow::ListBuilder list_builder(arrow::default_memory_pool(),
+                                    std::make_shared<arrow::StringBuilder>());
+    auto& vb = dynamic_cast<arrow::StringBuilder&>(*list_builder.value_builder());
+    REQUIRE(list_builder.Append().ok());
+    REQUIRE(vb.Append("a").ok());
+    auto arr = *list_builder.Finish();
+
+    auto schema = arrow::schema({arrow::field("tags", list_type)});
+    auto batch = arrow::RecordBatch::Make(schema, 1, {arr});
+    auto md = std::make_shared<arrow::KeyValueMetadata>();
+    md->Append(keys::METHOD, "test");
+    md->Append(keys::REQUEST_VERSION, "1");
+    Request req(batch, md);
+
+    auto opt = req.get_optional<std::vector<std::string>>("tags");
+    REQUIRE(opt.has_value());
+    REQUIRE(*opt == std::vector<std::string>{"a"});
+}
+
+TEST_CASE("get_optional<vector<string>> returns nullopt on missing column", "[request]") {
+    auto req = make_empty_request();
+    REQUIRE_FALSE(req.get_optional<std::vector<std::string>>("tags").has_value());
+}
+
+TEST_CASE("get_optional<vector<string>> returns nullopt on null", "[request]") {
+    auto req = make_null_request("tags", arrow::list(arrow::utf8()));
+    REQUIRE_FALSE(req.get_optional<std::vector<std::string>>("tags").has_value());
+}
+
+TEST_CASE("get_optional<vector<int64_t>> returns value when present", "[request]") {
+    auto list_type = arrow::list(arrow::int64());
+    arrow::ListBuilder list_builder(arrow::default_memory_pool(),
+                                    std::make_shared<arrow::Int64Builder>());
+    auto& vb = dynamic_cast<arrow::Int64Builder&>(*list_builder.value_builder());
+    REQUIRE(list_builder.Append().ok());
+    REQUIRE(vb.Append(7).ok());
+    auto arr = *list_builder.Finish();
+
+    auto schema = arrow::schema({arrow::field("nums", list_type)});
+    auto batch = arrow::RecordBatch::Make(schema, 1, {arr});
+    auto md = std::make_shared<arrow::KeyValueMetadata>();
+    md->Append(keys::METHOD, "test");
+    md->Append(keys::REQUEST_VERSION, "1");
+    Request req(batch, md);
+
+    auto opt = req.get_optional<std::vector<int64_t>>("nums");
+    REQUIRE(opt.has_value());
+    REQUIRE(*opt == std::vector<int64_t>{7});
+}
+
+TEST_CASE("get_optional<vector<int64_t>> returns nullopt on missing column", "[request]") {
+    auto req = make_empty_request();
+    REQUIRE_FALSE(req.get_optional<std::vector<int64_t>>("nums").has_value());
+}
+
+TEST_CASE("get_optional<vector<int64_t>> returns nullopt on null", "[request]") {
+    auto req = make_null_request("nums", arrow::list(arrow::int64()));
+    REQUIRE_FALSE(req.get_optional<std::vector<int64_t>>("nums").has_value());
+}
+
+TEST_CASE("get_optional<vector<double>> returns value when present", "[request]") {
+    auto list_type = arrow::list(arrow::float64());
+    arrow::ListBuilder list_builder(arrow::default_memory_pool(),
+                                    std::make_shared<arrow::DoubleBuilder>());
+    auto& vb = dynamic_cast<arrow::DoubleBuilder&>(*list_builder.value_builder());
+    REQUIRE(list_builder.Append().ok());
+    REQUIRE(vb.Append(2.5).ok());
+    auto arr = *list_builder.Finish();
+
+    auto schema = arrow::schema({arrow::field("vals", list_type)});
+    auto batch = arrow::RecordBatch::Make(schema, 1, {arr});
+    auto md = std::make_shared<arrow::KeyValueMetadata>();
+    md->Append(keys::METHOD, "test");
+    md->Append(keys::REQUEST_VERSION, "1");
+    Request req(batch, md);
+
+    auto opt = req.get_optional<std::vector<double>>("vals");
+    REQUIRE(opt.has_value());
+    REQUIRE(*opt == std::vector<double>{2.5});
+}
+
+TEST_CASE("get_optional<vector<double>> returns nullopt on missing column", "[request]") {
+    auto req = make_empty_request();
+    REQUIRE_FALSE(req.get_optional<std::vector<double>>("vals").has_value());
+}
+
+TEST_CASE("get_optional<vector<double>> returns nullopt on null", "[request]") {
+    auto req = make_null_request("vals", arrow::list(arrow::float64()));
+    REQUIRE_FALSE(req.get_optional<std::vector<double>>("vals").has_value());
+}
+
 // ── method_name / metadata ──────────────────────────────────────────
 
 TEST_CASE("method_name and request_version from metadata", "[request]") {

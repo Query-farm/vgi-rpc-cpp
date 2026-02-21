@@ -20,6 +20,8 @@ ServerBuilder& ServerBuilder::add_unary(
     std::shared_ptr<arrow::Schema> result_schema,
     std::function<Result(const Request&, CallContext&)> handler,
     const std::string& doc) {
+    if (!params_schema) throw std::invalid_argument("params_schema must not be null");
+    if (!result_schema) throw std::invalid_argument("result_schema must not be null");
     check_duplicate(name);
 
     MethodInfo info;
@@ -39,6 +41,7 @@ ServerBuilder& ServerBuilder::add_void(
     std::shared_ptr<arrow::Schema> params_schema,
     std::function<void(const Request&, CallContext&)> handler,
     const std::string& doc) {
+    if (!params_schema) throw std::invalid_argument("params_schema must not be null");
     check_duplicate(name);
 
     MethodInfo info;
@@ -63,6 +66,8 @@ ServerBuilder& ServerBuilder::add_producer(
     std::function<Stream(const Request&, CallContext&)> factory,
     const std::string& doc,
     std::shared_ptr<arrow::Schema> header_schema) {
+    if (!params_schema) throw std::invalid_argument("params_schema must not be null");
+    if (!output_schema) throw std::invalid_argument("output_schema must not be null");
     check_duplicate(name);
 
     MethodInfo info;
@@ -88,6 +93,9 @@ ServerBuilder& ServerBuilder::add_exchange(
     std::function<Stream(const Request&, CallContext&)> factory,
     const std::string& doc,
     std::shared_ptr<arrow::Schema> header_schema) {
+    if (!params_schema) throw std::invalid_argument("params_schema must not be null");
+    if (!input_schema) throw std::invalid_argument("input_schema must not be null");
+    if (!output_schema) throw std::invalid_argument("output_schema must not be null");
     check_duplicate(name);
 
     MethodInfo info;
@@ -105,6 +113,11 @@ ServerBuilder& ServerBuilder::add_exchange(
     return *this;
 }
 
+ServerBuilder& ServerBuilder::server_id(std::string id) {
+    server_id_ = std::move(id);
+    return *this;
+}
+
 ServerBuilder& ServerBuilder::enable_describe(const std::string& protocol_name) {
     describe_enabled_ = true;
     protocol_name_ = protocol_name;
@@ -117,7 +130,7 @@ std::unique_ptr<Server> ServerBuilder::build() {
     }
     built_ = true;
 
-    auto server_id = random_hex(12);
+    auto server_id = server_id_.empty() ? random_hex(12) : std::move(server_id_);
 
     std::unordered_map<std::string, MethodInfo> method_map;
     for (auto& m : methods_) {

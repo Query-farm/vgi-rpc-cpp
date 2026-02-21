@@ -1,3 +1,6 @@
+/// Per-request context passed to method handlers and stream processors.
+/// Provides the server/request IDs and a LogSink for emitting client-visible
+/// log messages during request handling.
 #pragma once
 
 #include <memory>
