@@ -1,0 +1,44 @@
+name: Sanitizer
+
+on:
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+env:
+  VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
+
+jobs:
+  asan-ubsan:
+    runs-on: ubuntu-24.04
+
+    env:
+      ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+      UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Export GitHub Actions cache env vars
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      - name: Clone and bootstrap vcpkg
+        run: |
+          git clone https://github.com/microsoft/vcpkg.git
+          git -C vcpkg checkout 05442024c3fda64320bd25d2251cc9807b84fb6f
+          ./vcpkg/bootstrap-vcpkg.sh -disableMetrics
+
+      - name: Configure
+        run: cmake --preset sanitizer
+
+      - name: Build
+        run: cmake --build --preset sanitizer --parallel
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure --timeout 300 -E conformance

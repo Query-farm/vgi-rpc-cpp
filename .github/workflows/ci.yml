@@ -1,0 +1,75 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            compiler: gcc
+            conformance: true
+          - os: macos-14
+            compiler: apple-clang
+            conformance: false
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Export GitHub Actions cache env vars
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      - name: Clone and bootstrap vcpkg
+        run: |
+          git clone https://github.com/microsoft/vcpkg.git
+          git -C vcpkg checkout 05442024c3fda64320bd25d2251cc9807b84fb6f
+          ./vcpkg/bootstrap-vcpkg.sh -disableMetrics
+
+      - name: Configure
+        run: cmake --preset default
+
+      - name: Build
+        run: cmake --build --preset default --parallel
+
+      - name: Test (unit)
+        run: ctest --test-dir build --output-on-failure -E conformance
+
+      - name: Setup Python
+        if: matrix.conformance
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install pyarrow
+        if: matrix.conformance
+        run: pip install pyarrow
+
+      - name: Clone vgi-rpc (Python)
+        if: matrix.conformance
+        run: git clone https://github.com/Query-farm/vgi-rpc.git ../vgi-rpc
+
+      - name: Test (conformance)
+        if: matrix.conformance
+        env:
+          CONFORMANCE_WORKER: ${{ github.workspace }}/build/conformance/conformance_worker
+          VGI_RPC_PYTHON_PATH: ${{ github.workspace }}/../vgi-rpc
+        run: ctest --test-dir build --output-on-failure -R conformance
