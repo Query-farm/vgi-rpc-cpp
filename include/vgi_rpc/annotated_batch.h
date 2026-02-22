@@ -1,3 +1,6 @@
+// © Copyright 2025-2026, Query.Farm LLC - https://query.farm
+// SPDX-License-Identifier: Apache-2.0
+
 /// A RecordBatch paired with optional per-batch custom metadata.
 /// AnnotatedBatch is the primary unit passed through the IPC wire protocol —
 /// use the static factories data() and with_metadata() to construct, and

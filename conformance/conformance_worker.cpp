@@ -1,3 +1,6 @@
+// © Copyright 2025-2026, Query.Farm LLC - https://query.farm
+// SPDX-License-Identifier: Apache-2.0
+
 // Conformance worker implementing all ~43 methods from ConformanceService.
 // Wire-compatible with the Python vgi_rpc conformance test suite.
 

@@ -1,3 +1,6 @@
+// © Copyright 2025-2026, Query.Farm LLC - https://query.farm
+// SPDX-License-Identifier: Apache-2.0
+
 /// Constructs RPC response batches returned from unary method handlers.
 /// Use Result::value() to return data, Result::void_result() for void methods,
 /// and Result::error() to signal an exception to the client.

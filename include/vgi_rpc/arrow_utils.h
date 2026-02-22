@@ -1,3 +1,6 @@
+// © Copyright 2025-2026, Query.Farm LLC - https://query.farm
+// SPDX-License-Identifier: Apache-2.0
+
 /// Helpers for converting Apache Arrow error types to C++ exceptions.
 /// unwrap() extracts a value from arrow::Result<T> or throws on failure.
 /// VGI_RPC_THROW_NOT_OK() checks an arrow::Status and throws std::runtime_error.

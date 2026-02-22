@@ -1,3 +1,6 @@
+// © Copyright 2025-2026, Query.Farm LLC - https://query.farm
+// SPDX-License-Identifier: Apache-2.0
+
 #include <catch2/catch_test_macros.hpp>
 
 #include "vgi_rpc/output_collector.h"

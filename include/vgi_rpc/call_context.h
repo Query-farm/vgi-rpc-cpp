@@ -1,3 +1,6 @@
+// © Copyright 2025-2026, Query.Farm LLC - https://query.farm
+// SPDX-License-Identifier: Apache-2.0
+
 /// Per-request context passed to method handlers and stream processors.
 /// Provides the server/request IDs and a LogSink for emitting client-visible
 /// log messages during request handling.

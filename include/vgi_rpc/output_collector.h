@@ -1,3 +1,6 @@
+// © Copyright 2025-2026, Query.Farm LLC - https://query.farm
+// SPDX-License-Identifier: Apache-2.0
+
 /// Accumulates output batches and log messages during a single stream tick.
 /// Created per-tick by the stream loop; use emit_batch()/emit_arrays() to
 /// produce data, client_log() for in-band logs, and finish() to signal

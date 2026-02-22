@@ -1,3 +1,6 @@
+// © Copyright 2025-2026, Query.Farm LLC - https://query.farm
+// SPDX-License-Identifier: Apache-2.0
+
 /// Typed read-only view over an incoming RPC request batch.
 /// Wraps a single-row Arrow RecordBatch and its custom metadata, providing
 /// get<T>(name) / get_optional<T>(name) for extracting typed parameters by

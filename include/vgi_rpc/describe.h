@@ -1,3 +1,6 @@
+// © Copyright 2025-2026, Query.Farm LLC - https://query.farm
+// SPDX-License-Identifier: Apache-2.0
+
 /// Introspection support for the __describe__ built-in method.
 /// register_describe() adds a handler that returns method schemas, types,
 /// and documentation for all registered methods on the server.

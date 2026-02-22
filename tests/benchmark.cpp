@@ -1,3 +1,6 @@
+// © Copyright 2025-2026, Query.Farm LLC - https://query.farm
+// SPDX-License-Identifier: Apache-2.0
+
 /// Benchmarks matching the Python vgi-rpc test_benchmarks.py for comparison.
 /// Run: ./build/tests/vgi_rpc_benchmark
 ///
