@@ -41,6 +41,16 @@ jobs:
             core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
             core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
 
+      - name: Setup Python
+        if: matrix.conformance
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install pyarrow
+        if: matrix.conformance
+        run: pip install pyarrow
+
       - name: Clone and bootstrap vcpkg
         run: |
           git clone https://github.com/microsoft/vcpkg.git
@@ -69,16 +79,6 @@ jobs:
           cmake -S tests/install_test -B ${{ runner.temp }}/install_test_build \
             -DCMAKE_PREFIX_PATH="${{ runner.temp }}/install;$(pwd)/build/vcpkg_installed/x64-linux"
           cmake --build ${{ runner.temp }}/install_test_build
-
-      - name: Setup Python
-        if: matrix.conformance
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Install pyarrow
-        if: matrix.conformance
-        run: pip install pyarrow
 
       - name: Clone vgi-rpc (Python)
         if: matrix.conformance
