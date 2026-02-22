@@ -1,34 +1,61 @@
 site_name: vgi-rpc C++
-site_url: https://vgi-rpc-cpp.query.farm
-site_description: C++20 RPC framework built on Apache Arrow IPC
+site_description: "vgi-rpc C++: a C++20 RPC framework built on Apache Arrow IPC — unary, producer, and exchange method patterns over pipe-based transport"
+site_url: https://vgi-rpc-cpp.query.farm/
 repo_url: https://github.com/Query-farm/vgi-rpc-cpp
 repo_name: Query-farm/vgi-rpc-cpp
+copyright: "&copy; 2026 <a href=\"https://query.farm\">Query.Farm LLC</a>"
+
+extra:
+  social:
+    - icon: material/web
+      link: https://query.farm
+      name: Query.Farm
+    - icon: fontawesome/brands/github
+      link: https://github.com/Query-farm
+      name: Query.Farm on GitHub
+
+extra_css:
+  - stylesheets/extra.css
 
 theme:
   name: material
   palette:
     - media: "(prefers-color-scheme: light)"
       scheme: default
-      primary: indigo
-      accent: indigo
+      primary: custom
+      accent: custom
       toggle:
-        icon: material/brightness-7
+        icon: material/weather-sunny
         name: Switch to dark mode
     - media: "(prefers-color-scheme: dark)"
       scheme: slate
-      primary: indigo
-      accent: indigo
+      primary: custom
+      accent: custom
       toggle:
-        icon: material/brightness-4
+        icon: material/weather-night
         name: Switch to light mode
   features:
-    - content.code.copy
+    - navigation.tabs
+    - navigation.tabs.sticky
     - navigation.sections
-    - navigation.expand
+    - navigation.indexes
     - navigation.top
+    - navigation.footer
+    - content.code.copy
     - search.highlight
+    - search.suggest
+    - toc.follow
+  custom_dir: docs/overrides
+  logo: assets/logo.png
+  favicon: assets/favicon.ico
+  icon:
+    repo: fontawesome/brands/github
 
 markdown_extensions:
+  - toc:
+      permalink: true
+      toc_depth: 3
+  - tables
   - admonition
   - pymdownx.details
   - pymdownx.superfences
@@ -37,9 +64,8 @@ markdown_extensions:
   - pymdownx.inlinehilite
   - pymdownx.tabbed:
       alternate_style: true
-  - toc:
-      permalink: true
   - attr_list
+  - md_in_html
 
 nav:
   - Home: index.md
