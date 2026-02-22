@@ -14,7 +14,12 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
+  VCPKG_BINARY_SOURCES: "clear;x-aws,s3://query-farm-duckdb-vcpkg/,readwrite"
+  AWS_ACCESS_KEY_ID: ${{ secrets.VCPKG_CACHING_AWS_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.VCPKG_CACHING_AWS_SECRET_ACCESS_KEY }}
+  AWS_ENDPOINT_URL: ${{ secrets.VCPKG_CACHING_AWS_ENDPOINT_URL }}
+  AWS_DEFAULT_REGION: ${{ secrets.VCPKG_CACHING_AWS_DEFAULT_REGION }}
+  AWS_REQUEST_CHECKSUM_CALCULATION: when_required
 
 jobs:
   build:
@@ -33,13 +38,6 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
-
-      - name: Export GitHub Actions cache env vars
-        uses: actions/github-script@v7
-        with:
-          script: |
-            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
-            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
 
       - name: Setup Python
         if: matrix.conformance
