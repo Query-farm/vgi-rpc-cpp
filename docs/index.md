@@ -14,41 +14,8 @@ The framework is single-threaded by design, processing one request at a time. Me
 
 ## Quick Example
 
-```cpp
-#include <vgi_rpc/server.h>
-#include <vgi_rpc/request.h>
-#include <vgi_rpc/result.h>
-#include <vgi_rpc/arrow_utils.h>
-
-#include <arrow/array/builder_primitive.h>
-#include <arrow/type.h>
-
-int main() {
-    auto server = vgi_rpc::ServerBuilder()
-        .add_unary("add",
-            arrow::schema({
-                arrow::field("a", arrow::float64()),
-                arrow::field("b", arrow::float64()),
-            }),
-            arrow::schema({arrow::field("result", arrow::float64())}),
-            [](const vgi_rpc::Request& req, vgi_rpc::CallContext& ctx) {
-                double a = req.get<double>("a");
-                double b = req.get<double>("b");
-
-                arrow::DoubleBuilder builder;
-                VGI_RPC_THROW_NOT_OK(builder.Append(a + b));
-                auto array = vgi_rpc::unwrap(builder.Finish());
-
-                return vgi_rpc::Result::value(
-                    arrow::schema({arrow::field("result", arrow::float64())}),
-                    {array});
-            },
-            "Add two numbers together.")
-        .enable_describe("MyServer")
-        .build();
-
-    server->run();
-}
+```cpp title="examples/quick_example.cpp"
+--8<-- "examples/quick_example.cpp"
 ```
 
 ## Features

@@ -47,6 +47,12 @@ jobs:
           git -C vcpkg checkout 05442024c3fda64320bd25d2251cc9807b84fb6f
           ./vcpkg/bootstrap-vcpkg.sh -disableMetrics
 
+      - name: Install newer bison (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install bison
+          echo "$(brew --prefix bison)/bin" >> $GITHUB_PATH
+
       - name: Configure
         run: cmake --preset default
 
@@ -76,7 +82,7 @@ jobs:
 
       - name: Clone vgi-rpc (Python)
         if: matrix.conformance
-        run: git clone https://github.com/Query-farm/vgi-rpc.git ../vgi-rpc
+        run: git clone https://github.com/Query-farm/vgi-rpc-python.git ../vgi-rpc
 
       - name: Test (conformance)
         if: matrix.conformance

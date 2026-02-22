@@ -9,3 +9,9 @@ target_link_libraries(calculator PRIVATE vgi_rpc)
 
 add_executable(streaming streaming.cpp)
 target_link_libraries(streaming PRIVATE vgi_rpc)
+
+add_executable(quick_example quick_example.cpp)
+target_link_libraries(quick_example PRIVATE vgi_rpc)
+
+add_executable(getting_started getting_started.cpp)
+target_link_libraries(getting_started PRIVATE vgi_rpc)
