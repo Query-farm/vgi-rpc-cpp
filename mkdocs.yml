@@ -8,6 +8,9 @@ copyright: "&copy; 2026 <a href=\"https://query.farm\">Query.Farm LLC</a>"
 extra:
   social:
     - icon: material/web
+      link: https://vgi-rpc.query.farm
+      name: VGI-RPC
+    - icon: material/web
       link: https://query.farm
       name: Query.Farm
     - icon: fontawesome/brands/github
@@ -45,6 +48,9 @@ theme:
     - search.highlight
     - search.suggest
     - toc.follow
+  font:
+    text: Inter
+    code: JetBrains Mono
   custom_dir: docs/overrides
   logo: assets/logo.png
   favicon: assets/favicon.ico
