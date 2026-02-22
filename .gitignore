@@ -2,3 +2,5 @@ build/
 vcpkg/
 .cache/
 .claude/
+site/
+.venv/
