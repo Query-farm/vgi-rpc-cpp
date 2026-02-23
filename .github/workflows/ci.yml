@@ -31,6 +31,9 @@ jobs:
           - os: ubuntu-24.04
             compiler: gcc
             conformance: true
+          - os: ubuntu-24.04-arm
+            compiler: gcc
+            conformance: true
           - os: macos-14
             compiler: apple-clang
             conformance: false
@@ -72,11 +75,11 @@ jobs:
         run: ctest --test-dir build --output-on-failure -E conformance
 
       - name: Validate install
-        if: matrix.os == 'ubuntu-24.04'
+        if: runner.os == 'Linux'
         run: |
           cmake --install build --prefix ${{ runner.temp }}/install
           cmake -S tests/install_test -B ${{ runner.temp }}/install_test_build \
-            -DCMAKE_PREFIX_PATH="${{ runner.temp }}/install;$(pwd)/build/vcpkg_installed/x64-linux"
+            -DCMAKE_PREFIX_PATH="${{ runner.temp }}/install;$(pwd)/build/vcpkg_installed/${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}-linux"
           cmake --build ${{ runner.temp }}/install_test_build
 
       - name: Clone vgi-rpc (Python)
