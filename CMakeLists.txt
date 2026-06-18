@@ -13,6 +13,7 @@ set(CMAKE_VISIBILITY_INLINES_HIDDEN ON)
 
 find_package(Arrow CONFIG REQUIRED)
 find_package(nlohmann_json CONFIG REQUIRED)
+find_package(httplib CONFIG REQUIRED)
 
 add_library(vgi_rpc
     src/metadata.cpp
@@ -26,6 +27,7 @@ add_library(vgi_rpc
     src/pipe_transport.cpp
     src/describe.cpp
     src/access_log.cpp
+    src/http_transport.cpp
     src/output_collector.cpp
 )
 
@@ -46,6 +48,7 @@ endif()
 target_link_libraries(vgi_rpc PUBLIC
     ${_VGI_RPC_ARROW_TARGET}
     nlohmann_json::nlohmann_json
+    httplib::httplib
 )
 
 add_subdirectory(examples)

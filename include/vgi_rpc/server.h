@@ -39,6 +39,9 @@ struct MethodInfo {
     std::shared_ptr<arrow::Schema> output_schema;   // nullptr for unary
     std::shared_ptr<arrow::Schema> header_schema;   // nullptr if no header
     std::function<Stream(const Request&, CallContext&)> stream_factory;
+    // true = exchange (bidi), false = producer.  Used to pick the stream
+    // dispatch shape; not surfaced in __describe__ (which reports null).
+    bool is_exchange = false;
 };
 
 class Server;
@@ -119,6 +122,12 @@ class VGI_RPC_EXPORT Server {
 
 public:
     void run();
+
+    // Serve over HTTP (cpp-httplib) instead of stdin/stdout.  Blocks until the
+    // server stops.  `max_response_bytes < 0` means unbounded; when set, unary
+    // and exchange responses larger than the cap surface a strict-fail error.
+    // Prints "PORT:<n>" to stdout once bound (so port 0 callers learn the port).
+    void serve_http(const std::string& host, int port, int64_t max_response_bytes = -1);
 
     const std::string& server_id() const noexcept { return server_id_; }
     const std::unordered_map<std::string, MethodInfo>& methods() const noexcept { return methods_; }

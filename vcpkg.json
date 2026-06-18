@@ -8,6 +8,10 @@
       "default-features": false
     },
     "nlohmann-json",
+    {
+      "name": "cpp-httplib",
+      "features": ["zstd", "zlib", "brotli"]
+    },
     "catch2"
   ]
 }

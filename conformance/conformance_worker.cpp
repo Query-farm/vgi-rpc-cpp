@@ -1191,16 +1191,31 @@ static std::shared_ptr<arrow::Schema> params(
 }
 
 int main(int argc, char** argv) {
-    // Parse the conformance CLI surface.  Only --access-log is acted on; other
-    // access-log tuning flags are accepted (and ignored) so the worker stays
-    // launchable by the cross-language test harness.
+    // Parse the conformance CLI surface.  --access-log and the HTTP flags are
+    // acted on; other access-log tuning flags are accepted (and ignored) so the
+    // worker stays launchable by the cross-language test harness.
     std::string access_log_path;
+    bool http = false;
+    std::string host = "127.0.0.1";
+    int port = 0;
+    int64_t max_response_bytes = -1;
+    auto take_value = [&](int& i) -> std::string {
+        return (i + 1 < argc) ? std::string(argv[++i]) : std::string();
+    };
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "--access-log" && i + 1 < argc) {
             access_log_path = argv[++i];
         } else if (arg.rfind("--access-log=", 0) == 0) {
             access_log_path = arg.substr(std::string("--access-log=").size());
+        } else if (arg == "--http") {
+            http = true;
+        } else if (arg == "--host") {
+            host = take_value(i);
+        } else if (arg == "--port") {
+            port = std::stoi(take_value(i));
+        } else if (arg == "--max-response-bytes") {
+            max_response_bytes = std::stoll(take_value(i));
         } else if ((arg == "--access-log-max-bytes" || arg == "--access-log-when" ||
                     arg == "--access-log-backup-count" ||
                     arg == "--access-log-max-record-bytes") && i + 1 < argc) {
@@ -1529,6 +1544,10 @@ int main(int argc, char** argv) {
     }
 
     auto server = builder.build();
-    server->run();
+    if (http) {
+        server->serve_http(host, port, max_response_bytes);
+    } else {
+        server->run();
+    }
     return 0;
 }

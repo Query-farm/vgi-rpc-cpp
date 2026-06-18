@@ -112,6 +112,7 @@ ServerBuilder& ServerBuilder::add_exchange(
     info.has_return = true;
     info.doc = doc;
     info.stream_factory = std::move(factory);
+    info.is_exchange = true;
     methods_.push_back(std::move(info));
     return *this;
 }
