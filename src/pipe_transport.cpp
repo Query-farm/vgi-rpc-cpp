@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "vgi_rpc/server.h"
+#include "vgi_rpc/access_log.h"
 #include "vgi_rpc/arrow_utils.h"
 #include "vgi_rpc/metadata.h"
 #include "vgi_rpc/wire.h"
@@ -9,6 +10,8 @@
 #include "vgi_rpc/output_collector.h"
 
 #include <arrow/array.h>
+#include <arrow/compute/cast.h>
+#include <arrow/io/memory.h>
 #include <arrow/io/stdio.h>
 #include <arrow/ipc/reader.h>
 #include <arrow/ipc/writer.h>
@@ -17,7 +20,9 @@
 #include <arrow/util/key_value_metadata.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -37,6 +42,57 @@ void write_stream_error(
     auto error_batch = make_empty_batch(schema);
     auto md = make_error_metadata(exception_type, message, server_id, request_id);
     VGI_RPC_THROW_NOT_OK(writer->WriteRecordBatch(*error_batch, md));
+}
+
+// Reconcile an inbound exchange batch to the declared input schema.  Strict on
+// the field set, tolerant of column order and compatible type coercions (e.g.
+// int32->float64).  Mirrors Python's _coerce_input_batch; a mismatch raises
+// std::logic_error so the dispatcher surfaces it as a "TypeError".
+std::shared_ptr<arrow::RecordBatch> coerce_input_batch(
+    const std::shared_ptr<arrow::RecordBatch>& batch,
+    const std::shared_ptr<arrow::Schema>& target) {
+    if (batch->schema()->Equals(*target)) return batch;
+
+    auto mismatch = [&]() {
+        return std::logic_error("Input schema mismatch: expected " + target->ToString() +
+                                ", got " + batch->schema()->ToString());
+    };
+
+    std::set<std::string> batch_names, target_names;
+    for (const auto& f : batch->schema()->fields()) batch_names.insert(f->name());
+    for (const auto& f : target->fields()) target_names.insert(f->name());
+    if (batch_names != target_names) throw mismatch();
+
+    std::vector<std::shared_ptr<arrow::Array>> cols;
+    cols.reserve(static_cast<size_t>(target->num_fields()));
+    for (const auto& f : target->fields()) {
+        // GetColumnByName returns null for an ambiguous (duplicated) name; the
+        // set-equality check above does not catch duplicates, so guard here.
+        auto col = batch->GetColumnByName(f->name());
+        if (!col) throw mismatch();
+        if (!col->type()->Equals(*f->type())) {
+            auto cast_res = arrow::compute::Cast(*col, f->type());
+            if (!cast_res.ok()) throw mismatch();
+            col = cast_res.ValueUnsafe();
+        }
+        cols.push_back(std::move(col));
+    }
+    return arrow::RecordBatch::Make(target, batch->num_rows(), std::move(cols));
+}
+
+// Serialize a request batch to a self-contained Arrow IPC stream and return it
+// base64-encoded, for the access log's request_data field.
+std::string serialize_request_b64(const std::shared_ptr<arrow::RecordBatch>& batch) {
+    auto out = unwrap(arrow::io::BufferOutputStream::Create());
+    write_ipc_stream(out, batch->schema(), {AnnotatedBatch::data(batch)});
+    auto buf = unwrap(out->Finish());
+    return base64_encode(buf->data(), static_cast<size_t>(buf->size()));
+}
+
+// Milliseconds elapsed since `t0`.
+double elapsed_ms_since(std::chrono::steady_clock::time_point t0) {
+    auto dt = std::chrono::steady_clock::now() - t0;
+    return std::chrono::duration<double, std::milli>(dt).count();
 }
 
 }  // anonymous namespace
@@ -140,25 +196,31 @@ void Server::serve_unary(const MethodInfo& method_info,
                          const Request& request,
                          const std::string& request_id,
                          const std::shared_ptr<arrow::io::OutputStream>& output) {
+    auto t0 = std::chrono::steady_clock::now();
     auto log_sink = std::make_shared<LogSink>(server_id_, request_id);
     CallContext ctx(log_sink, server_id_, request_id);
 
+    std::string status = "ok", error_type, error_message;
     Result result = Result::void_result();
     try {
         result = method_info.handler(request, ctx);
     } catch (const std::invalid_argument& e) {
+        status = "error"; error_type = "ValueError"; error_message = e.what();
         result = Result::error(
             method_info.result_schema, "ValueError", e.what(),
             server_id_, request_id);
     } catch (const std::out_of_range& e) {
+        status = "error"; error_type = "IndexError"; error_message = e.what();
         result = Result::error(
             method_info.result_schema, "IndexError", e.what(),
             server_id_, request_id);
     } catch (const std::logic_error& e) {
+        status = "error"; error_type = "TypeError"; error_message = e.what();
         result = Result::error(
             method_info.result_schema, "TypeError", e.what(),
             server_id_, request_id);
     } catch (const std::exception& e) {
+        status = "error"; error_type = "RuntimeError"; error_message = e.what();
         result = Result::error(
             method_info.result_schema, "RuntimeError", e.what(),
             server_id_, request_id);
@@ -176,6 +238,19 @@ void Server::serve_unary(const MethodInfo& method_info,
     response_batches.push_back(result.annotated_batch());
     write_ipc_stream(output, method_info.result_schema, response_batches);
     VGI_RPC_THROW_NOT_OK(output->Flush());
+
+    if (access_log_ && access_log_->enabled()) {
+        AccessRecord rec;
+        rec.method = method_info.name;
+        rec.is_stream = false;
+        rec.status = status;
+        rec.error_type = error_type;
+        rec.error_message = error_message;
+        rec.duration_ms = elapsed_ms_since(t0);
+        rec.request_data_b64 = serialize_request_b64(request.batch());
+        rec.has_request_data = true;
+        access_log_->emit(rec);
+    }
 }
 
 void Server::serve_stream(const MethodInfo& method_info,
@@ -183,8 +258,15 @@ void Server::serve_stream(const MethodInfo& method_info,
                           const std::string& request_id,
                           const std::shared_ptr<arrow::io::InputStream>& input,
                           const std::shared_ptr<arrow::io::OutputStream>& output) {
+    auto t0 = std::chrono::steady_clock::now();
     auto log_sink = std::make_shared<LogSink>(server_id_, request_id);
     CallContext ctx(log_sink, server_id_, request_id);
+
+    // Access-log state for the (single) record emitted at the normal end of the
+    // stream.  Factory-init failures return early and are not logged.
+    std::string status = "ok", error_type, error_message;
+    bool cancelled_flag = false;
+    std::string stream_id = random_hex(32);
 
     // Call the stream factory
     Stream stream_result = Stream{};
@@ -286,14 +368,39 @@ void Server::serve_stream(const MethodInfo& method_info,
     // Stream loop
     try {
         while (true) {
-            // Read input batch
-            std::shared_ptr<arrow::RecordBatch> input_batch;
-            auto read_status = input_reader->ReadNext(&input_batch);
-            if (!read_status.ok() || !input_batch) break;  // EOS
+            // Read input batch (with per-batch custom metadata so we can
+            // detect client cancellation).
+            auto read_result = input_reader->ReadNext();
+            if (!read_result.ok()) break;  // I/O error / disconnect
+            auto batch_with_md = std::move(read_result).ValueUnsafe();
+            if (!batch_with_md.batch) break;  // EOS
+
+            // Cancellation: the client sends a batch carrying vgi_rpc.cancel.
+            // Run the state's on_cancel hook (best-effort) and stop without
+            // emitting an output batch for this turn.
+            if (batch_with_md.custom_metadata &&
+                batch_with_md.custom_metadata->FindKey(keys::CANCEL) >= 0) {
+                cancelled_flag = true;
+                CallContext cancel_ctx(log_sink, server_id_, request_id);
+                try {
+                    state->on_cancel(cancel_ctx);
+                } catch (const std::exception& e) {
+                    fprintf(stderr, "vgi_rpc: warning: on_cancel hook failed: %s\n", e.what());
+                } catch (...) {}
+                break;
+            }
 
             AnnotatedBatch input_ab;
-            input_ab.batch = input_batch;
-            input_ab.custom_metadata = nullptr;
+            // Exchange streams coerce the inbound batch to the declared input
+            // schema (reorder + compatible casts); producer ticks are empty.
+            input_ab.batch = is_producer
+                ? batch_with_md.batch
+                : coerce_input_batch(batch_with_md.batch, input_schema);
+            input_ab.custom_metadata =
+                batch_with_md.custom_metadata
+                    ? std::static_pointer_cast<arrow::KeyValueMetadata>(
+                          batch_with_md.custom_metadata->Copy())
+                    : nullptr;
 
             OutputCollector out(output_schema, is_producer, server_id_, request_id);
             CallContext stream_ctx(log_sink, server_id_, request_id);
@@ -323,15 +430,19 @@ void Server::serve_stream(const MethodInfo& method_info,
             if (out.is_finished()) break;
         }
     } catch (const std::invalid_argument& e) {
+        status = "error"; error_type = "ValueError"; error_message = e.what();
         write_stream_error(output_writer, output_schema, "ValueError",
                            e.what(), server_id_, request_id);
     } catch (const std::out_of_range& e) {
+        status = "error"; error_type = "IndexError"; error_message = e.what();
         write_stream_error(output_writer, output_schema, "IndexError",
                            e.what(), server_id_, request_id);
     } catch (const std::logic_error& e) {
+        status = "error"; error_type = "TypeError"; error_message = e.what();
         write_stream_error(output_writer, output_schema, "TypeError",
                            e.what(), server_id_, request_id);
     } catch (const std::exception& e) {
+        status = "error"; error_type = "RuntimeError"; error_message = e.what();
         write_stream_error(output_writer, output_schema, "RuntimeError",
                            e.what(), server_id_, request_id);
     }
@@ -346,6 +457,21 @@ void Server::serve_stream(const MethodInfo& method_info,
 
     // Drain remaining input
     drain_reader(input_reader);
+
+    if (access_log_ && access_log_->enabled()) {
+        AccessRecord rec;
+        rec.method = method_info.name;
+        rec.is_stream = true;
+        rec.status = status;
+        rec.error_type = error_type;
+        rec.error_message = error_message;
+        rec.duration_ms = elapsed_ms_since(t0);
+        rec.stream_id = stream_id;
+        rec.cancelled = cancelled_flag;
+        rec.request_data_b64 = serialize_request_b64(request.batch());
+        rec.has_request_data = true;
+        access_log_->emit(rec);
+    }
 }
 
 }  // namespace vgi_rpc

@@ -127,6 +127,16 @@ ServerBuilder& ServerBuilder::enable_describe(const std::string& protocol_name) 
     return *this;
 }
 
+ServerBuilder& ServerBuilder::protocol_version(std::string version) {
+    protocol_version_ = std::move(version);
+    return *this;
+}
+
+ServerBuilder& ServerBuilder::access_log(std::string path) {
+    access_log_path_ = std::move(path);
+    return *this;
+}
+
 std::unique_ptr<Server> ServerBuilder::build() {
     if (built_) {
         throw std::logic_error("ServerBuilder::build() has already been called");
@@ -140,18 +150,34 @@ std::unique_ptr<Server> ServerBuilder::build() {
         method_map[m.name] = std::move(m);
     }
 
+    // Compute protocol_hash over the user methods (before __describe__ is added)
+    // so it is available to both __describe__ and the access log.
+    std::string protocol_hash = compute_protocol_hash(protocol_name_, method_map);
+
     if (describe_enabled_) {
-        register_describe(method_map, protocol_name_, server_id);
+        register_describe(method_map, protocol_name_, server_id, protocol_version_);
     }
 
-    return std::unique_ptr<Server>(new Server(std::move(method_map), std::move(server_id)));
+    return std::unique_ptr<Server>(new Server(
+        std::move(method_map), std::move(server_id),
+        protocol_name_, std::move(protocol_hash), access_log_path_));
 }
 
 // Server
 
 Server::Server(std::unordered_map<std::string, MethodInfo> methods,
-               std::string server_id)
+               std::string server_id,
+               std::string protocol_name,
+               std::string protocol_hash,
+               const std::string& access_log_path)
     : methods_(std::move(methods))
-    , server_id_(std::move(server_id)) {}
+    , server_id_(std::move(server_id))
+    , protocol_name_(std::move(protocol_name))
+    , protocol_hash_(std::move(protocol_hash)) {
+    if (!access_log_path.empty()) {
+        access_log_ = std::make_unique<AccessLogWriter>(
+            access_log_path, server_id_, protocol_name_, protocol_hash_);
+    }
+}
 
 }  // namespace vgi_rpc

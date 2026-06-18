@@ -22,6 +22,11 @@ public:
     // Called once per input batch (tick for producer, data for exchange)
     virtual void process(const AnnotatedBatch& input,
                         OutputCollector& out, CallContext& ctx) = 0;
+
+    // Called when the client cancels the stream (sends a batch carrying
+    // vgi_rpc.cancel metadata).  Default is a no-op.  Implementations may
+    // override to release resources or record cancellation.
+    virtual void on_cancel(CallContext& /*ctx*/) {}
 };
 
 // Producer stream state — ignores input tick, just produces output

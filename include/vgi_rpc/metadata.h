@@ -37,6 +37,9 @@ inline constexpr const char* SHM_SEGMENT_NAME = "vgi_rpc.shm_segment_name";
 inline constexpr const char* SHM_SEGMENT_SIZE = "vgi_rpc.shm_segment_size";
 inline constexpr const char* PROTOCOL_NAME = "vgi_rpc.protocol_name";
 inline constexpr const char* DESCRIBE_VERSION = "vgi_rpc.describe_version";
+inline constexpr const char* PROTOCOL_HASH = "vgi_rpc.protocol_hash";
+inline constexpr const char* PROTOCOL_VERSION = "vgi_rpc.protocol_version";
+inline constexpr const char* CANCEL = "vgi_rpc.cancel";
 inline constexpr const char* TRACEPARENT = "traceparent";
 inline constexpr const char* TRACESTATE = "tracestate";
 
@@ -44,7 +47,7 @@ inline constexpr const char* TRACESTATE = "tracestate";
 
 // Protocol constants
 inline constexpr const char* REQUEST_VERSION_VALUE = "1";
-inline constexpr const char* DESCRIBE_VERSION_VALUE = "2";
+inline constexpr const char* DESCRIBE_VERSION_VALUE = "4";
 inline constexpr const char* DESCRIBE_METHOD_NAME = "__describe__";
 
 // Empty schema — used for void results, protocol errors, producer tick input

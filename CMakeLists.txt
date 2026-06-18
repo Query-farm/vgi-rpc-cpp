@@ -25,6 +25,7 @@ add_library(vgi_rpc
     src/server.cpp
     src/pipe_transport.cpp
     src/describe.cpp
+    src/access_log.cpp
     src/output_collector.cpp
 )
 

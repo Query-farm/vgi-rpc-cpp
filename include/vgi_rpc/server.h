@@ -11,6 +11,7 @@
 
 #include <arrow/type.h>
 
+#include "vgi_rpc/access_log.h"
 #include "vgi_rpc/call_context.h"
 #include "vgi_rpc/export.h"
 #include "vgi_rpc/request.h"
@@ -87,6 +88,15 @@ public:
     // The describe response is a snapshot captured at build() time.
     ServerBuilder& enable_describe(const std::string& protocol_name = "");
 
+    // Declare the application protocol surface version (canonical semver
+    // MAJOR.MINOR.PATCH).  Surfaced in the __describe__ response under
+    // vgi_rpc.protocol_version so version-aware clients can discover it.
+    ServerBuilder& protocol_version(std::string version);
+
+    // Enable the vgi_rpc.access JSONL access log, written to `path`.  One
+    // record per completed call.  Empty path (the default) disables it.
+    ServerBuilder& access_log(std::string path);
+
     // Build the server
     std::unique_ptr<Server> build();
 
@@ -98,6 +108,8 @@ private:
     bool built_ = false;
     std::string protocol_name_;
     std::string server_id_;
+    std::string protocol_version_;
+    std::string access_log_path_;
 };
 
 // NOT thread-safe.  Designed for single-threaded pipe-based operation
@@ -117,7 +129,10 @@ public:
 
 private:
     Server(std::unordered_map<std::string, MethodInfo> methods,
-           std::string server_id);
+           std::string server_id,
+           std::string protocol_name,
+           std::string protocol_hash,
+           const std::string& access_log_path);
 
     void serve_unary(const MethodInfo& method_info,
                      const Request& request,
@@ -132,6 +147,9 @@ private:
 
     std::unordered_map<std::string, MethodInfo> methods_;
     std::string server_id_;
+    std::string protocol_name_;
+    std::string protocol_hash_;
+    std::unique_ptr<AccessLogWriter> access_log_;
 };
 
 }  // namespace vgi_rpc
