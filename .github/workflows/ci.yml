@@ -36,7 +36,7 @@ jobs:
             conformance: true
           - os: macos-14
             compiler: apple-clang
-            conformance: false
+            conformance: true
 
     runs-on: ${{ matrix.os }}
 
@@ -49,9 +49,15 @@ jobs:
         with:
           python-version: "3.13"
 
-      - name: Install pyarrow
+      - name: Install vgi-rpc Python reference (conformance suite)
         if: matrix.conformance
-        run: pip install pyarrow
+        # Clone the reference implementation and install it with the `http`
+        # extra so the `vgi-rpc-test` CLI can drive both the pipe transport
+        # (--cmd) and the HTTP transport (--url, which needs httpx + zstandard).
+        run: |
+          git clone --depth 1 https://github.com/Query-farm/vgi-rpc-python.git ../vgi-rpc
+          python -m pip install --upgrade pip
+          python -m pip install '../vgi-rpc[http]'
 
       - name: Clone and bootstrap vcpkg
         run: |
@@ -82,13 +88,10 @@ jobs:
             -DCMAKE_PREFIX_PATH="${{ runner.temp }}/install;$(pwd)/build/vcpkg_installed/${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}-linux"
           cmake --build ${{ runner.temp }}/install_test_build
 
-      - name: Clone vgi-rpc (Python)
+      - name: Test (conformance — pipe + HTTP + access-log)
         if: matrix.conformance
-        run: git clone https://github.com/Query-farm/vgi-rpc-python.git ../vgi-rpc
-
-      - name: Test (conformance)
-        if: matrix.conformance
+        # Runs the official cross-language `vgi-rpc-test` suite against the C++
+        # worker over every transport it supports (see scripts/run_conformance.sh).
         env:
           CONFORMANCE_WORKER: ${{ github.workspace }}/build/conformance/conformance_worker
-          VGI_RPC_PYTHON_PATH: ${{ github.workspace }}/../vgi-rpc
-        run: ctest --test-dir build --output-on-failure -R conformance
+        run: ./scripts/run_conformance.sh
