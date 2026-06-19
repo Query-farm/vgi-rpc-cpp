@@ -52,12 +52,12 @@ jobs:
       - name: Install vgi-rpc Python reference (conformance suite)
         if: matrix.conformance
         # Clone the reference implementation and install it with the `http`
-        # extra so the `vgi-rpc-test` CLI can drive both the pipe transport
-        # (--cmd) and the HTTP transport (--url, which needs httpx + zstandard).
+        # extra (httpx + zstandard for the --url HTTP client) and the
+        # `conformance` extra (jsonschema, for --access-log validation).
         run: |
           git clone --depth 1 https://github.com/Query-farm/vgi-rpc-python.git ../vgi-rpc
           python -m pip install --upgrade pip
-          python -m pip install '../vgi-rpc[http]'
+          python -m pip install '../vgi-rpc[http,conformance]'
 
       - name: Clone and bootstrap vcpkg
         run: |
