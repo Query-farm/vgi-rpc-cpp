@@ -3,6 +3,7 @@
 include(CMakeFindDependencyMacro)
 find_dependency(Arrow CONFIG)
 find_dependency(nlohmann_json CONFIG)
+find_dependency(httplib CONFIG)
 
 include("${CMAKE_CURRENT_LIST_DIR}/vgi_rpc-targets.cmake")
 
