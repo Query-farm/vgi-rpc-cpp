@@ -1664,6 +1664,9 @@ int main(int argc, char** argv) {
 
     builder.protocol_version("1.0.0");
     builder.enable_describe("ConformanceService");
+    // We implement SHM, so we must answer the handshake: a worker that stays
+    // silent is treated as "no SHM" and clients never negotiate it.
+    builder.enable_transport_options();
     if (!server_id.empty()) builder.server_id(server_id);
     if (!access_log_path.empty()) {
         builder.access_log(access_log_path, access_log_max_record_bytes);

@@ -1,5 +1,5 @@
 ---
-description: "vgi-rpc C++: a C++20 RPC framework built on Apache Arrow IPC — unary, producer, and exchange method patterns over pipe, Unix socket, TCP, and HTTP transports."
+description: "vgi-rpc C++: a C++20 RPC framework built on Apache Arrow IPC — unary, producer, and exchange method patterns over pipe, Unix socket, TCP, and HTTP transports, with a shared-memory side channel."
 hide:
   - navigation
   - toc
@@ -44,6 +44,19 @@ Define RPC methods with typed C++20 handlers using Arrow schemas. The framework 
 Pipe, Unix, and TCP share the same raw Arrow IPC framing and differ only in
 the socket they read and write. HTTP maps the same protocol onto stateless
 request/response pairs and carries the optional features below.
+
+### Shared memory
+
+A **side channel**, not a transport of its own: it rides alongside a pipe or
+socket, which still carries control messages and small batches while a large
+batch is written into a POSIX segment and replaced on the wire by a zero-row
+pointer batch. Enable it with `ServerBuilder::enable_transport_options()`,
+which answers the `__transport_options__` handshake — a worker that stays
+silent is read as "no shared memory" and peers stay inline.
+
+Batches below `VGI_RPC_SHM_MIN_BATCH_BYTES` (128 KiB by default) stay inline,
+because the fixed cost of an allocation, a pointer round trip, and the peer's
+resolve and free only pays off once the copy it avoids is large enough.
 
 ## HTTP features
 

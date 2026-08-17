@@ -7,8 +7,9 @@
 #
 # Two suites, and both are load bearing:
 #
-#   1. `vgi-rpc-test` — the CLI runner, driven over pipe, Unix socket, TCP and
-#      HTTP, plus access-log validation.
+#   1. `vgi-rpc-test` — the CLI runner, driven over pipe (with and without the
+#      shared-memory side channel), Unix socket, TCP and HTTP, plus access-log
+#      validation.
 #   2. `pytest tests/conformance` — the shared pytest suite from
 #      `vgi_rpc.conformance._pytest_suite`, which covers the capability-gated
 #      HTTP groups the CLI runner has no way to reach: sticky sessions, proxy
@@ -82,6 +83,17 @@ run_pipe_access_log() {
                --access-log "$log2" --require-request-data \
                --filter '!large_payload.echo_binary_over_int32_max,!large_payload.echo_binary_4mib' \
                --format table || rc=1
+  echo "::endgroup::"
+}
+
+# The SHM side channel rides alongside the pipe, so this is the pipe suite with
+# a segment attached. VGI_RPC_SHM_MIN_BATCH_BYTES=1 forces *every* data batch
+# through it rather than only the handful of conformance payloads that clear
+# the 128 KiB default — at the default gate the dictionary-encoding path went
+# unexercised, and it was broken.
+run_shm() {
+  echo "::group::conformance: pipe + shared memory"
+  VGI_RPC_SHM_MIN_BATCH_BYTES=1 vgi-rpc-test --cmd "$WORKER" --shm 67108864 --format table || rc=1
   echo "::endgroup::"
 }
 
@@ -161,6 +173,7 @@ run_pytest_suite() {
 
 run_pipe
 run_pipe_access_log
+run_shm
 run_unix
 run_tcp
 run_http "no-cap" ""

@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-vgi-rpc-cpp is a C++20 RPC framework built on Apache Arrow IPC. It provides unary and streaming (producer/exchange) method patterns over four transports: pipe (stdin/stdout), Unix domain socket, TCP, and HTTP. Dispatch is single-threaded by design — the HTTP transport serializes requests under one mutex to preserve that.
+vgi-rpc-cpp is a C++20 RPC framework built on Apache Arrow IPC. It provides unary and streaming (producer/exchange) method patterns over four transports: pipe (stdin/stdout), Unix domain socket, TCP, and HTTP, plus a shared-memory side channel that rides alongside the raw-framing ones. Dispatch is single-threaded by design — the HTTP transport serializes requests under one mutex to preserve that.
 
 The HTTP transport additionally carries the optional features of the wire spec: capability discovery, response and externalization caps, external-location pointer batches, zstd response negotiation, CORS, sticky sessions, standardized 401s, proxy proof, and token introspection. All are off by default.
 

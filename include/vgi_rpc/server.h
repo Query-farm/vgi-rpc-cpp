@@ -17,6 +17,7 @@
 #include "vgi_rpc/http_config.h"
 #include "vgi_rpc/request.h"
 #include "vgi_rpc/result.h"
+#include "vgi_rpc/shm.h"
 #include "vgi_rpc/stream.h"
 
 namespace vgi_rpc {
@@ -94,6 +95,13 @@ public:
     // Set a deterministic server ID (defaults to random_hex(12) if not set).
     ServerBuilder& server_id(std::string id);
 
+    // Answer __transport_options__ (WIRE_PROTOCOL §15), advertising whether
+    // the shared-memory side channel is usable.  A worker that implements SHM
+    // MUST answer this method, or clients will never negotiate it; a worker
+    // that omits it returns method_not_implemented and clients stay on the
+    // pipe, which is also conformant.
+    ServerBuilder& enable_transport_options(bool enabled = true);
+
     // Enable __describe__ introspection.
     // The describe response is a snapshot captured at build() time.
     ServerBuilder& enable_describe(const std::string& protocol_name = "");
@@ -123,6 +131,7 @@ private:
     std::string server_id_;
     std::string protocol_version_;
     std::string access_log_path_;
+    bool transport_options_enabled_ = false;
     int64_t access_log_max_record_bytes_ = kDefaultMaxRecordBytes;
 };
 
@@ -188,11 +197,22 @@ private:
                       const std::shared_ptr<arrow::io::InputStream>& input,
                       const std::shared_ptr<arrow::io::OutputStream>& output);
 
+    // Attach (or reuse) the peer-owned segment this request advertises.
+    // Cached per connection because a segment is process-level, not per-call.
+    void refresh_shm(const std::shared_ptr<arrow::KeyValueMetadata>& custom_metadata);
+
     std::unordered_map<std::string, MethodInfo> methods_;
     std::string server_id_;
     std::string protocol_name_;
     std::string protocol_hash_;
     std::unique_ptr<AccessLogWriter> access_log_;
+
+    // Segment the peer advertised, and the segment for the call in flight.
+    // The second is set only when the client signalled SHM for *this* call, so
+    // a response is never routed through a channel the caller is not reading.
+    std::shared_ptr<ShmSegment> shm_;
+    std::string shm_name_;
+    std::shared_ptr<ShmSegment> call_shm_;
 };
 
 }  // namespace vgi_rpc

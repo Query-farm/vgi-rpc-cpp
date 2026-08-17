@@ -21,6 +21,7 @@ add_library(vgi_rpc
     src/external.cpp
     src/proxy_proof.cpp
     src/session.cpp
+    src/shm.cpp
     src/metadata.cpp
     src/wire.cpp
     src/log.cpp

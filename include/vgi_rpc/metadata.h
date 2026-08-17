@@ -35,6 +35,13 @@ inline constexpr const char* SHM_LENGTH = "vgi_rpc.shm_length";
 inline constexpr const char* SHM_SOURCE = "vgi_rpc.shm_source";
 inline constexpr const char* SHM_SEGMENT_NAME = "vgi_rpc.shm_segment_name";
 inline constexpr const char* SHM_SEGMENT_SIZE = "vgi_rpc.shm_segment_size";
+
+// Transport capability namespace for the __transport_options__ handshake.
+// Matched by prefix and open-ended: an unknown key is ignored, so a future
+// capability needs no protocol-version bump.  A feature is used only when
+// both peers advertise it.
+inline constexpr const char* TRANSPORT_PREFIX = "vgi_rpc.transport.";
+inline constexpr const char* TRANSPORT_SHM = "vgi_rpc.transport.shm";
 inline constexpr const char* PROTOCOL_NAME = "vgi_rpc.protocol_name";
 inline constexpr const char* DESCRIBE_VERSION = "vgi_rpc.describe_version";
 inline constexpr const char* PROTOCOL_HASH = "vgi_rpc.protocol_hash";
@@ -67,6 +74,7 @@ inline constexpr const char* ERROR_KIND_METHOD_NOT_IMPLEMENTED = "method_not_imp
 inline constexpr const char* REQUEST_VERSION_VALUE = "1";
 inline constexpr const char* DESCRIBE_VERSION_VALUE = "4";
 inline constexpr const char* DESCRIBE_METHOD_NAME = "__describe__";
+inline constexpr const char* TRANSPORT_OPTIONS_METHOD_NAME = "__transport_options__";
 
 // Empty schema — used for void results, protocol errors, producer tick input
 VGI_RPC_EXPORT const std::shared_ptr<arrow::Schema>& empty_schema();

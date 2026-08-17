@@ -137,6 +137,11 @@ ServerBuilder& ServerBuilder::protocol_version(std::string version) {
     return *this;
 }
 
+ServerBuilder& ServerBuilder::enable_transport_options(bool enabled) {
+    transport_options_enabled_ = enabled;
+    return *this;
+}
+
 ServerBuilder& ServerBuilder::access_log(std::string path, int64_t max_record_bytes) {
     access_log_path_ = std::move(path);
     access_log_max_record_bytes_ = max_record_bytes;
@@ -162,6 +167,12 @@ std::unique_ptr<Server> ServerBuilder::build() {
 
     if (describe_enabled_) {
         register_describe(method_map, protocol_name_, server_id, protocol_version_);
+    }
+
+    if (transport_options_enabled_) {
+        // Registered after __describe__ so neither synthetic method appears in
+        // the other's output — they are framework surface, not service surface.
+        register_transport_options(method_map, server_id);
     }
 
     return std::unique_ptr<Server>(new Server(

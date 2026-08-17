@@ -19,6 +19,7 @@ vgi_rpc_add_test(request_test)
 vgi_rpc_add_test(result_test)
 vgi_rpc_add_test(output_collector_test)
 vgi_rpc_add_test(server_test)
+vgi_rpc_add_test(shm_test)
 
 if(VGI_RPC_BUILD_BENCHMARKS)
     add_executable(vgi_rpc_benchmark benchmark.cpp)

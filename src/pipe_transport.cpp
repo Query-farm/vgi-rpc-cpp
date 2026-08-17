@@ -8,6 +8,7 @@
 #include "vgi_rpc/wire.h"
 #include "vgi_rpc/log_sink.h"
 #include "vgi_rpc/output_collector.h"
+#include "vgi_rpc/shm.h"
 
 #include <arrow/array.h>
 #include <arrow/compute/cast.h>
@@ -213,6 +214,43 @@ bool Server::serve_one(const std::shared_ptr<arrow::io::InputStream>& input,
     }
 
     auto& method_info = it->second;
+
+    // 5. Shared memory.  Attach whatever segment this request advertises, then
+    //    resolve a pointer request batch back to its real columns.  The
+    //    response is routed through the segment only when the client signalled
+    //    SHM for *this* call — either by sending a pointer or by naming the
+    //    segment — because a caller that sent an inline request is not reading
+    //    the other channel and would see an empty answer.
+    refresh_shm(custom_metadata);
+    const bool request_used_shm =
+        custom_metadata && (custom_metadata->FindKey(keys::SHM_OFFSET) >= 0 ||
+                            custom_metadata->FindKey(keys::SHM_SEGMENT_NAME) >= 0);
+    call_shm_ = request_used_shm ? shm_ : nullptr;
+
+    int64_t shm_free_offset = -1;
+    if (is_shm_pointer_batch(batch, custom_metadata)) {
+        if (!shm_) {
+            // A negotiation violation: fail loudly rather than hand the method
+            // a zero-row batch the caller never sent.
+            auto error_result = Result::error(
+                empty_schema(), "ProtocolError",
+                "Request carries a shared-memory pointer but no segment is attached.",
+                server_id_, request_id);
+            write_ipc_stream(output, empty_schema(), {error_result.annotated_batch()});
+            VGI_RPC_THROW_NOT_OK(output->Flush());
+            return true;
+        }
+        try {
+            batch = resolve_shm_batch(batch, &custom_metadata, shm_, &shm_free_offset);
+        } catch (const std::exception& e) {
+            auto error_result = Result::error(empty_schema(), "ProtocolError", e.what(),
+                                              server_id_, request_id);
+            write_ipc_stream(output, empty_schema(), {error_result.annotated_batch()});
+            VGI_RPC_THROW_NOT_OK(output->Flush());
+            return true;
+        }
+    }
+
     Request request(batch, custom_metadata);
 
     if (method_info.method_type == MethodType::UNARY) {
@@ -220,7 +258,28 @@ bool Server::serve_one(const std::shared_ptr<arrow::io::InputStream>& input,
     } else {
         serve_stream(method_info, request, request_id, input, output);
     }
+
+    // The region is dead once the handler has read its columns out.
+    if (shm_free_offset >= 0 && shm_) shm_->free_alloc(shm_free_offset);
+    call_shm_.reset();
     return true;
+}
+
+void Server::refresh_shm(const std::shared_ptr<arrow::KeyValueMetadata>& custom_metadata) {
+    const std::string name = get_metadata_value(custom_metadata, keys::SHM_SEGMENT_NAME);
+    if (name.empty() || name == shm_name_) return;
+
+    size_t size = 0;
+    try {
+        size = static_cast<size_t>(
+            std::stoull(get_metadata_value(custom_metadata, keys::SHM_SEGMENT_SIZE)));
+    } catch (const std::exception&) {
+        return;  // an unreadable size means we stay on the pipe
+    }
+    // A failed attach is not an error: the peer offered a channel we cannot
+    // use, and the pipe still carries everything.
+    shm_ = ShmSegment::attach(name, size);
+    shm_name_ = shm_ ? name : std::string();
 }
 
 bool Server::serve_unary_http(const MethodInfo& method_info,
@@ -253,7 +312,11 @@ bool Server::serve_unary_http(const MethodInfo& method_info,
     for (auto& log_ab : log_batches) {
         response_batches.push_back(std::move(log_ab));
     }
-    response_batches.push_back(result.annotated_batch());
+    // Log batches are zero-row and pass through untouched; only a data batch
+    // large enough to be worth it becomes a pointer.
+    AnnotatedBatch result_ab = result.annotated_batch();
+    result_ab.batch = maybe_write_to_shm(result_ab.batch, &result_ab.custom_metadata, call_shm_);
+    response_batches.push_back(std::move(result_ab));
     write_ipc_stream(output, method_info.result_schema, response_batches);
     VGI_RPC_THROW_NOT_OK(output->Flush());
 
@@ -419,16 +482,31 @@ void Server::serve_stream(const MethodInfo& method_info,
             }
 
             AnnotatedBatch input_ab;
-            // Exchange streams coerce the inbound batch to the declared input
-            // schema (reorder + compatible casts); producer ticks are empty.
-            input_ab.batch = is_producer
-                ? batch_with_md.batch
-                : coerce_input_batch(batch_with_md.batch, input_schema);
             input_ab.custom_metadata =
                 batch_with_md.custom_metadata
                     ? std::static_pointer_cast<arrow::KeyValueMetadata>(
                           batch_with_md.custom_metadata->Copy())
                     : nullptr;
+
+            // A large exchange input may arrive as a pointer into the peer's
+            // segment; resolve it before coercion so the schema check sees the
+            // real columns rather than a zero-row placeholder.
+            auto raw_input = batch_with_md.batch;
+            int64_t input_free_offset = -1;
+            if (is_shm_pointer_batch(raw_input, input_ab.custom_metadata)) {
+                if (!shm_) {
+                    throw std::runtime_error(
+                        "Stream input carries a shared-memory pointer but no segment is attached.");
+                }
+                raw_input = resolve_shm_batch(raw_input, &input_ab.custom_metadata, shm_,
+                                              &input_free_offset);
+            }
+
+            // Exchange streams coerce the inbound batch to the declared input
+            // schema (reorder + compatible casts); producer ticks are empty.
+            input_ab.batch = is_producer
+                ? raw_input
+                : coerce_input_batch(raw_input, input_schema);
 
             OutputCollector out(output_schema, is_producer, server_id_, request_id);
             CallContext stream_ctx(log_sink, server_id_, request_id);
@@ -445,7 +523,8 @@ void Server::serve_stream(const MethodInfo& method_info,
                 }
             }
 
-            for (const auto& ab : out.batches()) {
+            for (auto ab : out.batches()) {
+                ab.batch = maybe_write_to_shm(ab.batch, &ab.custom_metadata, call_shm_);
                 if (ab.custom_metadata) {
                     VGI_RPC_THROW_NOT_OK(output_writer->WriteRecordBatch(*ab.batch, ab.custom_metadata));
                 } else {
@@ -454,6 +533,9 @@ void Server::serve_stream(const MethodInfo& method_info,
             }
 
             VGI_RPC_THROW_NOT_OK(output->Flush());
+
+            // The handler has read the input by now, so its region is dead.
+            if (input_free_offset >= 0 && shm_) shm_->free_alloc(input_free_offset);
 
             if (out.is_finished()) break;
         }
