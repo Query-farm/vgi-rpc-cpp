@@ -1,0 +1,93 @@
+# © Copyright 2025-2026, Query.Farm LLC - https://query.farm
+# SPDX-License-Identifier: Apache-2.0
+
+# The S3 and GCS external-storage backends, which the main CI does not build.
+#
+# Separate because aws-sdk-cpp and google-cloud-cpp roughly triple the vcpkg
+# build; putting them on every PR would tax every change to pay for two files.
+# Separate is not the same as unrun, though — an untested backend rots — so
+# this fires on any change to the storage code and can be dispatched by hand.
+
+name: Cloud storage backends
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/external.cpp"
+      - "include/vgi_rpc/external.h"
+      - "tests/conformance/test_cloud_storage.py"
+      - "vcpkg.json"
+      - ".github/workflows/cloud-storage.yml"
+  pull_request:
+    paths:
+      - "src/external.cpp"
+      - "include/vgi_rpc/external.h"
+      - "tests/conformance/test_cloud_storage.py"
+      - "vcpkg.json"
+      - ".github/workflows/cloud-storage.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: cloud-storage-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  VCPKG_BINARY_SOURCES: "clear;x-aws,s3://query-farm-duckdb-vcpkg/,readwrite"
+  AWS_ACCESS_KEY_ID: ${{ secrets.VCPKG_CACHING_AWS_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.VCPKG_CACHING_AWS_SECRET_ACCESS_KEY }}
+  AWS_ENDPOINT_URL: ${{ secrets.VCPKG_CACHING_AWS_ENDPOINT_URL }}
+  AWS_DEFAULT_REGION: ${{ secrets.VCPKG_CACHING_AWS_DEFAULT_REGION }}
+  AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+
+jobs:
+  cloud:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install vgi-rpc Python reference and test tooling
+        run: |
+          git clone --depth 1 https://github.com/Query-farm/vgi-rpc-python.git ../vgi-rpc
+          python -m pip install --upgrade pip
+          python -m pip install '../vgi-rpc[http,conformance]'
+          # boto3 creates the bucket and asserts objects landed in it; the
+          # backend under test is the C++ one, not boto3.
+          python -m pip install pytest pytest-timeout boto3
+
+      - name: Clone and bootstrap vcpkg
+        run: |
+          git clone https://github.com/microsoft/vcpkg.git
+          git -C vcpkg checkout 05442024c3fda64320bd25d2251cc9807b84fb6f
+          ./vcpkg/bootstrap-vcpkg.sh -disableMetrics
+
+      - name: Configure with both cloud backends
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_TOOLCHAIN_FILE=vcpkg/scripts/buildsystems/vcpkg.cmake \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DVCPKG_MANIFEST_FEATURES="s3;gcs" \
+            -DVGI_RPC_WITH_S3=ON -DVGI_RPC_WITH_GCS=ON \
+            -DVGI_RPC_BUILD_TESTS=ON
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      # Docker is preinstalled on the runner, so the S3 group drives MinIO;
+      # the GCS group needs nothing but openssl for a throwaway signing key.
+      - name: Test (cloud storage backends)
+        env:
+          VGI_RPC_CPP_WORKER: ${{ github.workspace }}/build/conformance/conformance_worker
+        run: python -m pytest tests/conformance/test_cloud_storage.py -v -p no:randomly
+
+      # A build with the backends on must still pass everything else — the
+      # storage refactor runs through every externalisation path.
+      - name: Test (full conformance)
+        env:
+          CONFORMANCE_WORKER: ${{ github.workspace }}/build/conformance/conformance_worker
+        run: ./scripts/run_conformance.sh

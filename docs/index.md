@@ -79,6 +79,36 @@ Stream state travels as two tokens split by lifetime — a call token minted
 once by `/init` and a cursor re-minted every turn — so a continuation does not
 re-serialize the fixed half of the call.
 
+### External storage
+
+A batch over `externalize_threshold` is uploaded and replaced on the wire by a
+zero-row pointer batch carrying a URL the client re-fetches. `external_storage_url`
+picks the backend by scheme:
+
+| Scheme | Backend | Build |
+|---|---|---|
+| `http(s)://` | A service speaking the four-endpoint alloc/PUT/HEAD/GET contract | always |
+| `s3://bucket/prefix` | AWS S3 via `aws-sdk-cpp` | `-DVGI_RPC_WITH_S3=ON` |
+| `gs://bucket/prefix` | Google Cloud Storage via `google-cloud-cpp` | `-DVGI_RPC_WITH_GCS=ON` |
+
+The cloud backends are **off by default** — both SDKs are long builds, and a
+deployment that externalises through its own HTTPS service needs neither. Turn
+them on together with the matching vcpkg manifest features:
+
+```bash
+cmake --preset default \
+  -DVCPKG_MANIFEST_FEATURES="s3;gcs" \
+  -DVGI_RPC_WITH_S3=ON -DVGI_RPC_WITH_GCS=ON
+```
+
+A URI naming a backend the binary was not built with is refused **at startup**,
+not on the first payload large enough to externalise.
+
+What a pointer batch carries is always a **pre-signed HTTPS URL**, never a
+bucket path, so the client fetches it holding no cloud credentials and linking
+no SDK. `signed_url_ttl_seconds` bounds how long a leaked pointer stays usable.
+Uploaded objects are never deleted — set a lifecycle rule on the bucket.
+
 ## Three Method Types
 
 ### Unary

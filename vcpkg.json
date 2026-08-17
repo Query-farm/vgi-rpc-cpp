@@ -13,5 +13,27 @@
       "features": ["zstd", "zlib", "brotli"]
     },
     "catch2"
-  ]
+  ],
+  "features": {
+    "s3": {
+      "description": "S3 backend for external-location payloads. Opt-in: aws-sdk-cpp is a long build, and a deployment that externalises over pre-signed HTTPS URLs does not need it.",
+      "dependencies": [
+        {
+          "name": "aws-sdk-cpp",
+          "default-features": false,
+          "features": ["s3"]
+        }
+      ]
+    },
+    "gcs": {
+      "description": "Google Cloud Storage backend for external-location payloads. Opt-in for the same reason as s3.",
+      "dependencies": [
+        {
+          "name": "google-cloud-cpp",
+          "default-features": false,
+          "features": ["storage"]
+        }
+      ]
+    }
+  }
 }

@@ -6,6 +6,8 @@ vgi-rpc-cpp is a C++20 RPC framework built on Apache Arrow IPC. It provides unar
 
 The HTTP transport additionally carries the optional features of the wire spec: capability discovery, response and externalization caps, external-location pointer batches, zstd response negotiation, CORS, sticky sessions, standardized 401s, proxy proof, and token introspection. All are off by default.
 
+External storage picks its backend by URL scheme: `http(s)://` always works, while `s3://` and `gs://` need the opt-in vcpkg manifest features (`VCPKG_MANIFEST_FEATURES="s3;gcs"` plus `-DVGI_RPC_WITH_S3=ON -DVGI_RPC_WITH_GCS=ON`). Keep them opt-in — aws-sdk-cpp and google-cloud-cpp roughly triple the dependency build time.
+
 ## Build
 
 ```bash

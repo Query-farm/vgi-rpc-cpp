@@ -15,6 +15,21 @@ find_package(Arrow CONFIG REQUIRED)
 find_package(nlohmann_json CONFIG REQUIRED)
 find_package(httplib CONFIG REQUIRED)
 
+# Cloud backends for external-location payloads.  Off by default: aws-sdk-cpp
+# and google-cloud-cpp are long builds, and a deployment that externalises over
+# pre-signed HTTPS URLs vended by its own service needs neither.  Enable with
+#   cmake --preset default -DVCPKG_MANIFEST_FEATURES="s3;gcs" \
+#         -DVGI_RPC_WITH_S3=ON -DVGI_RPC_WITH_GCS=ON
+option(VGI_RPC_WITH_S3 "Build the S3 external-storage backend (aws-sdk-cpp)" OFF)
+option(VGI_RPC_WITH_GCS "Build the GCS external-storage backend (google-cloud-cpp)" OFF)
+
+if(VGI_RPC_WITH_S3)
+    find_package(AWSSDK CONFIG REQUIRED COMPONENTS s3)
+endif()
+if(VGI_RPC_WITH_GCS)
+    find_package(google_cloud_cpp_storage CONFIG REQUIRED)
+endif()
+
 add_library(vgi_rpc
     src/crypto.cpp
     src/errors.cpp
@@ -57,6 +72,18 @@ target_link_libraries(vgi_rpc PUBLIC
     nlohmann_json::nlohmann_json
     httplib::httplib
 )
+
+# PRIVATE: the SDKs are an implementation detail of src/external.cpp, and the
+# compile definitions gate only that file's backends.  A consumer of the
+# installed library links neither.
+if(VGI_RPC_WITH_S3)
+    target_compile_definitions(vgi_rpc PRIVATE VGI_RPC_WITH_S3)
+    target_link_libraries(vgi_rpc PRIVATE ${AWSSDK_LINK_LIBRARIES})
+endif()
+if(VGI_RPC_WITH_GCS)
+    target_compile_definitions(vgi_rpc PRIVATE VGI_RPC_WITH_GCS)
+    target_link_libraries(vgi_rpc PRIVATE google-cloud-cpp::storage)
+endif()
 
 add_subdirectory(examples)
 

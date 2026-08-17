@@ -1279,8 +1279,18 @@ int main(int argc, char** argv) {
             http_cfg.max_externalized_response_bytes = std::stoll(take_value(i));
         } else if (arg == "--externalize-threshold") {
             http_cfg.externalize_threshold = std::stoll(take_value(i));
-        } else if (arg == "--fake-storage") {
+        } else if (arg == "--fake-storage" || arg == "--external-storage") {
+            // s3://bucket/prefix, gs://bucket/prefix, or an http(s) base URL.
+            // The --fake-storage spelling is what the shared fixtures use.
             http_cfg.external_storage_url = take_value(i);
+        } else if (arg == "--storage-region") {
+            http_cfg.external_storage_region = take_value(i);
+        } else if (arg == "--storage-endpoint") {
+            http_cfg.external_storage_endpoint = take_value(i);
+        } else if (arg == "--storage-signing-account") {
+            http_cfg.external_storage_signing_account = take_value(i);
+        } else if (arg == "--signed-url-ttl") {
+            http_cfg.signed_url_ttl_seconds = std::stoi(take_value(i));
         } else if (arg == "--externalize-compression") {
             http_cfg.externalize_compression = take_value(i);
         } else if (arg == "--no-compression") {

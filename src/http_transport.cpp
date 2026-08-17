@@ -328,7 +328,16 @@ public:
         , proof_(cfg.proof_mode, cfg.proof_origin_id, cfg.proof_secrets,
                  cfg.proof_skew_seconds, cfg.proof_replay_cache) {
         if (!cfg.external_storage_url.empty()) {
-            storage_ = std::make_unique<ExternalStorage>(cfg.external_storage_url);
+            // Throws for a scheme this build cannot serve, so an operator who
+            // configured a bucket learns at startup rather than on the first
+            // payload large enough to externalise.
+            ExternalStorageConfig storage_config;
+            storage_config.uri = cfg.external_storage_url;
+            storage_config.signed_url_ttl_seconds = cfg.signed_url_ttl_seconds;
+            storage_config.region = cfg.external_storage_region;
+            storage_config.endpoint_url = cfg.external_storage_endpoint;
+            storage_config.signing_account = cfg.external_storage_signing_account;
+            storage_ = make_external_storage(storage_config);
         }
     }
 
@@ -547,8 +556,7 @@ std::string HttpServer::maybe_externalize(const std::string& body,
         }
     }
 
-    const std::string url = storage_->allocate(encoding);
-    storage_->upload(url, payload, encoding);
+    const std::string url = storage_->upload(payload, encoding);
     // Charged against the external cap as the bytes the client will fetch.
     if (externalized_bytes) *externalized_bytes += static_cast<int64_t>(payload.size());
 
@@ -590,8 +598,7 @@ std::shared_ptr<arrow::KeyValueMetadata> HttpServer::externalize_cycle(
         }
     }
 
-    const std::string url = storage_->allocate(encoding);
-    storage_->upload(url, payload, encoding);
+    const std::string url = storage_->upload(payload, encoding);
     if (externalized_bytes) *externalized_bytes += static_cast<int64_t>(payload.size());
 
     auto md = std::make_shared<arrow::KeyValueMetadata>();

@@ -58,7 +58,16 @@ struct HttpConfig {
 
     // Externalization: payloads at or above the threshold are uploaded to the
     // configured backend and replaced by a pointer batch.  Empty URL = off.
+    // Accepts s3://bucket/prefix, gs://bucket/prefix, or an http(s) base URL.
     std::string external_storage_url;
+    // Lifetime of the pre-signed URLs a pointer batch carries: long enough for
+    // a client to finish a fetch, short enough that a leaked pointer expires.
+    int signed_url_ttl_seconds = 3600;
+    // S3 only.  Empty means the SDK's own credential and region resolution.
+    std::string external_storage_region;
+    std::string external_storage_endpoint;
+    // GCS only; see ExternalStorageConfig::signing_account.
+    std::string external_storage_signing_account;
     int64_t externalize_threshold = 4096;
     // Coding applied to an externalized payload before upload; empty = none.
     // The integrity digest covers the payload *before* this is applied.
