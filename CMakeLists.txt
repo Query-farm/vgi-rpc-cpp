@@ -79,8 +79,18 @@ target_link_libraries(vgi_rpc PUBLIC
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     find_library(VGI_RPC_RT_LIBRARY rt)
     if(VGI_RPC_RT_LIBRARY)
-        target_link_libraries(vgi_rpc PUBLIC ${VGI_RPC_RT_LIBRARY})
+        # The bare name, not find_library's absolute path: this target is
+        # exported, and an absolute path would pin the installed package to
+        # the machine that built it.
+        target_link_libraries(vgi_rpc PUBLIC rt)
     endif()
+endif()
+
+# BCryptGenRandom (src/crypto.cpp) lives in bcrypt.lib, which MSVC does not
+# link by default.  PUBLIC because the symbol is reached from this library's
+# own objects, which a consumer links directly when building statically.
+if(WIN32)
+    target_link_libraries(vgi_rpc PUBLIC bcrypt)
 endif()
 
 # PRIVATE: the SDKs are an implementation detail of src/external.cpp, and the

@@ -66,9 +66,19 @@ jobs:
           git -C vcpkg checkout 05442024c3fda64320bd25d2251cc9807b84fb6f
           ./vcpkg/bootstrap-vcpkg.sh -disableMetrics
 
+      # The SDKs themselves come from vcpkg's binary cache; this covers our
+      # own sources, which rebuild on every run otherwise.
+      - name: ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: cloud-storage
+          max-size: 500M
+
       - name: Configure with both cloud backends
         run: |
           cmake -S . -B build \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
             -DCMAKE_TOOLCHAIN_FILE=vcpkg/scripts/buildsystems/vcpkg.cmake \
             -DCMAKE_BUILD_TYPE=Release \
             -DVCPKG_MANIFEST_FEATURES="s3;gcs" \

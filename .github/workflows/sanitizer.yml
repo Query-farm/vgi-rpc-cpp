@@ -35,8 +35,19 @@ jobs:
           git -C vcpkg checkout 05442024c3fda64320bd25d2251cc9807b84fb6f
           ./vcpkg/bootstrap-vcpkg.sh -disableMetrics
 
+      # Instrumented builds are the slowest of the three workflows, so this is
+      # where a warm compiler cache pays back most.
+      - name: ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: sanitizer
+          max-size: 500M
+
       - name: Configure
-        run: cmake --preset sanitizer
+        run: >
+          cmake --preset sanitizer
+          -DCMAKE_C_COMPILER_LAUNCHER=ccache
+          -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
 
       - name: Build
         run: cmake --build --preset sanitizer --parallel

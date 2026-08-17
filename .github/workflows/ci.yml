@@ -76,8 +76,20 @@ jobs:
           brew install bison
           echo "$(brew --prefix bison)/bin" >> $GITHUB_PATH
 
+      # vcpkg's binary cache (above) covers the dependencies; this covers our
+      # own translation units, which vcpkg knows nothing about. Keyed per
+      # os+compiler so the three matrix legs do not evict each other.
+      - name: ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: ${{ matrix.os }}-${{ matrix.compiler }}
+          max-size: 500M
+
       - name: Configure
-        run: cmake --preset default
+        run: >
+          cmake --preset default
+          -DCMAKE_C_COMPILER_LAUNCHER=ccache
+          -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
 
       - name: Build
         run: cmake --build --preset default --parallel
