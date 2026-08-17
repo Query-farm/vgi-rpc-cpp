@@ -52,14 +52,16 @@ jobs:
       - name: Install vgi-rpc Python reference (conformance suite)
         if: matrix.conformance
         # Clone the reference implementation and install it with the `http`
-        # extra (httpx2 + zstandard for the --url HTTP client) and the
-        # `conformance` extra (jsonschema, for --access-log validation).
+        # extra (httpx2 + zstandard for the --url HTTP client), the
+        # `conformance` extra (jsonschema, for --access-log validation), and
+        # `external` — the client's external-location *fetch* path imports
+        # aiohttp, so without it every pointer-batch test fails on an import.
         # pytest additionally drives the shared capability-gated suite in
         # vgi_rpc.conformance._pytest_suite, which the CLI runner cannot reach.
         run: |
           git clone --depth 1 https://github.com/Query-farm/vgi-rpc-python.git ../vgi-rpc
           python -m pip install --upgrade pip
-          python -m pip install '../vgi-rpc[http,conformance]'
+          python -m pip install '../vgi-rpc[http,conformance,external]'
           python -m pip install pytest pytest-timeout
 
       - name: Clone and bootstrap vcpkg

@@ -73,6 +73,16 @@ target_link_libraries(vgi_rpc PUBLIC
     httplib::httplib
 )
 
+# shm_open/shm_unlink moved from librt into libc in glibc 2.34.  Linking it
+# where it exists costs nothing (it is a stub on modern glibc) and is what
+# keeps the shared-memory channel building on older distributions.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    find_library(VGI_RPC_RT_LIBRARY rt)
+    if(VGI_RPC_RT_LIBRARY)
+        target_link_libraries(vgi_rpc PUBLIC ${VGI_RPC_RT_LIBRARY})
+    endif()
+endif()
+
 # PRIVATE: the SDKs are an implementation detail of src/external.cpp, and the
 # compile definitions gate only that file's backends.  A consumer of the
 # installed library links neither.

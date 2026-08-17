@@ -123,7 +123,10 @@ std::shared_ptr<arrow::RecordBatch> deserialize_from_shm(
 }  // namespace
 
 int64_t shm_min_batch_bytes() {
-    static const int64_t value = [] {
+    // Explicit return type: std::stoll yields long long while int64_t is long
+    // on LP64 Linux, so a deduced type is ambiguous there and compiles only by
+    // luck on platforms where the two happen to be the same.
+    static const int64_t value = []() -> int64_t {
         if (const char* raw = std::getenv("VGI_RPC_SHM_MIN_BATCH_BYTES")) {
             try {
                 return std::stoll(raw);
