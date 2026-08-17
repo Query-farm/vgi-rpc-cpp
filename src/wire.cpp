@@ -17,6 +17,11 @@
 
 #ifdef _WIN32
   #include <io.h>
+  // windows.h defines min/max as macros and ERROR as a constant, all of
+  // which collide with ordinary C++ spellings; these three keep it to itself.
+  #define WIN32_LEAN_AND_MEAN
+  #define NOMINMAX
+  #define NOGDI
   #include <windows.h>
 #else
   #include <unistd.h>
@@ -42,7 +47,7 @@ BatchType classify_batch(const AnnotatedBatch& ab) {
     auto msg_idx = md->FindKey(keys::LOG_MESSAGE);
     if (level_idx >= 0 && msg_idx >= 0) {
         auto level_str = md->value(level_idx);
-        if (level_str == "EXCEPTION") return BatchType::ERROR;
+        if (level_str == "EXCEPTION") return BatchType::EXCEPTION;
         return BatchType::LOG;
     }
 

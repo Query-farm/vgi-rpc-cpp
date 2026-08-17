@@ -50,6 +50,13 @@ inline constexpr size_t kShmMaxAllocs =
 // gate can be moved without a rebuild.
 VGI_RPC_EXPORT int64_t shm_min_batch_bytes();
 
+// Whether this build can map a segment at all.  The channel is POSIX shared
+// memory (shm_open + mmap), which is what the Go, Java and Python peers speak;
+// Windows' named mappings are a different, non-interoperable backing, so it
+// reports false and peers stay on the pipe.  __transport_options__ answers
+// from here rather than repeating the platform test.
+VGI_RPC_EXPORT bool shm_available();
+
 // A segment owned by the peer, attached read-write for the life of a call.
 // Read-write because freeing an allocation rewrites the header's allocation
 // list, which a read-only mapping could not do.

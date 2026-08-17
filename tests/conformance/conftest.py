@@ -27,6 +27,13 @@ from typing import Any
 
 import pytest
 
+#: Unix sockets and the raw TCP transport are POSIX-only in this port — the
+#: worker refuses them on Windows rather than pretending — so the matrix drops
+#: those legs there instead of failing every test in them.
+_SKIP_POSIX_ONLY = pytest.mark.skipif(
+    sys.platform == "win32", reason="unix and tcp transports are POSIX-only"
+)
+
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _DEFAULT_WORKER = _REPO_ROOT / "build" / "conformance" / "conformance_worker"
 
@@ -157,7 +164,14 @@ def conformance_tcp_addr() -> Iterator[tuple[str, int]]:
         yield host, int(port)
 
 
-@pytest.fixture(params=["subprocess", "http", "unix", "tcp"])
+@pytest.fixture(
+    params=[
+        "subprocess",
+        "http",
+        pytest.param("unix", marks=_SKIP_POSIX_ONLY),
+        pytest.param("tcp", marks=_SKIP_POSIX_ONLY),
+    ]
+)
 def conformance_conn(request: pytest.FixtureRequest, conformance_http_port: int) -> Any:
     """Connection factory over each transport the C++ worker implements.
 

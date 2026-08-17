@@ -21,7 +21,9 @@
 #include <arrow/util/key_value_metadata.h>
 
 #ifdef _WIN32
+  #include <fcntl.h>
   #include <io.h>
+  #include <stdio.h>
   #define STDIN_FILENO 0
 #else
   #include <unistd.h>
@@ -123,6 +125,16 @@ double elapsed_ms_since(std::chrono::steady_clock::time_point t0) {
 }  // anonymous namespace
 
 void Server::run() {
+#ifdef _WIN32
+    // Windows opens the standard streams in text mode, which rewrites CRLF and
+    // — the part that actually bites — treats a 0x1A byte as end of file.  Arrow
+    // IPC is binary, so a payload containing 0x1A reads short, the worker calls
+    // it a corrupt stream and exits, and the peer sees the pipe die mid-write.
+    // It hid for a while because the conformance payload that crosses INT_MAX
+    // is one repeated byte that happens to be neither.
+    _setmode(_fileno(stdin), _O_BINARY);
+    _setmode(_fileno(stdout), _O_BINARY);
+#endif
     // Our own fd stream rather than arrow::io::StdinStream: a message body can
     // exceed INT_MAX, and the read side needs the same clamp-and-loop treatment
     // as the write side (see kMaxIoChunk in wire.h).

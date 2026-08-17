@@ -58,7 +58,7 @@ IpcStreamContents read_response(const std::shared_ptr<arrow::Buffer>& buf) {
 // Extract exception_type from an ERROR batch's metadata.
 std::string get_error_type(const IpcStreamContents& contents) {
     for (const auto& ab : contents.batches) {
-        if (classify_batch(ab) == BatchType::ERROR) {
+        if (classify_batch(ab) == BatchType::EXCEPTION) {
             auto extra_idx = ab.custom_metadata->FindKey(keys::LOG_EXTRA);
             if (extra_idx >= 0) {
                 auto extra = nlohmann::json::parse(ab.custom_metadata->value(extra_idx));

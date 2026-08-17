@@ -7,6 +7,11 @@
 #include <stdexcept>
 
 #ifdef _WIN32
+  // windows.h defines min/max as macros and ERROR as a constant, all of
+  // which collide with ordinary C++ spellings; these three keep it to itself.
+  #define WIN32_LEAN_AND_MEAN
+  #define NOMINMAX
+  #define NOGDI
   #include <windows.h>
   #include <bcrypt.h>
 #else

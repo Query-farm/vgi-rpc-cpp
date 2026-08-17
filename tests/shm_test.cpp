@@ -20,6 +20,14 @@ using namespace vgi_rpc;
 
 namespace {
 
+// Windows has no POSIX shared memory, so there is nothing here to exercise —
+// the library reports shm = "false" and peers stay on the pipe.  Skipped
+// rather than compiled out, so the absence is visible in the test report.
+#define REQUIRE_SHM()                                                    \
+    do {                                                                 \
+        if (!shm_available()) SKIP("shared memory is POSIX-only");        \
+    } while (0)
+
 // A distinct name per test, so a leftover segment from a crashed run cannot
 // make the next one pass or fail for the wrong reason.
 std::string unique_name(const char* tag) {
@@ -58,6 +66,7 @@ std::shared_ptr<arrow::RecordBatch> dictionary_batch() {
 }  // namespace
 
 TEST_CASE("shm: a created segment attaches and reports the same size", "[shm]") {
+    REQUIRE_SHM();
     const auto name = unique_name("attach");
     auto owner = ShmSegment::create(name, 1 << 20);
     REQUIRE(owner != nullptr);
@@ -70,12 +79,14 @@ TEST_CASE("shm: a created segment attaches and reports the same size", "[shm]") 
 }
 
 TEST_CASE("shm: attaching a segment that does not exist fails softly", "[shm]") {
+    REQUIRE_SHM();
     // nullptr rather than an exception: a peer offering a channel we cannot
     // use is not an error, it just means staying on the pipe.
     REQUIRE(ShmSegment::attach(unique_name("absent"), 1 << 20) == nullptr);
 }
 
 TEST_CASE("shm: a batch round-trips through the segment", "[shm]") {
+    REQUIRE_SHM();
     const auto name = unique_name("roundtrip");
     auto owner = ShmSegment::create(name, 4 << 20);
     REQUIRE(owner != nullptr);
@@ -113,6 +124,7 @@ TEST_CASE("shm: a batch round-trips through the segment", "[shm]") {
 }
 
 TEST_CASE("shm: a dictionary-encoded batch round-trips", "[shm]") {
+    REQUIRE_SHM();
     // Stored without its schema message, so the reader has to rebuild the
     // stream around the dictionary and record-batch messages. A null
     // out-parameter in that path once corrupted every enum-valued response.
@@ -132,6 +144,7 @@ TEST_CASE("shm: a dictionary-encoded batch round-trips", "[shm]") {
 }
 
 TEST_CASE("shm: allocations are first-fit and free space coalesces", "[shm]") {
+    REQUIRE_SHM();
     const auto name = unique_name("alloc");
     auto owner = ShmSegment::create(name, 8 << 20);
     REQUIRE(owner != nullptr);
@@ -164,6 +177,7 @@ TEST_CASE("shm: allocations are first-fit and free space coalesces", "[shm]") {
 }
 
 TEST_CASE("shm: a batch too large for the segment stays inline", "[shm]") {
+    REQUIRE_SHM();
     // Not an error: a full allocator means the pipe carries this one.
     const auto name = unique_name("full");
     auto owner = ShmSegment::create(name, kShmHeaderSize + 4096);
@@ -179,6 +193,7 @@ TEST_CASE("shm: a batch too large for the segment stays inline", "[shm]") {
 }
 
 TEST_CASE("shm: a batch below the threshold stays inline", "[shm]") {
+    REQUIRE_SHM();
     const auto name = unique_name("small");
     auto owner = ShmSegment::create(name, 1 << 20);
     REQUIRE(owner != nullptr);
@@ -191,6 +206,7 @@ TEST_CASE("shm: a batch below the threshold stays inline", "[shm]") {
 }
 
 TEST_CASE("shm: a log batch is not mistaken for a pointer", "[shm]") {
+    REQUIRE_SHM();
     // Both are zero-row; only the level key tells them apart, and treating a
     // log batch as a pointer would read garbage out of the data region.
     auto schema = arrow::schema({arrow::field("value", arrow::int64())});
@@ -211,6 +227,7 @@ TEST_CASE("shm: a log batch is not mistaken for a pointer", "[shm]") {
 }
 
 TEST_CASE("shm: a pointer outside the segment is refused", "[shm]") {
+    REQUIRE_SHM();
     // Rather than reading whatever happens to be mapped there.
     const auto name = unique_name("bounds");
     auto owner = ShmSegment::create(name, 1 << 20);
@@ -226,6 +243,7 @@ TEST_CASE("shm: a pointer outside the segment is refused", "[shm]") {
 }
 
 TEST_CASE("shm: reset drops every allocation", "[shm]") {
+    REQUIRE_SHM();
     const auto name = unique_name("reset");
     auto owner = ShmSegment::create(name, 1 << 20);
     REQUIRE(owner != nullptr);

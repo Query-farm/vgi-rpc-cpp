@@ -122,6 +122,14 @@ std::shared_ptr<arrow::RecordBatch> deserialize_from_shm(
 
 }  // namespace
 
+bool shm_available() {
+#ifdef _WIN32
+    return false;
+#else
+    return true;
+#endif
+}
+
 int64_t shm_min_batch_bytes() {
     // Explicit return type: std::stoll yields long long while int64_t is long
     // on LP64 Linux, so a deduced type is ambiguous there and compiles only by
@@ -420,11 +428,7 @@ void register_transport_options(std::unordered_map<std::string, MethodInfo>& met
     auto md = std::make_shared<arrow::KeyValueMetadata>();
     // Advertised false on a build that cannot map a segment at all, so a peer
     // stays on the pipe instead of writing pointers we could never resolve.
-#ifdef _WIN32
-    md->Append(keys::TRANSPORT_SHM, "false");
-#else
-    md->Append(keys::TRANSPORT_SHM, "true");
-#endif
+    md->Append(keys::TRANSPORT_SHM, shm_available() ? "true" : "false");
     md->Append(keys::SERVER_ID, server_id);
     md->Append(keys::REQUEST_VERSION, REQUEST_VERSION_VALUE);
 

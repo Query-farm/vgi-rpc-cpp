@@ -54,18 +54,41 @@ add_library(vgi_rpc
 )
 
 target_compile_definitions(vgi_rpc PRIVATE VGI_RPC_BUILDING)
+# PUBLIC so it reaches consumers, including those of the installed package:
+# whether the dllimport attribute is correct is a property of how this library
+# was built, and only this build knows it.
+if(BUILD_SHARED_LIBS)
+    target_compile_definitions(vgi_rpc PUBLIC VGI_RPC_SHARED)
+endif()
 
 target_include_directories(vgi_rpc PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>
 )
 
+# Which Arrow target exists is decided by how Arrow was built, and vcpkg's
+# default triplet differs by platform: static on Linux and macOS, a DLL on
+# Windows.  Assuming either one turns a perfectly good Arrow into a "target
+# not found" at generate time, so take what the found package actually
+# defines unless an explicit choice was made.
 option(VGI_RPC_ARROW_SHARED "Link against shared Arrow" OFF)
 if(VGI_RPC_ARROW_SHARED)
+    if(NOT TARGET Arrow::arrow_shared)
+        message(FATAL_ERROR
+            "VGI_RPC_ARROW_SHARED is ON but the Arrow package defines no "
+            "Arrow::arrow_shared target; this Arrow was built static.")
+    endif()
+    set(_VGI_RPC_ARROW_TARGET Arrow::arrow_shared)
+elseif(TARGET Arrow::arrow_static)
+    set(_VGI_RPC_ARROW_TARGET Arrow::arrow_static)
+elseif(TARGET Arrow::arrow_shared)
     set(_VGI_RPC_ARROW_TARGET Arrow::arrow_shared)
 else()
-    set(_VGI_RPC_ARROW_TARGET Arrow::arrow_static)
+    message(FATAL_ERROR
+        "The Arrow package defines neither Arrow::arrow_static nor "
+        "Arrow::arrow_shared.")
 endif()
+message(STATUS "Linking Arrow via ${_VGI_RPC_ARROW_TARGET}")
 
 target_link_libraries(vgi_rpc PUBLIC
     ${_VGI_RPC_ARROW_TARGET}

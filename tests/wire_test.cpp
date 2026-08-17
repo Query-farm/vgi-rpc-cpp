@@ -52,7 +52,7 @@ TEST_CASE("classify_batch: EXCEPTION level -> ERROR", "[wire]") {
     md->Append(keys::LOG_LEVEL, "EXCEPTION");
     md->Append(keys::LOG_MESSAGE, "boom");
     AnnotatedBatch ab{batch, md};
-    REQUIRE(classify_batch(ab) == BatchType::ERROR);
+    REQUIRE(classify_batch(ab) == BatchType::EXCEPTION);
 }
 
 TEST_CASE("classify_batch: location -> EXTERNAL_POINTER", "[wire]") {

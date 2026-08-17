@@ -20,7 +20,10 @@ namespace vgi_rpc {
 enum class BatchType {
     DATA,
     LOG,
-    ERROR,
+    // Named for what the wire protocol calls it — an EXCEPTION batch — and
+    // not ERROR, which <windows.h> defines as a macro and would rewrite this
+    // enumerator out from under any consumer that included it first.
+    EXCEPTION,
     EXTERNAL_POINTER,
     SHM_POINTER,
     STATE_TOKEN,

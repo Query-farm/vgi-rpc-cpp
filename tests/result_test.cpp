@@ -52,7 +52,7 @@ TEST_CASE("Result::error produces zero-row batch with EXCEPTION metadata", "[res
     auto& ab = result.annotated_batch();
     REQUIRE(ab.batch->num_rows() == 0);
     REQUIRE(ab.batch->num_columns() == 1);
-    REQUIRE(ab.type() == BatchType::ERROR);
+    REQUIRE(ab.type() == BatchType::EXCEPTION);
     REQUIRE(ab.custom_metadata != nullptr);
 
     auto idx = ab.custom_metadata->FindKey(keys::LOG_LEVEL);
