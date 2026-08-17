@@ -18,8 +18,11 @@
 #include <arrow/record_batch.h>
 #include <arrow/type.h>
 
+#include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <format>
+#include <iostream>
 #include <limits>
 #include <memory>
 #include <sstream>
@@ -721,25 +724,41 @@ static void reset_cancel_probe_handler(const Request&, CallContext&) {
 // Implemented with a single process-global counter for robustness.
 // =========================================================================
 
-static int64_t g_sticky_counter = 0;
+// The handle-bearing object a sticky session binds.  Trivial on purpose: the
+// feature under test is that *this* object comes back on the next request to
+// the same worker, not what it holds.
+class StickyCounter : public SessionState {
+public:
+    explicit StickyCounter(int64_t value) : value(value) {}
+    int64_t value;
+};
 
-static Result open_counter_handler(const Request& req, CallContext&) {
+// Resolve the counter bound to this request, or say plainly that none is.
+static StickyCounter& require_counter(CallContext& ctx) {
+    auto* counter = dynamic_cast<StickyCounter*>(ctx.session().get());
+    if (!counter) throw std::runtime_error("no sticky counter bound to this request");
+    return *counter;
+}
+
+static Result open_counter_handler(const Request& req, CallContext& ctx) {
     auto initial = req.get<int64_t>("initial");
-    g_sticky_counter = initial;
+    ctx.open_session(std::make_shared<StickyCounter>(initial));
     arrow::Int64Builder b;
     VGI_RPC_THROW_NOT_OK(b.Append(initial));
     return Result::value(int_result_schema(), {unwrap(b.Finish())});
 }
-static Result increment_counter_handler(const Request& req, CallContext&) {
-    auto by = req.get<int64_t>("by");
-    g_sticky_counter += by;
+static Result increment_counter_handler(const Request& req, CallContext& ctx) {
+    auto& counter = require_counter(ctx);
+    counter.value += req.get<int64_t>("by");
     arrow::Int64Builder b;
-    VGI_RPC_THROW_NOT_OK(b.Append(g_sticky_counter));
+    VGI_RPC_THROW_NOT_OK(b.Append(counter.value));
     return Result::value(int_result_schema(), {unwrap(b.Finish())});
 }
-static Result close_counter_handler(const Request&, CallContext&) {
+static Result close_counter_handler(const Request&, CallContext& ctx) {
+    const int64_t final_value = require_counter(ctx).value;
+    ctx.close_session();
     arrow::Int64Builder b;
-    VGI_RPC_THROW_NOT_OK(b.Append(g_sticky_counter));
+    VGI_RPC_THROW_NOT_OK(b.Append(final_value));
     return Result::value(int_result_schema(), {unwrap(b.Finish())});
 }
 
@@ -920,11 +939,15 @@ private:
 class SessionCounterProducerState : public ProducerState {
 public:
     SessionCounterProducerState(int64_t count) : count_(count) {}
-    void produce(OutputCollector& out, CallContext&) override {
+    void produce(OutputCollector& out, CallContext& ctx) override {
         if (current_ >= count_) { out.finish(); return; }
-        ++g_sticky_counter;
+        // Resolved per turn, not captured at init: across HTTP turns the
+        // sticky middleware rebinds the session on every request, which is
+        // exactly the property this exercises.
+        auto& counter = require_counter(ctx);
+        ++counter.value;
         arrow::Int64Builder val;
-        VGI_RPC_THROW_NOT_OK(val.Append(g_sticky_counter));
+        VGI_RPC_THROW_NOT_OK(val.Append(counter.value));
         out.emit_arrays({unwrap(val.Finish())});
         ++current_;
     }
@@ -1030,11 +1053,12 @@ public:
 // Sticky-session exchange (HTTP-only; not exercised over pipe).
 class SessionCounterExchangeState : public ExchangeState {
 public:
-    void exchange(const AnnotatedBatch& input, OutputCollector& out, CallContext&) override {
+    void exchange(const AnnotatedBatch& input, OutputCollector& out, CallContext& ctx) override {
+        auto& counter = require_counter(ctx);
         auto col = checked_cast_column<arrow::Int64Array>(input.batch, "by");
-        for (int64_t i = 0; i < col->length(); ++i) g_sticky_counter += col->Value(i);
+        for (int64_t i = 0; i < col->length(); ++i) counter.value += col->Value(i);
         arrow::Int64Builder val;
-        VGI_RPC_THROW_NOT_OK(val.Append(g_sticky_counter));
+        VGI_RPC_THROW_NOT_OK(val.Append(counter.value));
         out.emit_arrays({unwrap(val.Finish())});
     }
 };
@@ -1196,9 +1220,25 @@ int main(int argc, char** argv) {
     // worker stays launchable by the cross-language test harness.
     std::string access_log_path;
     bool http = false;
-    std::string host = "127.0.0.1";
-    int port = 0;
-    int64_t max_response_bytes = -1;
+    bool unix_mode = false;
+    std::string unix_path;
+    bool tcp_mode = false;
+    std::string server_id;
+    vgi_rpc::HttpConfig http_cfg;
+    // Sticky is on by default here, matching the reference conformance worker,
+    // so the TestSticky group runs rather than skipping.  It stays off by
+    // default in HttpConfig itself, where the library's posture belongs.
+    http_cfg.sticky = true;
+    http_cfg.test_drain_endpoint = true;
+    bool sticky_echo = true;
+    int64_t access_log_max_record_bytes = vgi_rpc::kDefaultMaxRecordBytes;
+    if (const char* env = std::getenv("VGI_RPC_ACCESS_LOG_MAX_RECORD_BYTES")) {
+        try {
+            access_log_max_record_bytes = std::stoll(env);
+        } catch (const std::exception&) {
+            // Keep the default rather than refusing to start over a bad env var.
+        }
+    }
     auto take_value = [&](int& i) -> std::string {
         return (i + 1 < argc) ? std::string(argv[++i]) : std::string();
     };
@@ -1210,16 +1250,94 @@ int main(int argc, char** argv) {
             access_log_path = arg.substr(std::string("--access-log=").size());
         } else if (arg == "--http") {
             http = true;
+        } else if (arg == "--unix") {
+            unix_mode = true;
+            unix_path = take_value(i);
+        } else if (arg == "--tcp") {
+            // "[HOST:]PORT" — the host defaults to loopback, because TCP here
+            // carries no auth or TLS and must not bind the world by accident.
+            tcp_mode = true;
+            const std::string spec = take_value(i);
+            const size_t colon = spec.rfind(':');
+            if (colon == std::string::npos) {
+                http_cfg.port = std::stoi(spec);
+            } else {
+                http_cfg.host = spec.substr(0, colon);
+                http_cfg.port = std::stoi(spec.substr(colon + 1));
+            }
         } else if (arg == "--host") {
-            host = take_value(i);
+            http_cfg.host = take_value(i);
         } else if (arg == "--port") {
-            port = std::stoi(take_value(i));
+            http_cfg.port = std::stoi(take_value(i));
+        } else if (arg == "--prefix") {
+            http_cfg.prefix = take_value(i);
+        } else if (arg == "--server-id") {
+            server_id = take_value(i);
         } else if (arg == "--max-response-bytes") {
-            max_response_bytes = std::stoll(take_value(i));
+            http_cfg.max_response_bytes = std::stoll(take_value(i));
+        } else if (arg == "--max-externalized-response-bytes") {
+            http_cfg.max_externalized_response_bytes = std::stoll(take_value(i));
+        } else if (arg == "--externalize-threshold") {
+            http_cfg.externalize_threshold = std::stoll(take_value(i));
+        } else if (arg == "--fake-storage") {
+            http_cfg.external_storage_url = take_value(i);
+        } else if (arg == "--externalize-compression") {
+            http_cfg.externalize_compression = take_value(i);
+        } else if (arg == "--no-compression") {
+            http_cfg.compression = false;
+        } else if (arg == "--cors-origin") {
+            http_cfg.cors_origin = take_value(i);
+        } else if (arg == "--introspect") {
+            http_cfg.token_introspection = true;
+        } else if (arg == "--sticky") {
+            http_cfg.sticky = true;
+        } else if (arg == "--no-sticky") {
+            http_cfg.sticky = false;
+        } else if (arg == "--no-sticky-echo") {
+            sticky_echo = false;
+        } else if (arg == "--sticky-ttl") {
+            http_cfg.sticky = true;
+            http_cfg.sticky_default_ttl = std::stoi(take_value(i));
+        } else if (arg == "--sticky-auth") {
+            http_cfg.sticky = true;
+            http_cfg.sticky_header_auth = true;
+        } else if (arg == "--token-key") {
+            auto raw = vgi_rpc::crypto::hex_decode(take_value(i));
+            if (!raw || raw->size() != vgi_rpc::crypto::kAeadKeyBytes) {
+                std::cerr << "vgi_rpc: --token-key must be 64 hex characters\n";
+                return 2;
+            }
+            std::copy(raw->begin(), raw->end(), http_cfg.token_key.begin());
+        } else if (arg == "--no-call-state-cache") {
+            http_cfg.call_state_cache = false;
+        } else if (arg == "--auth-reject-all") {
+            // Reject every RPC request; health stays reachable.  Also honours
+            // X-Conformance-Auth-Reason so the discrimination tests can drive
+            // each reason code — a fixture affordance, never production shape.
+            http_cfg.reject_all = vgi_rpc::AuthReason::UNAUTHORIZED;
+            http_cfg.honour_requested_auth_reason = true;
+        } else if (arg == "--proof-mode") {
+            const std::string mode = take_value(i);
+            if (mode == "require") {
+                http_cfg.proof_mode = vgi_rpc::ProofMode::REQUIRE;
+            } else if (mode == "allow") {
+                http_cfg.proof_mode = vgi_rpc::ProofMode::ALLOW;
+            } else {
+                http_cfg.proof_mode = vgi_rpc::ProofMode::OFF;
+            }
+        } else if (arg == "--proof-origin-id") {
+            http_cfg.proof_origin_id = take_value(i);
+        } else if (arg == "--proof-secrets") {
+            http_cfg.proof_secrets = take_value(i);
+        } else if (arg == "--proof-skew") {
+            http_cfg.proof_skew_seconds = std::stoi(take_value(i));
+        } else if (arg == "--proof-no-replay-cache") {
+            http_cfg.proof_replay_cache = false;
+        } else if (arg == "--access-log-max-record-bytes" && i + 1 < argc) {
+            access_log_max_record_bytes = std::stoll(take_value(i));
         } else if ((arg == "--access-log-max-bytes" || arg == "--access-log-when" ||
-                    arg == "--access-log-backup-count" ||
-                    arg == "--access-log-max-record-bytes") && i + 1 < argc) {
-            ++i;  // accept and ignore the value
+                    arg == "--access-log-backup-count") && i + 1 < argc) {
+            ++i;  // rotation knobs: accepted so the harness can launch us
         }
     }
 
@@ -1537,17 +1655,43 @@ int main(int argc, char** argv) {
             session_by_schema(), session_value_schema(), make_exchange_session_counter,
             "Exchange stream adding each input by column to the sticky session counter.");
 
-    builder.protocol_version("1.0.0");
-    builder.enable_describe("ConformanceService");
-    if (!access_log_path.empty()) {
-        builder.access_log(access_log_path);
+    // A fixed marker rather than a real platform header: the contract under
+    // test is capture-and-replay, and a stable name is what lets the shared
+    // suite assert it. Real deployments substitute their own.
+    if (http_cfg.sticky && sticky_echo) {
+        http_cfg.sticky_echo_headers["x-vgi-conformance-echo"] = "conformance-fixed-marker";
     }
 
-    auto server = builder.build();
-    if (http) {
-        server->serve_http(host, port, max_response_bytes);
-    } else {
-        server->run();
+    builder.protocol_version("1.0.0");
+    builder.enable_describe("ConformanceService");
+    if (!server_id.empty()) builder.server_id(server_id);
+    if (!access_log_path.empty()) {
+        builder.access_log(access_log_path, access_log_max_record_bytes);
+    }
+
+    std::unique_ptr<vgi_rpc::Server> server;
+    try {
+        server = builder.build();
+    } catch (const std::exception& e) {
+        std::cerr << "vgi_rpc: failed to build server: " << e.what() << "\n";
+        return 2;
+    }
+
+    try {
+        if (http) {
+            server->serve_http(http_cfg);
+        } else if (unix_mode) {
+            server->serve_unix(unix_path);
+        } else if (tcp_mode) {
+            server->serve_tcp(http_cfg.host, http_cfg.port);
+        } else {
+            server->run();
+        }
+    } catch (const std::exception& e) {
+        // A misconfigured gate must abort rather than degrade to serving
+        // something weaker than the operator believes they configured.
+        std::cerr << "vgi_rpc: " << e.what() << "\n";
+        return 2;
     }
     return 0;
 }

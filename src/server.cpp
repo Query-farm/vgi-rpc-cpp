@@ -81,7 +81,9 @@ ServerBuilder& ServerBuilder::add_producer(
     info.input_schema = empty_schema();
     info.output_schema = std::move(output_schema);
     info.header_schema = std::move(header_schema);
-    info.has_return = true;
+    // A stream yields batches; it has no return value.  __describe__ reports
+    // has_return=false for every stream method, producer and exchange alike.
+    info.has_return = false;
     info.doc = doc;
     info.stream_factory = std::move(factory);
     methods_.push_back(std::move(info));
@@ -109,7 +111,9 @@ ServerBuilder& ServerBuilder::add_exchange(
     info.input_schema = std::move(input_schema);
     info.output_schema = std::move(output_schema);
     info.header_schema = std::move(header_schema);
-    info.has_return = true;
+    // A stream yields batches; it has no return value.  __describe__ reports
+    // has_return=false for every stream method, producer and exchange alike.
+    info.has_return = false;
     info.doc = doc;
     info.stream_factory = std::move(factory);
     info.is_exchange = true;
@@ -133,8 +137,9 @@ ServerBuilder& ServerBuilder::protocol_version(std::string version) {
     return *this;
 }
 
-ServerBuilder& ServerBuilder::access_log(std::string path) {
+ServerBuilder& ServerBuilder::access_log(std::string path, int64_t max_record_bytes) {
     access_log_path_ = std::move(path);
+    access_log_max_record_bytes_ = max_record_bytes;
     return *this;
 }
 
@@ -161,7 +166,8 @@ std::unique_ptr<Server> ServerBuilder::build() {
 
     return std::unique_ptr<Server>(new Server(
         std::move(method_map), std::move(server_id),
-        protocol_name_, std::move(protocol_hash), access_log_path_));
+        protocol_name_, std::move(protocol_hash), access_log_path_,
+        access_log_max_record_bytes_));
 }
 
 // Server
@@ -170,14 +176,16 @@ Server::Server(std::unordered_map<std::string, MethodInfo> methods,
                std::string server_id,
                std::string protocol_name,
                std::string protocol_hash,
-               const std::string& access_log_path)
+               const std::string& access_log_path,
+               int64_t access_log_max_record_bytes)
     : methods_(std::move(methods))
     , server_id_(std::move(server_id))
     , protocol_name_(std::move(protocol_name))
     , protocol_hash_(std::move(protocol_hash)) {
     if (!access_log_path.empty()) {
         access_log_ = std::make_unique<AccessLogWriter>(
-            access_log_path, server_id_, protocol_name_, protocol_hash_);
+            access_log_path, server_id_, protocol_name_, protocol_hash_,
+            access_log_max_record_bytes);
     }
 }
 

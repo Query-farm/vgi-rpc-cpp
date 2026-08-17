@@ -21,6 +21,7 @@
 #else
   #include <unistd.h>
 #endif
+#include <algorithm>
 #include <cerrno>
 #include <cstring>
 #include <stdexcept>
@@ -128,6 +129,12 @@ void write_ipc_stream(
     VGI_RPC_THROW_NOT_OK(writer->Close());
 }
 
+int64_t ipc_stream_byte_size(const std::shared_ptr<arrow::RecordBatch>& batch) {
+    auto counter = std::make_shared<arrow::io::MockOutputStream>();
+    write_ipc_stream(counter, batch->schema(), {AnnotatedBatch::data(batch)});
+    return counter->GetExtentBytesWritten();
+}
+
 // Consumes remaining batches from an IPC reader through the end-of-stream
 // marker.  This call blocks until the sender closes their end of the stream.
 // Used after early-exit to keep the pipe in a consistent state for the next
@@ -138,6 +145,91 @@ void drain_reader(const std::shared_ptr<arrow::ipc::RecordBatchStreamReader>& re
         auto status = reader->ReadNext(&batch);
         if (!status.ok() || !batch) break;
     }
+}
+
+// Clamped, looping fd primitives.  Both the clamp and the loop are load
+// bearing — see the comment on kMaxIoChunk in wire.h.
+arrow::Status write_all_fd(int fd, const void* data, int64_t nbytes) {
+    const auto* bytes = static_cast<const uint8_t*>(data);
+    int64_t written = 0;
+    while (written < nbytes) {
+        const int64_t chunk = std::min<int64_t>(nbytes - written, kMaxIoChunk);
+#ifdef _WIN32
+        auto n = ::_write(fd, bytes + written, static_cast<unsigned int>(chunk));
+#else
+        auto n = ::write(fd, bytes + written, static_cast<size_t>(chunk));
+#endif
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            if (errno == EPIPE) return arrow::Status::IOError("Broken pipe");
+            return arrow::Status::IOError("Write failed: ", std::strerror(errno));
+        }
+        if (n == 0) return arrow::Status::IOError("Write made no progress");
+        written += n;
+    }
+    return arrow::Status::OK();
+}
+
+arrow::Result<int64_t> read_full_fd(int fd, void* out, int64_t nbytes) {
+    auto* bytes = static_cast<uint8_t*>(out);
+    int64_t total = 0;
+    while (total < nbytes) {
+        const int64_t chunk = std::min<int64_t>(nbytes - total, kMaxIoChunk);
+#ifdef _WIN32
+        auto n = ::_read(fd, bytes + total, static_cast<unsigned int>(chunk));
+#else
+        auto n = ::read(fd, bytes + total, static_cast<size_t>(chunk));
+#endif
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return arrow::Status::IOError("Read failed: ", std::strerror(errno));
+        }
+        if (n == 0) break;  // EOF
+        total += n;
+    }
+    return total;
+}
+
+// FdInputStream implementation
+arrow::Status FdInputStream::Close() {
+    closed_ = true;
+    return arrow::Status::OK();
+}
+
+arrow::Result<int64_t> FdInputStream::Read(int64_t nbytes, void* out) {
+    if (closed_) return arrow::Status::IOError("FdInputStream is closed");
+    ARROW_ASSIGN_OR_RAISE(int64_t n, read_full_fd(fd_, out, nbytes));
+    position_ += n;
+    return n;
+}
+
+arrow::Result<std::shared_ptr<arrow::Buffer>> FdInputStream::Read(int64_t nbytes) {
+    ARROW_ASSIGN_OR_RAISE(auto buf, arrow::AllocateResizableBuffer(nbytes));
+    ARROW_ASSIGN_OR_RAISE(int64_t n, Read(nbytes, buf->mutable_data()));
+    if (n < nbytes) {
+        RETURN_NOT_OK(buf->Resize(n, /*shrink_to_fit=*/false));
+    }
+    return std::shared_ptr<arrow::Buffer>(std::move(buf));
+}
+
+// FdOutputStream implementation
+arrow::Status FdOutputStream::Close() {
+    closed_ = true;
+    return arrow::Status::OK();
+}
+
+arrow::Status FdOutputStream::Write(const void* data, int64_t nbytes) {
+    if (closed_) return arrow::Status::IOError("FdOutputStream is closed");
+    RETURN_NOT_OK(write_all_fd(fd_, data, nbytes));
+    position_ += nbytes;
+    return arrow::Status::OK();
+}
+
+arrow::Status FdOutputStream::Flush() {
+    // Sockets and pipes have no userspace buffer here — the bytes are in the
+    // kernel once write(2) returns — and fsync on a non-seekable fd is either
+    // redundant or an EINVAL.
+    return arrow::Status::OK();
 }
 
 // StdoutStream implementation
@@ -153,33 +245,26 @@ arrow::Status StdoutStream::Close() {
 arrow::Status StdoutStream::Write(const void* data, int64_t nbytes) {
     if (closed_) return arrow::Status::IOError("StdoutStream is closed");
 
-    const auto* bytes = static_cast<const uint8_t*>(data);
-    int64_t written = 0;
 #ifdef _WIN32
+    // Go through the Win32 handle rather than the CRT fd so that stdout is not
+    // subject to text-mode translation, which would corrupt Arrow IPC.
+    const auto* bytes = static_cast<const uint8_t*>(data);
     HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
     if (h == INVALID_HANDLE_VALUE) {
         return arrow::Status::IOError("Failed to get stdout handle");
     }
+    int64_t written = 0;
     while (written < nbytes) {
-        DWORD to_write = static_cast<DWORD>(
-            std::min<int64_t>(nbytes - written, static_cast<int64_t>(MAXDWORD)));
+        DWORD to_write = static_cast<DWORD>(std::min<int64_t>(nbytes - written, kMaxIoChunk));
         DWORD n = 0;
         if (!WriteFile(h, bytes + written, to_write, &n, nullptr)) {
             return arrow::Status::IOError("Write to stdout failed");
         }
+        if (n == 0) return arrow::Status::IOError("Write to stdout made no progress");
         written += n;
     }
 #else
-    while (written < nbytes) {
-        auto n = ::write(STDOUT_FILENO, bytes + written, nbytes - written);
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            if (errno == EPIPE) return arrow::Status::IOError("Broken pipe");
-            return arrow::Status::IOError("Write to stdout failed: ",
-                                          std::strerror(errno));
-        }
-        written += n;
-    }
+    RETURN_NOT_OK(write_all_fd(STDOUT_FILENO, data, nbytes));
 #endif
     position_ += nbytes;
     return arrow::Status::OK();

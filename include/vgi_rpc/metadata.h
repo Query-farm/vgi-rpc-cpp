@@ -43,7 +43,25 @@ inline constexpr const char* CANCEL = "vgi_rpc.cancel";
 inline constexpr const char* TRACEPARENT = "traceparent";
 inline constexpr const char* TRACESTATE = "tracestate";
 
+// Stream state travels as two tokens split by lifetime: the call token is
+// minted once by /init and names the fixed half (the request and the resolved
+// schemas), while the cursor token is re-minted every turn.  Packing both into
+// one would re-serialize and re-parse the fixed half on every continuation,
+// which for a typical stream is most of the payload.
+inline constexpr const char* STATE_B64 = "vgi_rpc.stream_state#b64";
+inline constexpr const char* CALL_STATE_B64 = "vgi_rpc.call_state#b64";
+
+// Machine-readable error class, alongside the human-facing error_type.
+// Clients branch on this; "session_lost" and "server_draining" are the values
+// a sticky-aware client must recognize.
+inline constexpr const char* ERROR_KIND = "vgi_rpc.error_kind";
+
 }  // namespace keys
+
+// Well-known error_kind values.
+inline constexpr const char* ERROR_KIND_SESSION_LOST = "session_lost";
+inline constexpr const char* ERROR_KIND_SERVER_DRAINING = "server_draining";
+inline constexpr const char* ERROR_KIND_METHOD_NOT_IMPLEMENTED = "method_not_implemented";
 
 // Protocol constants
 inline constexpr const char* REQUEST_VERSION_VALUE = "1";

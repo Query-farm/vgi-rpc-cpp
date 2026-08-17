@@ -1,5 +1,5 @@
 ---
-description: "vgi-rpc C++: a C++20 RPC framework built on Apache Arrow IPC — unary, producer, and exchange method patterns over pipe-based transport."
+description: "vgi-rpc C++: a C++20 RPC framework built on Apache Arrow IPC — unary, producer, and exchange method patterns over pipe, Unix socket, TCP, and HTTP transports."
 hide:
   - navigation
   - toc
@@ -19,7 +19,7 @@ C++ implementation of the [vgi_rpc](https://vgi-rpc.query.farm/) framework — A
 
 </div>
 
-Define RPC methods with typed C++20 handlers using Arrow schemas. The framework provides server dispatch with automatic parameter extraction and result serialization over stdin/stdout pipe transport.
+Define RPC methods with typed C++20 handlers using Arrow schemas. The framework provides server dispatch with automatic parameter extraction and result serialization over four transports: stdin/stdout pipes, Unix domain sockets, TCP, and HTTP.
 
 ## Key Features
 
@@ -30,6 +30,41 @@ Define RPC methods with typed C++20 handlers using Arrow schemas. The framework 
 - **Introspection** via optional `__describe__` method
 - **Error handling** — exceptions automatically converted to protocol error responses
 - **Builder pattern** — fluent `ServerBuilder` API for registering methods
+- **Access log** — JSONL records per call, with the spec's field-shedding size cap
+
+## Transports
+
+| Transport | Entry point | Discovery line |
+|---|---|---|
+| Pipe (stdin/stdout) | `Server::run()` | — |
+| Unix domain socket | `Server::serve_unix(path)` | `UNIX:<path>` |
+| TCP (trusted networks; no auth or TLS) | `Server::serve_tcp(host, port)` | `TCP:<host>:<port>` |
+| HTTP | `Server::serve_http(HttpConfig)` | `PORT:<port>` |
+
+Pipe, Unix, and TCP share the same raw Arrow IPC framing and differ only in
+the socket they read and write. HTTP maps the same protocol onto stateless
+request/response pairs and carries the optional features below.
+
+## HTTP features
+
+All off by default — a server built with `HttpConfig{}` is byte-identical on
+the wire to one built before any of them existed.
+
+| Feature | Configuration |
+|---|---|
+| Capability discovery (`GET`/`OPTIONS {prefix}/health`) | always on |
+| Response caps, strict-fail | `max_response_bytes`, `max_externalized_response_bytes` |
+| External locations (pointer batches) | `external_storage_url`, `externalize_threshold` |
+| Response codec negotiation (zstd) | `compression` |
+| CORS, including `Cross-Origin-Resource-Policy` | `cors_origin` |
+| Sticky sessions (AEAD-sealed tokens, TTL, drain) | `sticky`, `sticky_default_ttl`, `sticky_echo_headers` |
+| Standardized 401s with `VGI-Auth-Reason` | `reject_all` |
+| Proxy proof (HMAC-SHA256 proof-of-hop) | `proof_mode`, `proof_origin_id`, `proof_secrets` |
+| Token introspection | `token_introspection` |
+
+Stream state travels as two tokens split by lifetime — a call token minted
+once by `/init` and a cursor re-minted every turn — so a continuation does not
+re-serialize the fixed half of the call.
 
 ## Three Method Types
 

@@ -19,6 +19,13 @@
 #include <arrow/type.h>
 #include <arrow/util/key_value_metadata.h>
 
+#ifdef _WIN32
+  #include <io.h>
+  #define STDIN_FILENO 0
+#else
+  #include <unistd.h>
+#endif
+
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -80,14 +87,31 @@ std::shared_ptr<arrow::RecordBatch> coerce_input_batch(
     return arrow::RecordBatch::Make(target, batch->num_rows(), std::move(cols));
 }
 
-// Serialize a request batch to a self-contained Arrow IPC stream and return it
-// base64-encoded, for the access log's request_data field.
-std::string serialize_request_b64(const std::shared_ptr<arrow::RecordBatch>& batch) {
+}  // anonymous namespace
+
+// Populate `rec`'s request_data (or its truncation accounting) for `batch`.
+//
+// The size is measured before anything is serialized, because the alternative
+// is not merely wasteful: a 2 GiB request would otherwise be copied into an
+// IPC buffer and then expanded ~4/3 again into base64, for a record the cap
+// throws away regardless.  That is how the >INT_MAX conformance payload ran
+// the worker out of memory.
+void fill_request_data(const AccessLogWriter& log, AccessRecord& rec,
+                       const std::shared_ptr<arrow::RecordBatch>& batch) {
+    const int64_t b64_len = base64_encoded_length(ipc_stream_byte_size(batch));
+    if (!log.payload_fits(b64_len)) {
+        rec.has_request_data = false;
+        rec.original_request_bytes = b64_len;
+        return;
+    }
     auto out = unwrap(arrow::io::BufferOutputStream::Create());
     write_ipc_stream(out, batch->schema(), {AnnotatedBatch::data(batch)});
     auto buf = unwrap(out->Finish());
-    return base64_encode(buf->data(), static_cast<size_t>(buf->size()));
+    rec.request_data_b64 = base64_encode(buf->data(), static_cast<size_t>(buf->size()));
+    rec.has_request_data = true;
 }
+
+namespace {
 
 // Milliseconds elapsed since `t0`.
 double elapsed_ms_since(std::chrono::steady_clock::time_point t0) {
@@ -98,14 +122,21 @@ double elapsed_ms_since(std::chrono::steady_clock::time_point t0) {
 }  // anonymous namespace
 
 void Server::run() {
-    auto input = std::make_shared<arrow::io::StdinStream>();
+    // Our own fd stream rather than arrow::io::StdinStream: a message body can
+    // exceed INT_MAX, and the read side needs the same clamp-and-loop treatment
+    // as the write side (see kMaxIoChunk in wire.h).
+    auto input = std::make_shared<FdInputStream>(STDIN_FILENO);
     auto output = std::make_shared<StdoutStream>();
 
     while (true) {
         try {
             if (!serve_one(input, output)) break;
-        } catch (const std::exception&) {
-            break;  // Fatal I/O error (broken pipe); cannot recover
+        } catch (const std::exception& e) {
+            // Fatal I/O error (broken pipe); cannot recover.  Say so — a silent
+            // exit here presents to the client as a truncated response body,
+            // which is a much harder thing to diagnose than a line on stderr.
+            fprintf(stderr, "vgi_rpc: fatal transport error, closing: %s\n", e.what());
+            break;
         }
     }
 }
@@ -192,49 +223,36 @@ bool Server::serve_one(const std::shared_ptr<arrow::io::InputStream>& input,
     return true;
 }
 
-void Server::serve_unary(const MethodInfo& method_info,
-                         const Request& request,
-                         const std::string& request_id,
-                         const std::shared_ptr<arrow::io::OutputStream>& output) {
+bool Server::serve_unary_http(const MethodInfo& method_info,
+                              const Request& request,
+                              const std::string& request_id,
+                              const std::shared_ptr<arrow::io::OutputStream>& output,
+                              CallContext& ctx) {
     auto t0 = std::chrono::steady_clock::now();
-    auto log_sink = std::make_shared<LogSink>(server_id_, request_id);
-    CallContext ctx(log_sink, server_id_, request_id);
+    auto log_sink = ctx.log_sink();
 
     std::string status = "ok", error_type, error_message;
     Result result = Result::void_result();
     try {
         result = method_info.handler(request, ctx);
-    } catch (const std::invalid_argument& e) {
-        status = "error"; error_type = "ValueError"; error_message = e.what();
-        result = Result::error(
-            method_info.result_schema, "ValueError", e.what(),
-            server_id_, request_id);
-    } catch (const std::out_of_range& e) {
-        status = "error"; error_type = "IndexError"; error_message = e.what();
-        result = Result::error(
-            method_info.result_schema, "IndexError", e.what(),
-            server_id_, request_id);
-    } catch (const std::logic_error& e) {
-        status = "error"; error_type = "TypeError"; error_message = e.what();
-        result = Result::error(
-            method_info.result_schema, "TypeError", e.what(),
-            server_id_, request_id);
     } catch (const std::exception& e) {
-        status = "error"; error_type = "RuntimeError"; error_message = e.what();
-        result = Result::error(
-            method_info.result_schema, "RuntimeError", e.what(),
-            server_id_, request_id);
+        // The exception's class picks the error_type but never the HTTP
+        // status: a raising method still answers 200, with the error in the
+        // body, because the call reached the method and the method raised.
+        status = "error";
+        error_type = exception_type_of(e);
+        error_message = e.what();
+        result = Result::error(method_info.result_schema, error_type, e.what(), server_id_,
+                               request_id, error_kind_of(e));
     }
 
     auto log_batches = log_sink->flush(method_info.result_schema);
 
     std::vector<AnnotatedBatch> response_batches;
     response_batches.reserve(log_batches.size() + 1);
-
     for (auto& log_ab : log_batches) {
         response_batches.push_back(std::move(log_ab));
     }
-
     response_batches.push_back(result.annotated_batch());
     write_ipc_stream(output, method_info.result_schema, response_batches);
     VGI_RPC_THROW_NOT_OK(output->Flush());
@@ -242,15 +260,25 @@ void Server::serve_unary(const MethodInfo& method_info,
     if (access_log_ && access_log_->enabled()) {
         AccessRecord rec;
         rec.method = method_info.name;
+        rec.request_id = request_id;
         rec.is_stream = false;
         rec.status = status;
         rec.error_type = error_type;
         rec.error_message = error_message;
         rec.duration_ms = elapsed_ms_since(t0);
-        rec.request_data_b64 = serialize_request_b64(request.batch());
-        rec.has_request_data = true;
+        fill_request_data(*access_log_, rec, request.batch());
         access_log_->emit(rec);
     }
+    return status == "error";
+}
+
+void Server::serve_unary(const MethodInfo& method_info,
+                         const Request& request,
+                         const std::string& request_id,
+                         const std::shared_ptr<arrow::io::OutputStream>& output) {
+    auto log_sink = std::make_shared<LogSink>(server_id_, request_id);
+    CallContext ctx(log_sink, server_id_, request_id);
+    serve_unary_http(method_info, request, request_id, output, ctx);
 }
 
 void Server::serve_stream(const MethodInfo& method_info,
@@ -461,6 +489,7 @@ void Server::serve_stream(const MethodInfo& method_info,
     if (access_log_ && access_log_->enabled()) {
         AccessRecord rec;
         rec.method = method_info.name;
+        rec.request_id = request_id;
         rec.is_stream = true;
         rec.status = status;
         rec.error_type = error_type;
@@ -468,8 +497,7 @@ void Server::serve_stream(const MethodInfo& method_info,
         rec.duration_ms = elapsed_ms_since(t0);
         rec.stream_id = stream_id;
         rec.cancelled = cancelled_flag;
-        rec.request_data_b64 = serialize_request_b64(request.batch());
-        rec.has_request_data = true;
+        fill_request_data(*access_log_, rec, request.batch());
         access_log_->emit(rec);
     }
 }

@@ -4,3 +4,6 @@ vcpkg/
 .claude/
 site/
 .venv/
+__pycache__/
+*.pyc
+build-*/

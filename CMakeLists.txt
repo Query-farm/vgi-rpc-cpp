@@ -16,6 +16,11 @@ find_package(nlohmann_json CONFIG REQUIRED)
 find_package(httplib CONFIG REQUIRED)
 
 add_library(vgi_rpc
+    src/crypto.cpp
+    src/errors.cpp
+    src/external.cpp
+    src/proxy_proof.cpp
+    src/session.cpp
     src/metadata.cpp
     src/wire.cpp
     src/log.cpp
@@ -25,6 +30,7 @@ add_library(vgi_rpc
     src/call_context.cpp
     src/server.cpp
     src/pipe_transport.cpp
+    src/socket_transport.cpp
     src/describe.cpp
     src/access_log.cpp
     src/http_transport.cpp

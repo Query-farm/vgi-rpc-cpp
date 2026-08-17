@@ -12,6 +12,7 @@ function(vgi_rpc_add_test name)
     catch_discover_tests(${name} TEST_PREFIX "${name}:" PROPERTIES TIMEOUT 60)
 endfunction()
 
+vgi_rpc_add_test(crypto_test)
 vgi_rpc_add_test(metadata_test)
 vgi_rpc_add_test(wire_test)
 vgi_rpc_add_test(request_test)

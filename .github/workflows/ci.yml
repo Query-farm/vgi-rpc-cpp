@@ -52,12 +52,15 @@ jobs:
       - name: Install vgi-rpc Python reference (conformance suite)
         if: matrix.conformance
         # Clone the reference implementation and install it with the `http`
-        # extra (httpx + zstandard for the --url HTTP client) and the
+        # extra (httpx2 + zstandard for the --url HTTP client) and the
         # `conformance` extra (jsonschema, for --access-log validation).
+        # pytest additionally drives the shared capability-gated suite in
+        # vgi_rpc.conformance._pytest_suite, which the CLI runner cannot reach.
         run: |
           git clone --depth 1 https://github.com/Query-farm/vgi-rpc-python.git ../vgi-rpc
           python -m pip install --upgrade pip
           python -m pip install '../vgi-rpc[http,conformance]'
+          python -m pip install pytest pytest-timeout
 
       - name: Clone and bootstrap vcpkg
         run: |
@@ -88,10 +91,12 @@ jobs:
             -DCMAKE_PREFIX_PATH="${{ runner.temp }}/install;$(pwd)/build/vcpkg_installed/${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}-linux"
           cmake --build ${{ runner.temp }}/install_test_build
 
-      - name: Test (conformance — pipe + HTTP + access-log)
+      - name: Test (conformance — pipe, unix, tcp, HTTP, access-log, pytest suite)
         if: matrix.conformance
-        # Runs the official cross-language `vgi-rpc-test` suite against the C++
-        # worker over every transport it supports (see scripts/run_conformance.sh).
+        # Runs both official cross-language suites against the C++ worker over
+        # every transport it supports (see scripts/run_conformance.sh): the
+        # `vgi-rpc-test` CLI runner, and the shared pytest suite that covers
+        # the capability-gated HTTP groups.
         env:
           CONFORMANCE_WORKER: ${{ github.workspace }}/build/conformance/conformance_worker
         run: ./scripts/run_conformance.sh
