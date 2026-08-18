@@ -43,3 +43,18 @@ Prefer:
 - Smart pointers throughout — no raw new/delete
 - Exceptions for errors, `std::optional` for nullable access
 - Arrow errors converted via `unwrap()` / `VGI_RPC_THROW_NOT_OK()`
+
+Formatting is not a matter of opinion here — run `scripts/format.sh` (or
+`--check`, which is what CI runs before it builds anything). clang-format,
+Google style with 4-space indent and a 100-column limit. The script pins the
+major version, because clang-format's output changes between releases and
+contributors on different versions reformat each other's files on every
+commit.
+
+`-Wall -Wextra` are on. `-Wreturn-stack-address` is the reason: it caught a
+reference bound into the temporary `shared_ptr` that `ArrayBuilder::type()`
+returns, which the full conformance suite ran straight past.
+
+Line endings are LF, enforced by `.gitattributes`. The tree previously had
+files that were part CRLF and part LF, which turned every small edit into a
+whole-file diff.
