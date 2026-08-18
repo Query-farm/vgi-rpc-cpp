@@ -194,6 +194,11 @@ if(VGI_RPC_BUILD_TESTS)
         )
         set_tests_properties(conformance PROPERTIES
             TIMEOUT 60
+            # 77 means the interpreter CMake found cannot import the
+            # Python reference; that is a missing dependency, not a
+            # failing worker.  scripts/run_conformance.sh is the
+            # authoritative suite either way.
+            SKIP_RETURN_CODE 77
             ENVIRONMENT "CONFORMANCE_WORKER=$<TARGET_FILE:conformance_worker>"
         )
     endif()

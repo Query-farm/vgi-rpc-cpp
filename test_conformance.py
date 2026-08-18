@@ -10,11 +10,21 @@ _vgi_rpc_path = os.environ.get(
 )
 sys.path.insert(0, _vgi_rpc_path)
 
-from vgi_rpc.rpc import SubprocessTransport, RpcConnection, AnnotatedBatch, RpcError
-from vgi_rpc.conformance import ConformanceService, Point, BoundingBox, Status, AllTypes, ConformanceHeader
-from vgi_rpc.introspect import introspect
-from vgi_rpc.log import Level, Message
-import pyarrow as pa
+try:
+    from vgi_rpc.rpc import SubprocessTransport, RpcConnection, AnnotatedBatch, RpcError
+    from vgi_rpc.conformance import ConformanceService, Point, BoundingBox, Status, AllTypes, ConformanceHeader
+    from vgi_rpc.introspect import introspect
+    from vgi_rpc.log import Level, Message
+    import pyarrow as pa
+except ImportError as exc:
+    # CMake registers this test against whatever interpreter it found, which is
+    # often not the one the Python reference is installed into.  A missing
+    # dependency says nothing about the C++ worker, so report it as a skip (the
+    # exit code CMake maps to SKIP_RETURN_CODE) rather than a failure.
+    print(f"skipping: Python reference not importable ({exc})", file=sys.stderr)
+    print(f"  looked in {_vgi_rpc_path} using {sys.executable}", file=sys.stderr)
+    print("  set VGI_RPC_PYTHON_PATH, or configure with -DPython3_EXECUTABLE=...", file=sys.stderr)
+    sys.exit(77)
 
 CMD = [os.environ.get(
     "CONFORMANCE_WORKER",

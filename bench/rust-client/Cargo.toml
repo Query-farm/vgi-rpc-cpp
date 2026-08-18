@@ -1,0 +1,25 @@
+[package]
+name = "vgi-rpc-cpp-bench"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Benchmark the C++ vgi-rpc worker with a native client, no Python in the loop"
+
+[[bin]]
+name = "vgi-rpc-cpp-bench"
+path = "src/main.rs"
+
+# Path dependency on a sibling checkout of vgi-rpc-rust, the same shape CI
+# already uses for the Python reference.  Point it elsewhere with a
+# [patch] section or a .cargo/config.toml `paths` entry; there is no
+# environment variable for it, because Cargo resolves path deps before
+# any build script could read one.
+[dependencies]
+vgi-rpc-client = { path = "../../../vgi-rpc-rust/vgi-rpc-client", features = ["shm"] }
+vgi-rpc = { path = "../../../vgi-rpc-rust/vgi-rpc", default-features = false }
+arrow-array = "59"
+arrow-schema = "59"
+
+[profile.release]
+opt-level = 3
+lto = true

@@ -43,15 +43,32 @@ from typing import Any
 _ACTIVE_SEGMENT: Any = None
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
-_DEFAULT_WORKER = _REPO_ROOT / "build" / "conformance" / "conformance_worker"
+
+#: Release first, deliberately.  The ``default`` CMake preset is a Debug build
+#: that runs about half the speed of a release one, and benchmarking it reads
+#: as a plausible-looking result rather than an obvious mistake — it took the
+#: C++ server losing to the Python reference server to notice.
+_WORKER_CANDIDATES = (
+    _REPO_ROOT / "build-release" / "conformance" / "conformance_worker",
+    _REPO_ROOT / "build" / "conformance" / "conformance_worker",
+)
 
 
 def worker_path() -> str:
     override = os.environ.get("CONFORMANCE_WORKER")
-    path = Path(override) if override else _DEFAULT_WORKER
-    if not path.is_file():
-        sys.exit(f"worker not found: {path} (build it, or set CONFORMANCE_WORKER)")
-    return str(path)
+    if override:
+        path = Path(override)
+        if not path.is_file():
+            sys.exit(f"CONFORMANCE_WORKER is not a file: {path}")
+        return str(path)
+    for path in _WORKER_CANDIDATES:
+        if path.is_file():
+            return str(path)
+    sys.exit(
+        "worker not found in "
+        + " or ".join(str(p) for p in _WORKER_CANDIDATES)
+        + " (build it, or set CONFORMANCE_WORKER)"
+    )
 
 
 def _free_port() -> int:

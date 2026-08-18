@@ -55,13 +55,46 @@ void serve_connection(Server& server, int fd) {
 // Accept and serve connections one at a time, forever.  Sequential by design:
 // the framework's dispatch model is single-threaded, and a concurrent listener
 // would need a lock around every handler that bought nothing.
-void accept_loop(Server& server, int listen_fd) {
+//
+// Socket buffer asked for on an accepted connection.  macOS gives a Unix
+// domain socket 8 KiB by default — against ~64 KiB for a pipe and 128 KiB for
+// TCP — and at 8 KiB a megabyte of Arrow costs 128 round trips through the
+// kernel instead of a handful.  A request is best-effort: the kernel clamps to
+// its own maximum and a refusal is not worth failing a connection over.
+constexpr int kSocketBufferBytes = 1 << 20;
+
+void tune_socket_buffers(int fd) {
+    const int size = kSocketBufferBytes;
+    ::setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &size, sizeof(size));
+    ::setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &size, sizeof(size));
+}
+
+// `is_tcp` decides whether Nagle is disabled on the accepted socket; a Unix
+// socket has no such algorithm to turn off.
+void accept_loop(Server& server, int listen_fd, bool is_tcp) {
     while (true) {
         int fd = ::accept(listen_fd, nullptr, nullptr);
         if (fd < 0) {
             if (errno == EINTR) continue;
             std::fprintf(stderr, "vgi_rpc: accept failed: %s\n", std::strerror(errno));
             break;
+        }
+        tune_socket_buffers(fd);
+        if (is_tcp) {
+            // Request/response over small writes is the shape Nagle exists to
+            // coalesce, so it holds a reply back waiting for more to send —
+            // and against a peer's delayed ACK that becomes the classic
+            // tens-of-milliseconds stall.
+            //
+            // Measured on loopback this is a ~14% *loss* (tcp/pipe latency
+            // ratio 2.34 -> 2.66, ratio rather than absolute because the
+            // machine drifts more than the effect). That is loopback telling
+            // on itself: with instant ACKs Nagle's downside never arrives,
+            // while its coalescing still saves per-segment work. The stall it
+            // prevents needs a real link to appear, and a real link is what
+            // this transport is for.
+            int one = 1;
+            ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
         }
         serve_connection(server, fd);
         ::close(fd);
@@ -102,7 +135,7 @@ void Server::serve_unix(const std::string& path) {
     // Discovery line, then flush: a launcher blocks on this to learn the
     // socket is ready, so buffering it would look like a hung worker.
     std::cout << "UNIX:" << path << std::endl;
-    accept_loop(*this, listen_fd);
+    accept_loop(*this, listen_fd, /*is_tcp=*/false);
     ::unlink(path.c_str());
 }
 
@@ -143,7 +176,7 @@ void Server::serve_tcp(const std::string& host, int port) {
     }
 
     std::cout << "TCP:" << bind_host << ":" << bound_port << std::endl;
-    accept_loop(*this, listen_fd);
+    accept_loop(*this, listen_fd, /*is_tcp=*/true);
 }
 
 #else  // _WIN32
