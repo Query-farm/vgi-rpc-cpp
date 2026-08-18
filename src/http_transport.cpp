@@ -918,13 +918,26 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res)
 
     // Stream /exchange continuations carry the state tokens instead of the
     // request_version metadata, so only the initial request is version-checked.
+    // The application protocol version rides the same metadata and is gated on
+    // the same requests, for the same reason.
+    //
+    // The synthetic `__`-prefixed methods are exempt: they are framework
+    // surface, and `__describe__` in particular is how a mismatched client
+    // finds out what this server speaks.
     if (!is_exchange_ep) {
         auto version = get_metadata_value(custom_metadata, keys::REQUEST_VERSION);
         if (version != REQUEST_VERSION_VALUE) {
             fail(400, "VersionError", "Unsupported or missing request version, expected '1'.");
             return;
         }
+        if (method_name.rfind("__", 0) != 0) {
+            if (auto reason = rpc_.protocol_version_error(custom_metadata); !reason.empty()) {
+                fail(400, "ProtocolVersionError", reason);
+                return;
+            }
+        }
     }
+
 
     const AuthIdentity id = identify(req);
     const std::string aad = session_aad(id.domain, id.principal, id.authenticated);

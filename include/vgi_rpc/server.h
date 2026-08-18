@@ -162,6 +162,17 @@ public:
     const std::string& server_id() const noexcept { return server_id_; }
     const std::string& protocol_name() const noexcept { return protocol_name_; }
     const std::unordered_map<std::string, MethodInfo>& methods() const noexcept { return methods_; }
+    // The reason a request's declared application protocol version is
+    // incompatible with this server's, or empty when it is fine.
+    //
+    // Enforced here rather than left to the client because a mismatch means
+    // the two sides disagree about what the *payloads* mean: caught at the
+    // dispatch boundary it is one clear error, and caught later it is a
+    // schema mismatch somewhere inside a method. Compared on major and minor
+    // only — a patch release does not change the surface. A server that
+    // declared no version enforces nothing.
+    std::string protocol_version_error(
+        const std::shared_ptr<arrow::KeyValueMetadata>& custom_metadata) const;
 
     // Returns false on EOF (clean shutdown), true when a request was served.
     bool serve_one(const std::shared_ptr<arrow::io::InputStream>& input,
@@ -183,8 +194,10 @@ private:
            std::string server_id,
            std::string protocol_name,
            std::string protocol_hash,
+           std::string protocol_version,
            const std::string& access_log_path,
            int64_t access_log_max_record_bytes = kDefaultMaxRecordBytes);
+
 
     void serve_unary(const MethodInfo& method_info,
                      const Request& request,
@@ -205,6 +218,7 @@ private:
     std::string server_id_;
     std::string protocol_name_;
     std::string protocol_hash_;
+    std::string protocol_version_;
     std::unique_ptr<AccessLogWriter> access_log_;
 
     // Segment the peer advertised, and the segment for the call in flight.

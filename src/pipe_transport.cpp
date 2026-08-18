@@ -203,7 +203,21 @@ bool Server::serve_one(const std::shared_ptr<arrow::io::InputStream>& input,
         return true;
     }
 
-    // 4. Look up handler
+    // 4. Application protocol version gate.
+    // The synthetic `__`-prefixed methods are exempt: they are framework
+    // surface, and `__describe__` in particular is how a mismatched client
+    // finds out what this server speaks.
+    if (method_name.rfind("__", 0) != 0) {
+        if (auto reason = protocol_version_error(custom_metadata); !reason.empty()) {
+            auto error_result = Result::error(empty_schema(), "ProtocolVersionError", reason,
+                                              server_id_, request_id);
+            write_ipc_stream(output, empty_schema(), {error_result.annotated_batch()});
+            VGI_RPC_THROW_NOT_OK(output->Flush());
+            return true;
+        }
+    }
+
+    // 5. Look up handler
     auto it = methods_.find(method_name);
     if (it == methods_.end()) {
         std::vector<std::string> names;
@@ -227,7 +241,7 @@ bool Server::serve_one(const std::shared_ptr<arrow::io::InputStream>& input,
 
     auto& method_info = it->second;
 
-    // 5. Shared memory.  Attach whatever segment this request advertises, then
+    // 6. Shared memory.  Attach whatever segment this request advertises, then
     //    resolve a pointer request batch back to its real columns.  The
     //    response is routed through the segment only when the client signalled
     //    SHM for *this* call — either by sending a pointer or by naming the

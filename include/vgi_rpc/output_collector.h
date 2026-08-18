@@ -19,6 +19,8 @@
 
 #include "vgi_rpc/annotated_batch.h"
 #include "vgi_rpc/export.h"
+#include <arrow/util/key_value_metadata.h>
+
 #include "vgi_rpc/log.h"
 
 namespace vgi_rpc {
@@ -33,6 +35,15 @@ public:
 
     // Emit a pre-built data batch
     void emit_batch(std::shared_ptr<arrow::RecordBatch> batch);
+
+    // Emit a data batch carrying per-batch custom metadata.
+    //
+    // Distinct from schema metadata, which describes the shape: this describes
+    // *this batch*, which is what an application protocol needs when a batch
+    // says something about itself — a cache advertisement, a row-provenance
+    // map, a batch index.
+    void emit_batch(std::shared_ptr<arrow::RecordBatch> batch,
+                    std::shared_ptr<arrow::KeyValueMetadata> metadata);
 
     // Emit a data batch from arrays
     void emit_arrays(const std::vector<std::shared_ptr<arrow::Array>>& arrays);

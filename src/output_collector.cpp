@@ -33,6 +33,16 @@ void OutputCollector::emit_batch(std::shared_ptr<arrow::RecordBatch> batch) {
     batches_.push_back(std::move(ab));
 }
 
+void OutputCollector::emit_batch(std::shared_ptr<arrow::RecordBatch> batch,
+                                 std::shared_ptr<arrow::KeyValueMetadata> metadata) {
+    emit_batch(std::move(batch));
+    // The batch just appended is the last one; attaching afterwards keeps the
+    // validation in the single-argument overload rather than duplicating it.
+    if (metadata && !batches_.empty()) {
+        batches_.back().custom_metadata = std::move(metadata);
+    }
+}
+
 void OutputCollector::emit_arrays(
     const std::vector<std::shared_ptr<arrow::Array>>& arrays) {
     int64_t num_rows = arrays.empty() ? 0 : arrays[0]->length();
