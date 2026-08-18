@@ -25,6 +25,7 @@
 #include "vgi_rpc/proxy_proof.h"
 #include "vgi_rpc/session.h"
 #include "vgi_rpc/wire.h"
+#include "request_contract.h"
 
 #include <arrow/array.h>
 #include <arrow/builder.h>
@@ -131,33 +132,6 @@ std::shared_ptr<arrow::RecordBatch> coerce_input(const std::shared_ptr<arrow::Re
         cols.push_back(std::move(col));
     }
     return arrow::RecordBatch::Make(target, batch->num_rows(), std::move(cols));
-}
-
-// Initial-call parameters are an exact wire contract. Unlike exchange input,
-// parameter batches are not cast or reordered: generated clients construct
-// the declared schema verbatim, and accepting a different one can make a
-// handler read the wrong column or silently ignore caller data.
-std::string parameter_contract_error(const std::shared_ptr<arrow::RecordBatch>& batch,
-                                     const std::shared_ptr<arrow::Schema>& expected) {
-    if (expected->num_fields() > 0 && batch->num_rows() != 1) {
-        return "Expected 1 row in request batch, got " + std::to_string(batch->num_rows());
-    }
-
-    const auto& actual = batch->schema();
-    if (actual->num_fields() != expected->num_fields()) {
-        return "Parameter schema mismatch: expected " + std::to_string(expected->num_fields()) +
-               " fields, got " + std::to_string(actual->num_fields());
-    }
-    for (int i = 0; i < expected->num_fields(); ++i) {
-        const auto& got = actual->field(i);
-        const auto& want = expected->field(i);
-        if (got->name() != want->name() || !got->type()->Equals(*want->type()) ||
-            got->nullable() != want->nullable()) {
-            return "Parameter schema mismatch at field " + std::to_string(i) + ": expected " +
-                   want->ToString() + ", got " + got->ToString();
-        }
-    }
-    return {};
 }
 
 std::shared_ptr<arrow::KeyValueMetadata> cursor_metadata(const std::string& cursor) {
@@ -360,6 +334,10 @@ public:
             storage_config.region = cfg.external_storage_region;
             storage_config.endpoint_url = cfg.external_storage_endpoint;
             storage_config.signing_account = cfg.external_storage_signing_account;
+            storage_config.max_fetch_bytes = cfg.max_fetch_bytes;
+            storage_config.max_decompressed_bytes = cfg.max_decompressed_fetch_bytes;
+            storage_config.max_redirects = cfg.max_external_redirects;
+            storage_config.url_validator = cfg.external_url_validator;
             storage_ = make_external_storage(storage_config);
         }
     }

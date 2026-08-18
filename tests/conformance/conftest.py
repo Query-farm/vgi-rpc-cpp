@@ -364,6 +364,21 @@ def conformance_http_with_zstd_storage_port(conformance_fake_storage: str) -> It
 
 
 @pytest.fixture(scope="session")
+def conformance_http_external_security_port(conformance_fake_storage: str) -> Iterator[int]:
+    """Worker with per-hop URL validation and independent fetch caps."""
+    with spawn_http(
+        "--fake-storage",
+        conformance_fake_storage,
+        "--max-fetch-bytes",
+        "4096",
+        "--max-decompressed-fetch-bytes",
+        "8192",
+        "--reject-localhost-redirects",
+    ) as port:
+        yield port
+
+
+@pytest.fixture(scope="session")
 def conformance_http_strict_cap_port() -> Iterator[int]:
     """A worker with caps tight enough for the strict-fail tests to overshoot."""
     with spawn_http(

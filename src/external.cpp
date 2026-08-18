@@ -7,7 +7,12 @@
 
 #include <httplib.h>
 #include <nlohmann/json.hpp>
+#include <zstd.h>
 
+#include <array>
+#include <algorithm>
+#include <cctype>
+#include <memory>
 #include <stdexcept>
 #include <utility>
 
@@ -47,15 +52,45 @@ std::pair<std::string, std::string> split_bucket(const std::string& rest) {
     return {rest.substr(0, slash), rest.substr(slash + 1)};
 }
 
-// Split an absolute URL into an httplib client target and the path.
+// Render a URL for diagnostics without bearer query strings, fragments, or
+// userinfo.  Invalid input is deliberately not echoed.
+std::string redact_url(const std::string& url) {
+    const size_t scheme_end = url.find("://");
+    if (scheme_end == std::string::npos) return "<invalid-url>";
+    const size_t authority_start = scheme_end + 3;
+    const size_t authority_end = url.find_first_of("/?#", authority_start);
+    std::string authority = url.substr(authority_start, authority_end - authority_start);
+    const size_t at = authority.rfind('@');
+    if (at != std::string::npos) authority.erase(0, at + 1);
+    std::string path = "/";
+    if (authority_end != std::string::npos && url[authority_end] == '/') {
+        const size_t path_end = url.find_first_of("?#", authority_end);
+        path = url.substr(authority_end, path_end - authority_end);
+    }
+    return url.substr(0, scheme_end + 3) + authority + path;
+}
+
+// Split an absolute HTTP URL into an httplib client origin and request target.
 std::pair<std::string, std::string> split_url(const std::string& url) {
     const size_t scheme_end = url.find("://");
-    if (scheme_end == std::string::npos) {
-        throw std::invalid_argument("not an absolute URL: " + url);
+    const std::string scheme = scheme_end == std::string::npos ? "" : url.substr(0, scheme_end);
+    if (scheme != "http" && scheme != "https") {
+        throw std::invalid_argument(
+            "external location is not an absolute HTTP URL [url: " + redact_url(url) + "]");
     }
-    const size_t path_start = url.find('/', scheme_end + 3);
-    if (path_start == std::string::npos) return {url, "/"};
-    return {url.substr(0, path_start), url.substr(path_start)};
+    const size_t authority_start = scheme_end + 3;
+    const size_t target_start = url.find_first_of("/?#", authority_start);
+    const std::string origin =
+        target_start == std::string::npos ? url : url.substr(0, target_start);
+    if (origin.size() == authority_start) {
+        throw std::invalid_argument(
+            "external location URL has no authority [url: " + redact_url(url) + "]");
+    }
+    if (target_start == std::string::npos || url[target_start] == '#') return {origin, "/"};
+    const size_t fragment = url.find('#', target_start);
+    std::string target = url.substr(target_start, fragment - target_start);
+    if (!target.empty() && target.front() == '?') target.insert(target.begin(), '/');
+    return {origin, target};
 }
 
 httplib::Client make_client(const std::string& origin) {
@@ -63,8 +98,59 @@ httplib::Client make_client(const std::string& origin) {
     client.set_connection_timeout(10, 0);
     client.set_read_timeout(60, 0);
     client.set_write_timeout(60, 0);
-    client.set_follow_location(true);
+    client.set_follow_location(false);
+    client.set_decompress(false);
     return client;
+}
+
+bool is_redirect(int status) {
+    return status == 301 || status == 302 || status == 303 || status == 307 || status == 308;
+}
+
+std::string resolve_redirect(const std::string& current, const std::string& location) {
+    if (location.find("://") != std::string::npos) return location;
+    auto [origin, target] = split_url(current);
+    if (location.rfind("//", 0) == 0) {
+        return current.substr(0, current.find(':')) + ":" + location;
+    }
+    if (!location.empty() && location.front() == '/') return origin + location;
+    const size_t query = target.find('?');
+    if (query != std::string::npos) target.erase(query);
+    if (!location.empty() && location.front() == '?') return origin + target + location;
+    const size_t slash = target.rfind('/');
+    return origin + target.substr(0, slash == std::string::npos ? 0 : slash + 1) + location;
+}
+
+std::string zstd_decompress_bounded(const std::string& encoded, int64_t max_bytes) {
+    using DStream = std::unique_ptr<ZSTD_DStream, decltype(&ZSTD_freeDStream)>;
+    DStream stream(ZSTD_createDStream(), &ZSTD_freeDStream);
+    if (!stream) throw std::runtime_error("external location zstd decoder allocation failed");
+    const size_t initialized = ZSTD_initDStream(stream.get());
+    if (ZSTD_isError(initialized)) {
+        throw std::runtime_error("external location zstd decoder initialization failed");
+    }
+
+    ZSTD_inBuffer input{encoded.data(), encoded.size(), 0};
+    std::array<char, 16 * 1024> chunk{};
+    std::string decoded;
+    size_t remaining = 1;
+    while (input.pos < input.size || remaining != 0) {
+        ZSTD_outBuffer output{chunk.data(), chunk.size(), 0};
+        remaining = ZSTD_decompressStream(stream.get(), &output, &input);
+        if (ZSTD_isError(remaining)) {
+            throw std::runtime_error("external location zstd decompression failed");
+        }
+        if (output.pos > static_cast<size_t>(max_bytes) ||
+            decoded.size() > static_cast<size_t>(max_bytes) - output.pos) {
+            throw std::runtime_error("external location exceeds max_decompressed_bytes (" +
+                                     std::to_string(max_bytes) + ")");
+        }
+        decoded.append(chunk.data(), output.pos);
+        if (input.pos == input.size && remaining != 0 && output.pos == 0) {
+            throw std::runtime_error("external location contains a truncated zstd payload");
+        }
+    }
+    return decoded;
 }
 
 #if defined(VGI_RPC_WITH_S3) || defined(VGI_RPC_WITH_GCS)
@@ -93,7 +179,8 @@ std::string make_key(const std::string& prefix, const std::string& content_encod
 // cloud backends below.
 class HttpExternalStorage final : public ExternalStorage {
 public:
-    explicit HttpExternalStorage(std::string base_url) : base_url_(std::move(base_url)) {
+    HttpExternalStorage(std::string base_url, ExternalStorageConfig config)
+        : base_url_(std::move(base_url)), config_(std::move(config)) {
         while (!base_url_.empty() && base_url_.back() == '/') base_url_.pop_back();
     }
 
@@ -115,15 +202,82 @@ public:
     }
 
     std::string fetch(const std::string& url) override {
-        auto [origin, path] = split_url(url);
-        auto client = make_client(origin);
-        auto res = client.Get(path);
-        if (!res || res->status != 200) {
-            throw std::runtime_error(
-                "external storage fetch failed: " +
-                (res ? std::to_string(res->status) : std::string("no response")));
+        std::string current = url;
+        for (int redirects = 0;; ++redirects) {
+            if (config_.url_validator) {
+                try {
+                    config_.url_validator(current);
+                } catch (...) {
+                    throw std::runtime_error(
+                        "external location URL rejected [url: " + redact_url(current) + "]");
+                }
+            }
+
+            auto [origin, path] = split_url(current);
+            auto client = make_client(origin);
+            std::string body;
+            std::string location;
+            std::string content_encoding;
+            int response_status = 0;
+            bool cap_exceeded = false;
+            auto res = client.Get(
+                path,
+                [&](const httplib::Response& response) {
+                    response_status = response.status;
+                    location = response.get_header_value("Location");
+                    content_encoding = response.get_header_value("Content-Encoding");
+                    return true;
+                },
+                [&](const char* data, size_t length) {
+                    if (is_redirect(response_status)) return true;
+                    if (length > static_cast<size_t>(config_.max_fetch_bytes) ||
+                        body.size() > static_cast<size_t>(config_.max_fetch_bytes) - length) {
+                        cap_exceeded = true;
+                        return false;
+                    }
+                    body.append(data, length);
+                    return true;
+                });
+
+            if (cap_exceeded) {
+                throw std::runtime_error("external location exceeds max_fetch_bytes (" +
+                                         std::to_string(config_.max_fetch_bytes) + ")");
+            }
+            if (!res) {
+                throw std::runtime_error(
+                    "external location fetch failed [url: " + redact_url(current) + "]");
+            }
+            if (is_redirect(res->status)) {
+                if (redirects >= config_.max_redirects) {
+                    throw std::runtime_error("external location redirect limit exceeded (" +
+                                             std::to_string(config_.max_redirects) + ")");
+                }
+                if (location.empty()) {
+                    throw std::runtime_error(
+                        "external location redirect has no Location header [url: " +
+                        redact_url(current) + "]");
+                }
+                current = resolve_redirect(current, location);
+                continue;
+            }
+            if (res->status != 200) {
+                throw std::runtime_error(
+                    "external location fetch failed: " + std::to_string(res->status) +
+                    " [url: " + redact_url(current) + "]");
+            }
+
+            std::transform(content_encoding.begin(), content_encoding.end(),
+                           content_encoding.begin(),
+                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            if (content_encoding == "zstd") {
+                return zstd_decompress_bounded(body, config_.max_decompressed_bytes);
+            }
+            if (body.size() > static_cast<size_t>(config_.max_decompressed_bytes)) {
+                throw std::runtime_error("external location exceeds max_decompressed_bytes (" +
+                                         std::to_string(config_.max_decompressed_bytes) + ")");
+            }
+            return body;
         }
-        return res->body;
     }
 
     std::vector<UploadUrlPair> upload_urls(int64_t count) override {
@@ -157,6 +311,7 @@ private:
     }
 
     std::string base_url_;
+    ExternalStorageConfig config_;
 };
 
 // ---------------------------------------------------------------------------
@@ -183,7 +338,8 @@ public:
     S3ExternalStorage(std::string bucket, std::string prefix, const ExternalStorageConfig& config)
         : bucket_(std::move(bucket)),
           prefix_(std::move(prefix)),
-          ttl_(config.signed_url_ttl_seconds) {
+          ttl_(config.signed_url_ttl_seconds),
+          config_(config) {
         ensure_aws_initialized();
         Aws::Client::ClientConfiguration client_config;
         if (!config.region.empty()) client_config.region = config.region;
@@ -224,7 +380,7 @@ public:
     std::string fetch(const std::string& url) override {
         // A pointer's URL is pre-signed HTTPS, so this is a plain GET —
         // the same path a client takes, which keeps the two in agreement.
-        return HttpExternalStorage(url).fetch(url);
+        return HttpExternalStorage(url, config_).fetch(url);
     }
 
     std::vector<UploadUrlPair> upload_urls(int64_t count) override {
@@ -254,6 +410,7 @@ private:
     std::string prefix_;
     int ttl_;
     std::unique_ptr<Aws::S3::S3Client> client_;
+    ExternalStorageConfig config_;
 };
 
 #endif  // VGI_RPC_WITH_S3
@@ -271,7 +428,8 @@ public:
           prefix_(std::move(prefix)),
           ttl_(config.signed_url_ttl_seconds),
           signing_account_(config.signing_account),
-          client_(google::cloud::storage::Client()) {}
+          client_(google::cloud::storage::Client()),
+          config_(config) {}
 
     std::string upload(const std::string& data, const std::string& content_encoding) override {
         namespace gcs = google::cloud::storage;
@@ -291,7 +449,7 @@ public:
     }
 
     std::string fetch(const std::string& url) override {
-        return HttpExternalStorage(url).fetch(url);
+        return HttpExternalStorage(url, config_).fetch(url);
     }
 
     std::vector<UploadUrlPair> upload_urls(int64_t count) override {
@@ -328,6 +486,7 @@ private:
     int ttl_;
     std::string signing_account_;
     google::cloud::storage::Client client_;
+    ExternalStorageConfig config_;
 };
 
 #endif  // VGI_RPC_WITH_GCS
@@ -352,9 +511,13 @@ bool gcs_storage_available() {
 
 std::unique_ptr<ExternalStorage> make_external_storage(const ExternalStorageConfig& config) {
     auto [scheme, rest] = split_scheme(config.uri);
+    if (config.max_fetch_bytes < 0 || config.max_decompressed_bytes < 0 ||
+        config.max_redirects < 0) {
+        throw std::invalid_argument("external fetch limits must be non-negative");
+    }
 
     if (scheme == "http" || scheme == "https") {
-        return std::make_unique<HttpExternalStorage>(config.uri);
+        return std::make_unique<HttpExternalStorage>(config.uri, config);
     }
 
     if (scheme == "s3") {

@@ -12,6 +12,8 @@
 /// bytes itself.
 #pragma once
 
+#include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -41,6 +43,13 @@ struct ExternalStorageConfig {
     // from the ambient credentials; naming it is required when they do not
     // carry a signing email — under impersonation, or against an emulator.
     std::string signing_account;
+    // The encoded response and decoded Arrow IPC payload are bounded
+    // independently.  A validator, when present, runs before the initial GET
+    // and again before every redirect hop.
+    int64_t max_fetch_bytes = 256LL * 1024 * 1024;
+    int64_t max_decompressed_bytes = 4LL * 1024 * 1024 * 1024;
+    int max_redirects = 5;
+    std::function<void(const std::string&)> url_validator;
 };
 
 // One object store.  Uploaded objects persist: configure a lifecycle rule on

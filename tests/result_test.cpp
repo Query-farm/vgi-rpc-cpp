@@ -11,6 +11,7 @@
 #include <arrow/builder.h>
 #include <arrow/record_batch.h>
 #include <arrow/type.h>
+#include <nlohmann/json.hpp>
 
 using namespace vgi_rpc;
 
@@ -58,6 +59,21 @@ TEST_CASE("Result::error produces zero-row batch with EXCEPTION metadata", "[res
     auto idx = ab.custom_metadata->FindKey(keys::LOG_LEVEL);
     REQUIRE(idx >= 0);
     REQUIRE(ab.custom_metadata->value(idx) == "EXCEPTION");
+}
+
+TEST_CASE("Result::error replaces invalid UTF-8 before writing error metadata", "[result]") {
+    const std::string malformed("bad\xff", 4);
+    auto result = Result::error(empty_schema(), "ProtocolError", malformed, "srv", "req");
+    const auto& metadata = result.annotated_batch().custom_metadata;
+
+    const auto message_index = metadata->FindKey(keys::LOG_MESSAGE);
+    REQUIRE(message_index >= 0);
+    REQUIRE(metadata->value(message_index) == "bad\xef\xbf\xbd");
+
+    const auto extra_index = metadata->FindKey(keys::LOG_EXTRA);
+    REQUIRE(extra_index >= 0);
+    const auto extra = nlohmann::json::parse(metadata->value(extra_index));
+    REQUIRE(extra.at("exception_message") == "bad\xef\xbf\xbd");
 }
 
 TEST_CASE("Result::from_annotated_batch wraps correctly", "[result]") {

@@ -16,6 +16,20 @@
 
 namespace vgi_rpc {
 
+namespace {
+
+// Arrow custom metadata is byte-oriented, but every vgi-rpc peer decodes log
+// fields as UTF-8 and LOG_EXTRA is JSON. Protocol errors can quote untrusted
+// metadata bytes, so normalize malformed sequences before putting them on the
+// wire instead of letting JSON serialization tear down a reusable connection.
+std::string wire_safe_text(const std::string& text) {
+    const auto encoded =
+        nlohmann::json(text).dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
+    return nlohmann::json::parse(encoded).get<std::string>();
+}
+
+}  // anonymous namespace
+
 Result Result::value(std::shared_ptr<arrow::RecordBatch> batch) {
     AnnotatedBatch ab;
     ab.batch = std::move(batch);
@@ -46,13 +60,15 @@ std::shared_ptr<arrow::KeyValueMetadata> make_error_metadata(const std::string& 
                                                              const std::string& server_id,
                                                              const std::string& request_id,
                                                              const std::string& error_kind) {
+    const std::string safe_exception_type = wire_safe_text(exception_type);
+    const std::string safe_message = wire_safe_text(message);
     auto md = std::make_shared<arrow::KeyValueMetadata>();
     md->Append(keys::LOG_LEVEL, log_level_to_string(LogLevel::EXCEPTION));
-    md->Append(keys::LOG_MESSAGE, message);
+    md->Append(keys::LOG_MESSAGE, safe_message);
 
     nlohmann::json extra;
-    extra["exception_type"] = exception_type;
-    extra["exception_message"] = message;
+    extra["exception_type"] = safe_exception_type;
+    extra["exception_message"] = safe_message;
     md->Append(keys::LOG_EXTRA, extra.dump());
 
     if (!server_id.empty()) {

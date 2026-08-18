@@ -1327,6 +1327,24 @@ int main(int argc, char** argv) {
             http_cfg.signed_url_ttl_seconds = std::stoi(take_value(i));
         } else if (arg == "--externalize-compression") {
             http_cfg.externalize_compression = take_value(i);
+        } else if (arg == "--max-fetch-bytes") {
+            http_cfg.max_fetch_bytes = std::stoll(take_value(i));
+        } else if (arg == "--max-decompressed-fetch-bytes") {
+            http_cfg.max_decompressed_fetch_bytes = std::stoll(take_value(i));
+        } else if (arg == "--reject-localhost-redirects") {
+            http_cfg.external_url_validator = [](const std::string& url) {
+                const size_t scheme_end = url.find("://");
+                if (scheme_end == std::string::npos) throw std::runtime_error("URL rejected");
+                const size_t authority_start = scheme_end + 3;
+                const size_t authority_end = url.find_first_of("/?#", authority_start);
+                std::string authority =
+                    url.substr(authority_start, authority_end - authority_start);
+                const size_t at = authority.rfind('@');
+                if (at != std::string::npos) authority.erase(0, at + 1);
+                const size_t colon = authority.rfind(':');
+                const std::string host = authority.substr(0, colon);
+                if (host != "127.0.0.1") throw std::runtime_error("URL rejected");
+            };
         } else if (arg == "--no-compression") {
             http_cfg.compression = false;
         } else if (arg == "--cors-origin") {

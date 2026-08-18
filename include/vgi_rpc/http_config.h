@@ -8,6 +8,7 @@
 
 #include <array>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <optional>
 #include <string>
@@ -72,6 +73,12 @@ struct HttpConfig {
     // Coding applied to an externalized payload before upload; empty = none.
     // The integrity digest covers the payload *before* this is applied.
     std::string externalize_compression;
+    // External pointer fetch safety.  These are independent encoded and
+    // decoded limits; the URL policy is evaluated before every network hop.
+    int64_t max_fetch_bytes = 256LL * 1024 * 1024;
+    int64_t max_decompressed_fetch_bytes = 4LL * 1024 * 1024 * 1024;
+    int max_external_redirects = 5;
+    std::function<void(const std::string&)> external_url_validator;
 
     // Content codings this server will produce.  Empty means it positively
     // states it speaks none, which is distinct from not advertising at all.

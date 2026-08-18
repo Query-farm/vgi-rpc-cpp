@@ -9,6 +9,7 @@
 #include "vgi_rpc/log_sink.h"
 #include "vgi_rpc/output_collector.h"
 #include "vgi_rpc/shm.h"
+#include "request_contract.h"
 
 #include <arrow/array.h>
 #include <arrow/compute/cast.h>
@@ -270,6 +271,15 @@ bool Server::serve_one(const std::shared_ptr<arrow::io::InputStream>& input,
             VGI_RPC_THROW_NOT_OK(output->Flush());
             return true;
         }
+    }
+
+    if (const std::string error = parameter_contract_error(batch, method_info.params_schema);
+        !error.empty()) {
+        auto error_result =
+            Result::error(empty_schema(), "ProtocolError", error, server_id_, request_id);
+        write_ipc_stream(output, empty_schema(), {error_result.annotated_batch()});
+        VGI_RPC_THROW_NOT_OK(output->Flush());
+        return true;
     }
 
     Request request(batch, custom_metadata);
