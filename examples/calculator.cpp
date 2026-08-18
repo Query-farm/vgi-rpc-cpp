@@ -49,14 +49,14 @@ int main() {
             },
             "Add two numbers.")
         .add_unary("multiply", params_ab(), result_double(),
-            [](const vgi_rpc::Request& req, vgi_rpc::CallContext& ctx) {
+            [](const vgi_rpc::Request& req, vgi_rpc::CallContext& /*ctx*/) {
                 double a = req.get<double>("a");
                 double b = req.get<double>("b");
                 return make_double_result(a * b);
             },
             "Multiply two numbers.")
         .add_unary("divide", params_ab(), result_double(),
-            [](const vgi_rpc::Request& req, vgi_rpc::CallContext& ctx) {
+            [](const vgi_rpc::Request& req, vgi_rpc::CallContext& /*ctx*/) {
                 double a = req.get<double>("a");
                 double b = req.get<double>("b");
                 if (b == 0.0) {

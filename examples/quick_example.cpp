@@ -17,7 +17,7 @@ int main() {
                 arrow::field("b", arrow::float64()),
             }),
             arrow::schema({arrow::field("result", arrow::float64())}),
-            [](const vgi_rpc::Request& req, vgi_rpc::CallContext& ctx) {
+            [](const vgi_rpc::Request& req, vgi_rpc::CallContext& /*ctx*/) {
                 double a = req.get<double>("a");
                 double b = req.get<double>("b");
 

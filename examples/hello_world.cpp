@@ -21,7 +21,7 @@ int main() {
 
     auto server = vgi_rpc::ServerBuilder()
         .add_unary("add", params_schema, result_schema,
-            [](const vgi_rpc::Request& req, vgi_rpc::CallContext& ctx) {
+            [](const vgi_rpc::Request& req, vgi_rpc::CallContext& /*ctx*/) {
                 double a = req.get<double>("a");
                 double b = req.get<double>("b");
                 double sum = a + b;

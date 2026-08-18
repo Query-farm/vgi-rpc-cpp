@@ -7,6 +7,13 @@ project(vgi-rpc-cpp VERSION 0.1.0 LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# On, because they earn their keep: -Wreturn-stack-address catches a reference
+# bound into a temporary `shared_ptr`, which the conformance suite runs past.
+# Scoped to our own targets — vcpkg's headers are not ours to clean.
+if(NOT MSVC)
+  add_compile_options(-Wall -Wextra)
+endif()
+
 # Default to hidden visibility so only VGI_RPC_EXPORT symbols are public
 set(CMAKE_CXX_VISIBILITY_PRESET hidden)
 set(CMAKE_VISIBILITY_INLINES_HIDDEN ON)

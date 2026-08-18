@@ -67,8 +67,12 @@ httplib::Client make_client(const std::string& origin) {
     return client;
 }
 
+#if defined(VGI_RPC_WITH_S3) || defined(VGI_RPC_WITH_GCS)
 // A random object key under the configured prefix.  The extension records the
 // coding so a human browsing the bucket can tell what is in there.
+//
+// Guarded, because every caller is: the HTTP backend takes its keys from the
+// server's own upload-URL response, so a default build never mints one.
 std::string make_key(const std::string& prefix, const std::string& content_encoding) {
     auto bytes = crypto::random_bytes(16);
     std::string key = prefix;
@@ -77,6 +81,7 @@ std::string make_key(const std::string& prefix, const std::string& content_encod
     key += content_encoding == "zstd" ? ".arrow.zst" : ".arrow";
     return key;
 }
+#endif
 
 // ---------------------------------------------------------------------------
 // HTTP backend
