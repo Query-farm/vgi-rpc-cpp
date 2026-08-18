@@ -259,6 +259,11 @@ fn connect(transport: &str, worker: &str) -> Option<Conn> {
     match transport {
         "pipe" => RpcClient::connect(&[worker]).ok().map(Conn::Bytes),
         "pipe+shm" => RpcClient::shm_connect(&[worker], 256 << 20).ok().map(Conn::Bytes),
+        // `unix_connect` is `#[cfg(unix)]` in vgi-rpc-client, so calling it
+        // unconditionally does not merely skip the column on Windows — it
+        // fails to compile, which is the opposite of what the doc comment
+        // above promises.
+        #[cfg(unix)]
         "unix" => {
             let path = spawn_listener(worker, "--unix", &unique_sock(), "UNIX:")?;
             RpcClient::unix_connect(&path).ok().map(Conn::Bytes)
@@ -281,6 +286,7 @@ fn connect(transport: &str, worker: &str) -> Option<Conn> {
 
 /// A short socket path: sockaddr_un.sun_path is 104 bytes on macOS, which the
 /// usual temp directory plus a generated name overruns.
+#[cfg(unix)]
 fn unique_sock() -> String {
     let pid = std::process::id();
     format!("/tmp/vgib{pid}.sock")
