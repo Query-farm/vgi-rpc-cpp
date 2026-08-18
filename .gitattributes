@@ -1,0 +1,12 @@
+# LF in the repository, whatever the platform checks out. Mixed endings —
+# including files that were part CRLF and part LF — turned every unrelated edit
+# into a whole-file diff and hid the real change.
+* text=auto
+
+# Must stay LF even on a Windows checkout: a shell script with CRLF fails at
+# the shebang with a message that names neither the file nor the cause.
+*.sh text eol=lf
+
+# Byte-exact, so nothing rewrites them.
+*.png binary
+*.arrow binary

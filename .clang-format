@@ -1,0 +1,19 @@
+# Google, with the two deviations this codebase already had: 4-space indent and
+# a 100-column limit. Everything else is left at Google's default on purpose —
+# the point of a formatter is to stop having the argument, not to win it.
+---
+Language: Cpp
+BasedOnStyle: Google
+IndentWidth: 4
+ColumnLimit: 100
+AccessModifierOffset: -4
+DerivePointerAlignment: false
+PointerAlignment: Left
+AllowShortCaseLabelsOnASingleLine: true
+AllowShortFunctionsOnASingleLine: Inline
+AlwaysBreakTemplateDeclarations: Yes
+IndentCaseLabels: true
+# Off, because include order here is meaningful: the C++ standard headers, then
+# Arrow, then the framework, then this project's own — grouped by hand with
+# blank lines that a sort would collapse.
+SortIncludes: false
