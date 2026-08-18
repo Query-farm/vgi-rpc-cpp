@@ -8,6 +8,8 @@
 #include <arrow/record_batch.h>
 #include <arrow/util/key_value_metadata.h>
 
+#include <arrow/array/util.h>
+
 #include <random>
 
 namespace vgi_rpc {
@@ -22,9 +24,12 @@ std::shared_ptr<arrow::RecordBatch> make_empty_batch(
     std::vector<std::shared_ptr<arrow::Array>> arrays;
     arrays.reserve(schema->num_fields());
     for (int i = 0; i < schema->num_fields(); ++i) {
+        // `MakeArrayOfNull` rather than `MakeEmptyArray`: the latter goes
+        // through `MakeBuilder`, which has no builder for an extension type,
+        // so a schema carrying one (a UUID column, say) killed the transport
+        // before the client ever saw a schema message.
         arrays.push_back(
-            unwrap(arrow::MakeEmptyArray(schema->field(i)->type()),
-                   "make_empty_batch"));
+            unwrap(arrow::MakeArrayOfNull(schema->field(i)->type(), 0), "make_empty_batch"));
     }
     return arrow::RecordBatch::Make(schema, 0, std::move(arrays));
 }
