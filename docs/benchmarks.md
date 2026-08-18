@@ -52,19 +52,19 @@ _best, ms — lower is better_
 
 |                  | pipe | unix | tcp | http | pipe+shm |
 |------------------|-----:|-----:|----:|-----:|---------:|
-| `void_noop()`      | 0.022 | 0.027 | 0.052 | 0.271 | 0.023 |
-| `add_floats(a,b)`  | 0.034 | 0.040 | 0.062 | 0.298 | 0.035 |
-| `echo_string(11B)` | 0.032 | 0.038 | 0.061 | 0.289 | 0.032 |
-| `echo_all_types()` | 0.250 | 0.254 | 0.280 | 0.543 | 0.250 |
+| `void_noop()`      | 0.023 | 0.026 | 0.053 | 0.270 | 0.022 |
+| `add_floats(a,b)`  | 0.035 | 0.040 | 0.063 | 0.291 | 0.036 |
+| `echo_string(11B)` | 0.032 | 0.038 | 0.061 | 0.281 | 0.033 |
+| `echo_all_types()` | 0.251 | 0.256 | 0.282 | 0.546 | 0.253 |
 
 Median, to show the spread the machine added:
 
 |                  | pipe | unix | tcp | http | pipe+shm |
 |------------------|-----:|-----:|----:|-----:|---------:|
-| `void_noop()`      | 0.026 | 0.031 | 0.074 | 0.300 | 0.025 |
-| `add_floats(a,b)`  | 0.037 | 0.043 | 0.071 | 0.323 | 0.039 |
-| `echo_string(11B)` | 0.035 | 0.041 | 0.070 | 0.322 | 0.036 |
-| `echo_all_types()` | 0.260 | 0.262 | 0.300 | 0.583 | 0.259 |
+| `void_noop()`      | 0.027 | 0.030 | 0.075 | 0.308 | 0.026 |
+| `add_floats(a,b)`  | 0.040 | 0.043 | 0.072 | 0.336 | 0.039 |
+| `echo_string(11B)` | 0.038 | 0.041 | 0.072 | 0.333 | 0.037 |
+| `echo_all_types()` | 0.266 | 0.269 | 0.307 | 0.610 | 0.266 |
 
 ### Unary rate
 
@@ -72,15 +72,15 @@ _calls/sec — higher is better_
 
 |                  | pipe | unix | tcp | http | pipe+shm |
 |------------------|-----:|-----:|----:|-----:|---------:|
-| `void_noop()`      | 45,368 | 37,616 | 19,355 | 3,686 | 44,199 |
-| `add_floats(a,b)`  | 29,412 | 25,026 | 16,075 | 3,361 | 28,202 |
-| `echo_string(11B)` | 31,746 | 26,549 | 16,438 | 3,461 | 31,169 |
-| `echo_all_types()` |  4,003 |  3,932 |  3,571 | 1,842 |  4,002 |
+| `void_noop()`      | 44,037 | 38,835 | 18,750 | 3,698 | 45,114 |
+| `add_floats(a,b)`  | 28,951 | 25,211 | 15,769 | 3,432 | 27,972 |
+| `echo_string(11B)` | 31,168 | 26,638 | 16,461 | 3,553 | 30,691 |
+| `echo_all_types()` |  3,986 |  3,906 |  3,545 | 1,830 |  3,958 |
 
 `void_noop()` is the per-call framing floor — no parameters, no result.
 `echo_all_types()` carries eighteen fields covering every type mapping, so the
 gap between the two is encode/decode cost rather than transport cost. That the
-transports converge as the payload grows (45k → 4.0k on pipe, 3.7k → 1.8k on
+transports converge as the payload grows (44k → 4.0k on pipe, 3.7k → 1.8k on
 HTTP) says most of the per-call spread is fixed framing overhead.
 
 ### Streaming
@@ -89,8 +89,8 @@ _best, ms — lower is better_
 
 |                     | pipe | unix | tcp | http | pipe+shm |
 |---------------------|-----:|-----:|----:|-----:|---------:|
-| `produce_n(50)`       | 0.70 | 1.12 | 1.72 | 15.90 | 1.04 |
-| `exchange_scale(20)`  | 0.35 | 0.57 | 0.82 |  6.58 | 0.57 |
+| `produce_n(50)`       | 1.03 | 1.08 | 1.75 | 16.07 | 1.06 |
+| `exchange_scale(20)`  | 0.37 | 0.53 | 0.82 |  6.71 | 0.41 |
 
 HTTP pays worst here, and for a structural reason: the raw-framing transports
 hold one connection open for the whole stream, while HTTP maps every producer
@@ -102,15 +102,17 @@ _MB/s, both directions, at best time — higher is better_
 
 |         | pipe | unix | tcp | http | pipe+shm |
 |---------|-----:|-----:|----:|-----:|---------:|
-| 1 KiB   |    60 |    50 |    30 |     6 |    56 |
-| 64 KiB  | 2,351 | 1,780 | 1,539 |   336 | 2,247 |
-| 1 MiB   | 6,856 | 3,758 | 7,783 | 1,559 | **8,830** |
-| 16 MiB  | 3,625 | 2,486 | 5,394 | 1,797 | **5,216** |
+| 1 KiB   |    57 |    50 |    28 |     6 |    56 |
+| 64 KiB  | 2,429 | 2,488 | 1,514 |   329 | 2,320 |
+| 1 MiB   | 7,152 | **12,149** | 7,519 | 1,561 | 8,979 |
+| 16 MiB  | 3,580 | **5,374** | 5,210 | 1,661 | 5,373 |
 
 The 1 KiB row is latency-bound, not bandwidth-bound — it is really just
 `1 / round-trip` wearing different units. Shared memory does not engage below
 `VGI_RPC_SHM_MIN_BATCH_BYTES` (128 KiB), which is why its 1 KiB and 64 KiB
 figures track the plain pipe.
+
+Unix leading at the top two sizes is new, and is the socket-buffer fix below.
 
 ## Through a native client
 
@@ -121,14 +123,14 @@ Driving the same worker from Rust — reusing `vgi-rpc-client` from the sibling
 
 | `void_noop()`, calls/sec | Python client | Rust client | |
 |---|---:|---:|---|
-| pipe | 45,368 | **89,888** | 2.0x |
-| unix | 37,616 | **92,661** | 2.5x |
-| tcp  | 19,355 | **36,922** | 1.9x |
-| http |  3,686 | **18,663** | **5.1x** |
+| pipe | 44,037 | **102,135** | 2.3x |
+| unix | 38,835 |  **87,268** | 2.2x |
+| tcp  | 18,750 |  **36,474** | 1.9x |
+| http |  3,698 |  **17,978** | **4.9x** |
 
 HTTP is where the difference is starkest: the Python table reads as though
 this server costs 0.27 ms per HTTP call, and most of that is the client's HTTP
-stack. The server's own figure is nearer 54 us.
+stack. The server's own figure is nearer 56 us.
 
 Throughput separates the same way — and the shared-memory column most of all,
 because the channel exists to avoid copies, which is exactly what a client
@@ -136,29 +138,57 @@ spending tens of microseconds per call in Python hides:
 
 | MB/s round trip | pipe | unix | tcp | http | pipe+shm |
 |---|---:|---:|---:|---:|---:|
-| 1 KiB   |   159 |   141 |    53 |    32 |   131 |
-| 64 KiB  | 4,329 | 2,515 | 2,521 |   875 | 3,911 |
-| 1 MiB   | 9,585 | 4,431 | 12,211 | 1,920 | **12,257** |
-| 16 MiB  | 3,613 | 2,393 |  5,228 | 1,690 | **5,756** |
+| 1 KiB   |   155 |   139 |    54 |    28 |   100 |
+| 64 KiB  | 4,386 | 2,613 | 2,529 |   918 | 3,759 |
+| 1 MiB   | 10,327 | 4,994 | 11,928 | 1,910 | **12,223** |
+| 16 MiB  |  3,475 | 2,373 |  4,992 | 1,608 |  **5,693** |
 
-Everything peaks near 1 MiB and falls away at 16 MiB, on both harnesses and
-every transport. That is the cache boundary rather than anything in the
-protocol: a megabyte of Arrow still fits, sixteen does not, so the larger
-payload is bounded by main memory no matter how it is carried.
+Read the `unix` column here as a floor, not a measurement: the Rust client does
+not yet widen its socket buffers, so it is the only client in this document
+still paying macOS's 8 KiB default. The Python column is the one to trust for
+Unix at ≥ 1 MiB.
 
-## Two socket settings the sharper instrument found
+Everything else peaks near 1 MiB and falls away at 16 MiB, on both harnesses.
+That is the cache boundary rather than anything in the protocol: a megabyte of
+Arrow still fits, sixteen does not, so the larger payload is bounded by main
+memory no matter how it is carried.
 
-**Unix sockets got 1 MiB buffers.** macOS gives a Unix domain socket 8,192
-bytes of send and receive buffer by default — against ~64 KiB for a pipe and
-128 KiB for TCP — so a megabyte of Arrow crossed the kernel in 128 trips
-instead of a handful. Raising it moved the unix/pipe throughput ratio by +46%
-at 64 KiB, +79% at 1 MiB and +41% at 16 MiB. Measured as a ratio against the
-pipe column, because the machine drifts further between runs than the change
-is worth: an early A/B of this looked convincing until the pipe column, which
-was not supposed to move at all, moved 26%.
+## Two socket settings, and how the second one hid
 
-**TCP got `TCP_NODELAY`, and it costs about 14% here.** Nagle coalesces small
-writes, which is precisely wrong for request/response: it holds a reply
+**Unix sockets get 1 MiB buffers — on both ends.** macOS defaults a Unix
+domain socket to 8,192 bytes of send and receive buffer
+(`net.local.stream.sendspace`), against ~64 KiB for a pipe and 128 KiB for
+TCP, so a megabyte of Arrow crossed the kernel in 128 trips instead of a
+handful.
+
+Setting it on the server's accepted socket alone bought +46% at 64 KiB, +79%
+at 1 MiB and +41% at 16 MiB — a good result that made it easy to stop looking.
+But an AF_UNIX write is bounded by space in the *receiver's* buffer, so a
+tuned server still had to hand every response to an 8 KiB client. Widening the
+client's socket too, in the Python reference's `UnixTransport`, moved the
+unix/pipe throughput ratio again, and much further:
+
+| unix ÷ pipe | server only | both ends |
+|---|---:|---:|
+| 64 KiB |  0.71 | 1.03 |
+| 1 MiB  |  0.54 | **1.71** |
+| 16 MiB |  0.72 | **1.53** |
+
+That is the difference between a Unix socket costing 46% of the pipe's
+throughput and beating it outright. Both figures are ratios against the pipe
+column rather than absolute numbers, because the machine drifts further
+between runs than the effect is worth: an early absolute A/B of the
+server-side change moved the pipe control column — which was not supposed to
+move at all — by 26%, and was measuring the laptop.
+
+**TCP deliberately does not get the same treatment.** It already starts at
+128 KiB and grows, an explicit `SO_RCVBUF` *disables* Linux's receive-window
+auto-tuning and pins the window at whatever constant we guessed, and measuring
+it on loopback showed no gain either way. A setting that helps one family is
+not a setting that helps sockets.
+
+**TCP does get `TCP_NODELAY`, and it costs about 14% here.** Nagle coalesces
+small writes, which is precisely wrong for request/response: it holds a reply
 waiting for more to send, and against a peer's delayed ACK that becomes a
 tens-of-milliseconds stall. On loopback that stall never arrives — ACKs are
 instant — while the coalescing still saves per-segment work, so the
@@ -169,13 +199,19 @@ without it.
 
 ## Where shared memory earns its keep
 
-Above the 128 KiB threshold, and not before: **+29% at 1 MiB and +44% at
-16 MiB** over the plain pipe through the Python client, +28% and +59% through
-the Rust one, while adding a little overhead below the threshold. On a single
-machine with a fast pipe that is the whole of the win — the channel is for
-large batches between co-located processes, not for making small calls faster.
+Against the plain pipe, above the 128 KiB threshold and not before: **+26% at
+1 MiB and +50% at 16 MiB** through the Python client, +18% and +64% through
+the Rust one, while adding a little overhead below the threshold.
 
-It did not start out that way. The first measurements had shared memory
+Against a properly buffered Unix socket the case is now much weaker — in the
+Python harness a 1 MiB Unix socket is *faster* than pipe+shm at 1 MiB (12,149
+vs 8,979 MB/s) and ties it at 16 MiB. The Rust harness still shows shared
+memory well ahead, but its Unix client is the untuned one, so that comparison
+cannot settle the question yet. The shared-memory channel rides any of the
+raw-framing transports, so the interesting configuration to measure next is
+unix+shm rather than either alone.
+
+It did not start out even this good. The first measurements had shared memory
 roughly 40% *behind* the pipe at 1 MiB, from two independent causes:
 
 - **The client never freed a resolved region.** Forty calls left forty live
