@@ -78,6 +78,7 @@ markdown_extensions:
 nav:
   - Home: index.md
   - Getting Started: getting-started.md
+  - Benchmarks: benchmarks.md
   - Examples:
       - examples/index.md
       - Hello World: examples/hello-world.md
