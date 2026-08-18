@@ -133,6 +133,33 @@ std::shared_ptr<arrow::RecordBatch> coerce_input(const std::shared_ptr<arrow::Re
     return arrow::RecordBatch::Make(target, batch->num_rows(), std::move(cols));
 }
 
+// Initial-call parameters are an exact wire contract. Unlike exchange input,
+// parameter batches are not cast or reordered: generated clients construct
+// the declared schema verbatim, and accepting a different one can make a
+// handler read the wrong column or silently ignore caller data.
+std::string parameter_contract_error(const std::shared_ptr<arrow::RecordBatch>& batch,
+                                     const std::shared_ptr<arrow::Schema>& expected) {
+    if (expected->num_fields() > 0 && batch->num_rows() != 1) {
+        return "Expected 1 row in request batch, got " + std::to_string(batch->num_rows());
+    }
+
+    const auto& actual = batch->schema();
+    if (actual->num_fields() != expected->num_fields()) {
+        return "Parameter schema mismatch: expected " + std::to_string(expected->num_fields()) +
+               " fields, got " + std::to_string(actual->num_fields());
+    }
+    for (int i = 0; i < expected->num_fields(); ++i) {
+        const auto& got = actual->field(i);
+        const auto& want = expected->field(i);
+        if (got->name() != want->name() || !got->type()->Equals(*want->type()) ||
+            got->nullable() != want->nullable()) {
+            return "Parameter schema mismatch at field " + std::to_string(i) + ": expected " +
+                   want->ToString() + ", got " + got->ToString();
+        }
+    }
+    return {};
+}
+
 std::shared_ptr<arrow::KeyValueMetadata> cursor_metadata(const std::string& cursor) {
     auto md = std::make_shared<arrow::KeyValueMetadata>();
     md->Append(keys::STATE_B64, cursor);
@@ -606,6 +633,17 @@ std::optional<IpcStreamContents> HttpServer::resolve_request_pointer(
     if (url.empty()) return std::nullopt;
 
     const std::string fetched = storage_->fetch(url);
+    const std::string expected_sha256 =
+        get_metadata_value(first.custom_metadata, keys::LOCATION_SHA256);
+    if (!expected_sha256.empty()) {
+        const auto digest =
+            crypto::sha256(reinterpret_cast<const uint8_t*>(fetched.data()), fetched.size());
+        const std::string actual_sha256 = crypto::hex_encode(digest.data(), digest.size());
+        if (actual_sha256 != expected_sha256) {
+            throw std::runtime_error("external location checksum mismatch: expected " +
+                                     expected_sha256 + ", got " + actual_sha256);
+        }
+    }
     auto buf = arrow::Buffer::FromString(fetched);
     auto reader = std::make_shared<arrow::io::BufferReader>(buf);
     auto contents = read_ipc_stream(reader);
@@ -899,7 +937,7 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res)
             contents = std::move(resolved);
         }
     } catch (const std::exception& e) {
-        fail(400, "ProtocolError",
+        fail(200, "ProtocolError",
              std::string("Could not resolve externalized request: ") + e.what());
         return;
     }
@@ -917,6 +955,13 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res)
     // surface, and `__describe__` in particular is how a mismatched client
     // finds out what this server speaks.
     if (!is_exchange_ep) {
+        const std::string wire_method = get_metadata_value(custom_metadata, keys::METHOD);
+        if (wire_method != method_name) {
+            fail(400, "ProtocolError",
+                 wire_method.empty() ? "Missing 'vgi_rpc.method' in request batch custom_metadata."
+                                     : "Method name in request does not match the HTTP route.");
+            return;
+        }
         auto version = get_metadata_value(custom_metadata, keys::REQUEST_VERSION);
         if (version != REQUEST_VERSION_VALUE) {
             fail(400, "VersionError", "Unsupported or missing request version, expected '1'.");
@@ -985,6 +1030,13 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res)
         return;
     }
     const auto& method_info = it->second;
+    if (!is_exchange_ep) {
+        if (const std::string error = parameter_contract_error(batch, method_info.params_schema);
+            !error.empty()) {
+            fail(400, "ProtocolError", error);
+            return;
+        }
+    }
     Request request(batch, custom_metadata);
 
     auto log_sink = std::make_shared<LogSink>(rpc_.server_id(), request_id);

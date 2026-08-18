@@ -1241,6 +1241,10 @@ static Stream make_exchange_session_counter(const Request&, CallContext&) {
 // =========================================================================
 
 static std::shared_ptr<arrow::Schema> params(std::vector<std::shared_ptr<arrow::Field>> fields) {
+    // Python's required parameters are non-nullable on the wire. Arrow's C++
+    // field factory defaults to nullable, so normalize the common case here;
+    // the two Optional parameters below deliberately bypass this helper.
+    for (auto& field : fields) field = field->WithNullable(false);
     return arrow::schema(std::move(fields));
 }
 
@@ -1422,10 +1426,12 @@ int main(int argc, char** argv) {
 
     // --- Optional/Nullable ---
     builder
-        .add_unary("echo_optional_string", params({arrow::field("value", arrow::utf8(), true)}),
+        .add_unary("echo_optional_string",
+                   arrow::schema({arrow::field("value", arrow::utf8(), true)}),
                    optional_str_result_schema(), echo_optional_string_handler,
                    "Echo an optional string (may be None).")
-        .add_unary("echo_optional_int", params({arrow::field("value", arrow::int64(), true)}),
+        .add_unary("echo_optional_int",
+                   arrow::schema({arrow::field("value", arrow::int64(), true)}),
                    optional_int_result_schema(), echo_optional_int_handler,
                    "Echo an optional int (may be None).");
 

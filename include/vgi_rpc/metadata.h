@@ -28,6 +28,7 @@ inline constexpr const char* SERVER_ID = "vgi_rpc.server_id";
 inline constexpr const char* REQUEST_ID = "vgi_rpc.request_id";
 inline constexpr const char* STREAM_STATE = "vgi_rpc.stream_state";
 inline constexpr const char* LOCATION = "vgi_rpc.location";
+inline constexpr const char* LOCATION_SHA256 = "vgi_rpc.location.sha256";
 inline constexpr const char* LOCATION_SOURCE = "vgi_rpc.location.source";
 inline constexpr const char* LOCATION_FETCH_MS = "vgi_rpc.location.fetch_ms";
 inline constexpr const char* SHM_OFFSET = "vgi_rpc.shm_offset";

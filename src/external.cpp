@@ -98,8 +98,8 @@ public:
     }
 
     std::string upload(const std::string& data, const std::string& content_encoding) override {
-        const std::string url = allocate(content_encoding);
-        auto [origin, path] = split_url(url);
+        const UploadUrlPair urls = allocate(content_encoding);
+        auto [origin, path] = split_url(urls.upload_url);
         auto client = make_client(origin);
 
         httplib::Headers headers;
@@ -111,7 +111,7 @@ public:
                 "external storage upload failed: " +
                 (res ? std::to_string(res->status) : std::string("no response")));
         }
-        return url;
+        return urls.download_url;
     }
 
     std::string fetch(const std::string& url) override {
@@ -130,16 +130,13 @@ public:
         std::vector<UploadUrlPair> out;
         out.reserve(static_cast<size_t>(count));
         for (int64_t i = 0; i < count; ++i) {
-            // The store vends one URL used for both verbs; the protocol keeps
-            // them separate because a real signer issues one credential per verb.
-            const std::string url = allocate("");
-            out.push_back(UploadUrlPair{url, url});
+            out.push_back(allocate(""));
         }
         return out;
     }
 
 private:
-    std::string allocate(const std::string& content_encoding) {
+    UploadUrlPair allocate(const std::string& content_encoding) {
         auto [origin, _] = split_url(base_url_);
         auto client = make_client(origin);
         nlohmann::json body = nlohmann::json::object();
@@ -151,7 +148,12 @@ private:
                 "external storage alloc failed: " +
                 (res ? std::to_string(res->status) : std::string("no response")));
         }
-        return nlohmann::json::parse(res->body).at("object_url").get<std::string>();
+        const auto allocation = nlohmann::json::parse(res->body);
+        const std::string legacy = allocation.at("object_url").get<std::string>();
+        return UploadUrlPair{
+            allocation.value("upload_url", legacy),
+            allocation.value("download_url", legacy),
+        };
     }
 
     std::string base_url_;
