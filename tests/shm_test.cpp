@@ -254,3 +254,68 @@ TEST_CASE("shm: reset drops every allocation", "[shm]") {
     owner->reset();
     REQUIRE(owner->live_allocations() == 0);
 }
+
+TEST_CASE("shm: a held region survives churn around it", "[shm]") {
+    REQUIRE_SHM();
+    // The consumer is allowed to hold batches and release them in whatever
+    // order it finishes with them — that is the point of handing the batch to
+    // the caller rather than freeing on its behalf. So an allocation that has
+    // not been released must survive its neighbours being freed and the gaps
+    // being handed out again. Nothing else in this file covers that: the
+    // first-fit test frees and reallocates but never checks that untouched
+    // data stayed untouched.
+    const auto name = unique_name("hold");
+    auto owner = ShmSegment::create(name, 32 << 20);
+    REQUIRE(owner != nullptr);
+
+    struct Held {
+        int64_t offset;
+        int64_t length;
+        std::shared_ptr<arrow::RecordBatch> expected;
+    };
+
+    // Each batch carries a distinct value, so a region overwritten by another
+    // allocation shows up as a content mismatch rather than a crash.
+    auto distinct_batch = [](int64_t seed) {
+        arrow::Int64Builder b;
+        const int64_t rows = (shm_min_batch_bytes() / 8) * 2;
+        for (int64_t i = 0; i < rows; ++i) REQUIRE(b.Append(seed * 1'000'000 + i).ok());
+        auto schema = arrow::schema({arrow::field("value", arrow::int64())});
+        return arrow::RecordBatch::Make(schema, rows, {unwrap(b.Finish())});
+    };
+
+    std::vector<Held> held;
+    for (int64_t i = 0; i < 8; ++i) {
+        auto batch = distinct_batch(i);
+        std::shared_ptr<arrow::KeyValueMetadata> md;
+        auto pointer = maybe_write_to_shm(batch, &md, owner);
+        REQUIRE(is_shm_pointer_batch(pointer, md));
+        held.push_back({std::stoll(get_metadata_value(md, keys::SHM_OFFSET)),
+                        std::stoll(get_metadata_value(md, keys::SHM_LENGTH)), batch});
+    }
+    REQUIRE(owner->live_allocations() == 8);
+
+    // Free every other one, so the survivors are separated by reusable gaps.
+    for (size_t i = 0; i < held.size(); i += 2) {
+        owner->free_alloc(held[i].offset);
+    }
+    REQUIRE(owner->live_allocations() == 4);
+
+    // Hand the gaps straight back out.
+    for (int64_t i = 100; i < 104; ++i) {
+        std::shared_ptr<arrow::KeyValueMetadata> md;
+        auto pointer = maybe_write_to_shm(distinct_batch(i), &md, owner);
+        REQUIRE(is_shm_pointer_batch(pointer, md));
+    }
+
+    // Everything still held must read back exactly as it was written.
+    for (size_t i = 1; i < held.size(); i += 2) {
+        auto md = std::make_shared<arrow::KeyValueMetadata>();
+        md->Append(keys::SHM_OFFSET, std::to_string(held[i].offset));
+        md->Append(keys::SHM_LENGTH, std::to_string(held[i].length));
+        auto batch = make_empty_batch(held[i].expected->schema());
+        int64_t unused = -1;
+        auto resolved = resolve_shm_batch(batch, &md, owner, &unused);
+        REQUIRE(resolved->Equals(*held[i].expected));
+    }
+}
