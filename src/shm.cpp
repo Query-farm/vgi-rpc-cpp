@@ -120,6 +120,69 @@ std::shared_ptr<arrow::RecordBatch> deserialize_from_shm(
     return batch;
 }
 
+// An OutputStream over a region of the mapped segment.  Arrow's IPC writer
+// writes through it directly, which is the point: the alternative is to
+// serialize into a heap buffer and then copy that in, paying for the batch
+// twice.
+//
+// Hard-bounded.  The region has to be reserved before the exact byte count is
+// known, so a size estimate decides it; a writer that ran past the reservation
+// would silently corrupt whatever was allocated next, which is the worst
+// failure this file could have.  Overrunning fails the write instead, and the
+// caller falls back to sending the batch inline.
+class ShmSink : public arrow::io::OutputStream {
+public:
+    ShmSink(uint8_t* base, int64_t capacity) : base_(base), capacity_(capacity) {}
+
+    arrow::Status Close() override {
+        closed_ = true;
+        return arrow::Status::OK();
+    }
+    bool closed() const override { return closed_; }
+    arrow::Result<int64_t> Tell() const override { return position_; }
+
+    arrow::Status Write(const void* data, int64_t nbytes) override {
+        if (position_ + nbytes > capacity_) {
+            return arrow::Status::CapacityError(
+                "shared-memory reservation too small: needed at least ",
+                position_ + nbytes, ", reserved ", capacity_);
+        }
+        std::memcpy(base_ + position_, data, static_cast<size_t>(nbytes));
+        position_ += nbytes;
+        return arrow::Status::OK();
+    }
+
+    arrow::Status Flush() override { return arrow::Status::OK(); }
+
+    int64_t bytes_written() const noexcept { return position_; }
+
+private:
+    uint8_t* base_;
+    int64_t capacity_;
+    int64_t position_ = 0;
+    bool closed_ = false;
+};
+
+// Bytes an IPC stream carrying `batch` needs: the schema message, the record
+// batch message, and the end-of-stream marker.  The record batch half comes
+// from GetRecordBatchSize, which reads the buffer layout rather than
+// serializing; the schema half is measured against a counting stream, which
+// touches no data.  Neither pass copies the batch.
+arrow::Result<int64_t> estimate_stream_size(const std::shared_ptr<arrow::RecordBatch>& batch) {
+    int64_t body_size = 0;
+    ARROW_RETURN_NOT_OK(arrow::ipc::GetRecordBatchSize(*batch, &body_size));
+
+    auto counter = std::make_shared<arrow::io::MockOutputStream>();
+    ARROW_ASSIGN_OR_RAISE(auto writer, arrow::ipc::MakeStreamWriter(counter, batch->schema()));
+    ARROW_RETURN_NOT_OK(writer->Close());  // schema message + EOS
+    const int64_t schema_and_eos = counter->GetExtentBytesWritten();
+
+    // A little slack for alignment padding the two measurements do not model
+    // between them.  Costs nothing: the pointer records what was actually
+    // written, so slack is only ever reserved, never transmitted.
+    return schema_and_eos + body_size + 64;
+}
+
 }  // namespace
 
 bool shm_available() {
@@ -329,19 +392,31 @@ std::optional<std::pair<int64_t, int64_t>> ShmSegment::allocate_and_write(
         return std::make_pair(*offset, static_cast<int64_t>(payload.size()));
     }
 
-    // Non-dictionary: serialize once, then copy in.  Arrow can write straight
-    // into the mapping, but only against an allocation sized in advance, and
-    // an over-estimate would strand the difference until the region is freed.
-    auto sink = unwrap(arrow::io::BufferOutputStream::Create());
-    auto writer = unwrap(arrow::ipc::MakeStreamWriter(sink, batch->schema()));
-    VGI_RPC_THROW_NOT_OK(writer->WriteRecordBatch(*batch));
-    VGI_RPC_THROW_NOT_OK(writer->Close());
-    auto buf = unwrap(sink->Finish());
+    // Non-dictionary: reserve from a measured estimate and let Arrow write
+    // straight into the segment, so the batch is paid for once rather than
+    // serialized to a heap buffer and copied in.
+    auto estimate = estimate_stream_size(batch);
+    if (!estimate.ok()) return std::nullopt;
 
-    auto offset = allocate(buf->size());
+    auto offset = allocate(*estimate);
     if (!offset) return std::nullopt;
-    std::memcpy(bytes() + *offset, buf->data(), static_cast<size_t>(buf->size()));
-    return std::make_pair(*offset, buf->size());
+
+    auto sink = std::make_shared<ShmSink>(bytes() + *offset, *estimate);
+    auto writer_result = arrow::ipc::MakeStreamWriter(sink, batch->schema());
+    if (!writer_result.ok()) {
+        free_alloc(*offset);
+        return std::nullopt;
+    }
+    auto writer = std::move(writer_result).ValueUnsafe();
+    if (!writer->WriteRecordBatch(*batch).ok() || !writer->Close().ok()) {
+        // Includes the estimate coming up short, which the sink refuses rather
+        // than writing past the reservation.
+        free_alloc(*offset);
+        return std::nullopt;
+    }
+    // The reservation keeps the estimate so the next allocation cannot overlap
+    // the slack; the pointer carries what was actually written.
+    return std::make_pair(*offset, sink->bytes_written());
 }
 
 // ---------------------------------------------------------------------------
