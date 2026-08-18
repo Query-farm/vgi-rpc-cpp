@@ -31,10 +31,9 @@ bool take_u64_le(const std::string& in, size_t& off, uint64_t* out) {
 }
 
 uint64_t unix_now() {
-    return static_cast<uint64_t>(
-        std::chrono::duration_cast<std::chrono::seconds>(
-            std::chrono::system_clock::now().time_since_epoch())
-            .count());
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::seconds>(
+                                     std::chrono::system_clock::now().time_since_epoch())
+                                     .count());
 }
 
 }  // namespace
@@ -57,12 +56,11 @@ std::string session_aad(const std::string& domain, const std::string& principal,
 
 SessionRegistry::SessionRegistry(std::array<uint8_t, crypto::kAeadKeyBytes> key,
                                  std::string server_id, int default_ttl_seconds)
-    : key_(key)
-    , server_id_(std::move(server_id))
-    , default_ttl_seconds_(default_ttl_seconds > 0 ? default_ttl_seconds : 300) {}
+    : key_(key),
+      server_id_(std::move(server_id)),
+      default_ttl_seconds_(default_ttl_seconds > 0 ? default_ttl_seconds : 300) {}
 
-std::string SessionRegistry::open(std::shared_ptr<SessionState> state,
-                                  const std::string& aad,
+std::string SessionRegistry::open(std::shared_ptr<SessionState> state, const std::string& aad,
                                   std::optional<int> ttl_seconds) {
     const int ttl = ttl_seconds.value_or(default_ttl_seconds_);
     auto id_bytes = crypto::random_bytes(12);

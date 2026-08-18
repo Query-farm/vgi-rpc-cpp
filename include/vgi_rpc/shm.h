@@ -37,8 +37,8 @@ struct MethodInfo;
 // begins immediately after it, and every offset on the wire is absolute —
 // measured from the start of the segment, not the start of the data region.
 inline constexpr size_t kShmHeaderSize = 65536;
-inline constexpr size_t kShmHeaderStructSize = 24;   // magic|version|data_size|num_allocs|pad
-inline constexpr size_t kShmAllocStructSize = 16;    // offset|length
+inline constexpr size_t kShmHeaderStructSize = 24;  // magic|version|data_size|num_allocs|pad
+inline constexpr size_t kShmAllocStructSize = 16;   // offset|length
 inline constexpr uint32_t kShmVersion = 1;
 inline constexpr size_t kShmMaxAllocs =
     (kShmHeaderSize - kShmHeaderStructSize) / kShmAllocStructSize;  // 4094
@@ -130,8 +130,7 @@ VGI_RPC_EXPORT bool is_shm_pointer_batch(
 VGI_RPC_EXPORT std::shared_ptr<arrow::RecordBatch> resolve_shm_batch(
     const std::shared_ptr<arrow::RecordBatch>& batch,
     std::shared_ptr<arrow::KeyValueMetadata>* custom_metadata,
-    const std::shared_ptr<ShmSegment>& segment,
-    int64_t* out_free_offset);
+    const std::shared_ptr<ShmSegment>& segment, int64_t* out_free_offset);
 
 // Write `batch` into the segment and return a pointer batch, or return the
 // batch unchanged when there is no segment, it is too small to be worth it, or
@@ -145,8 +144,7 @@ VGI_RPC_EXPORT std::shared_ptr<arrow::RecordBatch> maybe_write_to_shm(
 // empty batch whose custom_metadata carries this server's transport
 // capabilities.  Declared here rather than in describe.h because what it
 // advertises is decided by whether this build can attach a segment at all.
-VGI_RPC_EXPORT void register_transport_options(
-    std::unordered_map<std::string, MethodInfo>& methods,
-    const std::string& server_id);
+VGI_RPC_EXPORT void register_transport_options(std::unordered_map<std::string, MethodInfo>& methods,
+                                               const std::string& server_id);
 
 }  // namespace vgi_rpc

@@ -38,35 +38,39 @@ vgi_rpc::Result make_double_result(double value) {
 }  // anonymous namespace
 
 int main() {
-    auto server = vgi_rpc::ServerBuilder()
-        .add_unary("add", params_ab(), result_double(),
-            [](const vgi_rpc::Request& req, vgi_rpc::CallContext& ctx) {
-                double a = req.get<double>("a");
-                double b = req.get<double>("b");
-                ctx.client_log(vgi_rpc::LogLevel::DEBUG,
-                               "Computing " + std::to_string(a) + " + " + std::to_string(b));
-                return make_double_result(a + b);
-            },
-            "Add two numbers.")
-        .add_unary("multiply", params_ab(), result_double(),
-            [](const vgi_rpc::Request& req, vgi_rpc::CallContext& /*ctx*/) {
-                double a = req.get<double>("a");
-                double b = req.get<double>("b");
-                return make_double_result(a * b);
-            },
-            "Multiply two numbers.")
-        .add_unary("divide", params_ab(), result_double(),
-            [](const vgi_rpc::Request& req, vgi_rpc::CallContext& /*ctx*/) {
-                double a = req.get<double>("a");
-                double b = req.get<double>("b");
-                if (b == 0.0) {
-                    throw std::runtime_error("division by zero");
-                }
-                return make_double_result(a / b);
-            },
-            "Divide a by b. Raises error if b is zero.")
-        .enable_describe("Calculator")
-        .build();
+    auto server =
+        vgi_rpc::ServerBuilder()
+            .add_unary(
+                "add", params_ab(), result_double(),
+                [](const vgi_rpc::Request& req, vgi_rpc::CallContext& ctx) {
+                    double a = req.get<double>("a");
+                    double b = req.get<double>("b");
+                    ctx.client_log(vgi_rpc::LogLevel::DEBUG,
+                                   "Computing " + std::to_string(a) + " + " + std::to_string(b));
+                    return make_double_result(a + b);
+                },
+                "Add two numbers.")
+            .add_unary(
+                "multiply", params_ab(), result_double(),
+                [](const vgi_rpc::Request& req, vgi_rpc::CallContext& /*ctx*/) {
+                    double a = req.get<double>("a");
+                    double b = req.get<double>("b");
+                    return make_double_result(a * b);
+                },
+                "Multiply two numbers.")
+            .add_unary(
+                "divide", params_ab(), result_double(),
+                [](const vgi_rpc::Request& req, vgi_rpc::CallContext& /*ctx*/) {
+                    double a = req.get<double>("a");
+                    double b = req.get<double>("b");
+                    if (b == 0.0) {
+                        throw std::runtime_error("division by zero");
+                    }
+                    return make_double_result(a / b);
+                },
+                "Divide a by b. Raises error if b is zero.")
+            .enable_describe("Calculator")
+            .build();
 
     server->run();
     return 0;

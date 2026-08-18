@@ -56,17 +56,17 @@ std::shared_ptr<arrow::RecordBatch> make_bench_batch(int64_t num_rows) {
         arrow::field("label", arrow::utf8()),
     });
 
-    return arrow::RecordBatch::Make(schema, num_rows, {
-        *id_builder.Finish(),
-        *value_builder.Finish(),
-        *label_builder.Finish(),
-    });
+    return arrow::RecordBatch::Make(schema, num_rows,
+                                    {
+                                        *id_builder.Finish(),
+                                        *value_builder.Finish(),
+                                        *label_builder.Finish(),
+                                    });
 }
 
 // Pre-serialize a batch to a buffer for deserialization benchmarks
-std::shared_ptr<arrow::Buffer> serialize_to_buffer(
-    const std::shared_ptr<arrow::Schema>& schema,
-    const std::vector<AnnotatedBatch>& batches) {
+std::shared_ptr<arrow::Buffer> serialize_to_buffer(const std::shared_ptr<arrow::Schema>& schema,
+                                                   const std::vector<AnnotatedBatch>& batches) {
     auto sink = arrow::io::BufferOutputStream::Create().ValueUnsafe();
     write_ipc_stream(sink, schema, batches);
     return sink->Finish().ValueUnsafe();

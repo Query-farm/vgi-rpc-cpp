@@ -10,14 +10,12 @@
 
 namespace vgi_rpc {
 
-OutputCollector::OutputCollector(std::shared_ptr<arrow::Schema> output_schema,
-                                 bool producer_mode,
-                                 const std::string& server_id,
-                                 const std::string& request_id)
-    : output_schema_(std::move(output_schema))
-    , producer_mode_(producer_mode)
-    , server_id_(server_id)
-    , request_id_(request_id) {}
+OutputCollector::OutputCollector(std::shared_ptr<arrow::Schema> output_schema, bool producer_mode,
+                                 const std::string& server_id, const std::string& request_id)
+    : output_schema_(std::move(output_schema)),
+      producer_mode_(producer_mode),
+      server_id_(server_id),
+      request_id_(request_id) {}
 
 void OutputCollector::emit_batch(std::shared_ptr<arrow::RecordBatch> batch) {
     if (data_batch_idx_) {
@@ -44,8 +42,7 @@ void OutputCollector::emit_batch(std::shared_ptr<arrow::RecordBatch> batch,
     }
 }
 
-void OutputCollector::emit_arrays(
-    const std::vector<std::shared_ptr<arrow::Array>>& arrays) {
+void OutputCollector::emit_arrays(const std::vector<std::shared_ptr<arrow::Array>>& arrays) {
     int64_t num_rows = arrays.empty() ? 0 : arrays[0]->length();
     auto batch = arrow::RecordBatch::Make(output_schema_, num_rows, arrays);
     emit_batch(std::move(batch));

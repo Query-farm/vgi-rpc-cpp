@@ -16,15 +16,15 @@
 #include <arrow/util/key_value_metadata.h>
 
 #ifdef _WIN32
-  #include <io.h>
-  // windows.h defines min/max as macros and ERROR as a constant, all of
-  // which collide with ordinary C++ spellings; these three keep it to itself.
-  #define WIN32_LEAN_AND_MEAN
-  #define NOMINMAX
-  #define NOGDI
-  #include <windows.h>
+#include <io.h>
+// windows.h defines min/max as macros and ERROR as a constant, all of
+// which collide with ordinary C++ spellings; these three keep it to itself.
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#define NOGDI
+#include <windows.h>
 #else
-  #include <unistd.h>
+#include <unistd.h>
 #endif
 #include <algorithm>
 #include <cerrno>
@@ -70,7 +70,6 @@ BatchType AnnotatedBatch::type() const {
 
 std::optional<IpcStreamContents> read_ipc_stream(
     const std::shared_ptr<arrow::io::InputStream>& input) {
-
     auto reader_result = arrow::ipc::RecordBatchStreamReader::Open(input);
     if (!reader_result.ok()) {
         auto& status = reader_result.status();
@@ -97,8 +96,7 @@ std::optional<IpcStreamContents> read_ipc_stream(
     while (true) {
         auto result = reader->ReadNext();
         if (!result.ok()) {
-            throw std::runtime_error("Error reading IPC batch: " +
-                                     result.status().ToString());
+            throw std::runtime_error("Error reading IPC batch: " + result.status().ToString());
         }
         auto batch_with_md = std::move(result).ValueUnsafe();
         if (!batch_with_md.batch) break;  // EOS
@@ -115,13 +113,11 @@ std::optional<IpcStreamContents> read_ipc_stream(
     return contents;
 }
 
-void write_ipc_stream(
-    const std::shared_ptr<arrow::io::OutputStream>& output,
-    const std::shared_ptr<arrow::Schema>& schema,
-    const std::vector<AnnotatedBatch>& batches) {
-
-    auto writer = unwrap(arrow::ipc::MakeStreamWriter(output, schema),
-                         "Failed to create IPC writer");
+void write_ipc_stream(const std::shared_ptr<arrow::io::OutputStream>& output,
+                      const std::shared_ptr<arrow::Schema>& schema,
+                      const std::vector<AnnotatedBatch>& batches) {
+    auto writer =
+        unwrap(arrow::ipc::MakeStreamWriter(output, schema), "Failed to create IPC writer");
 
     for (const auto& ab : batches) {
         if (ab.custom_metadata) {

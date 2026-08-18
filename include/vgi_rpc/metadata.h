@@ -12,7 +12,7 @@
 namespace arrow {
 class Schema;
 class KeyValueMetadata;
-}
+}  // namespace arrow
 
 namespace vgi_rpc {
 
@@ -88,8 +88,7 @@ VGI_RPC_EXPORT std::string random_hex(size_t length);
 
 // Get or create metadata value from a KeyValueMetadata
 VGI_RPC_EXPORT std::string get_metadata_value(
-    const std::shared_ptr<arrow::KeyValueMetadata>& metadata,
-    const std::string& key,
+    const std::shared_ptr<arrow::KeyValueMetadata>& metadata, const std::string& key,
     const std::string& default_value = "");
 
 }  // namespace vgi_rpc

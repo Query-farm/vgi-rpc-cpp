@@ -117,8 +117,8 @@ static std::shared_ptr<arrow::Schema> binary_result_schema() {
     return s;
 }
 static std::shared_ptr<arrow::Schema> enum_result_schema() {
-    static auto s = arrow::schema({
-        arrow::field("result", arrow::dictionary(arrow::int16(), arrow::utf8()))});
+    static auto s =
+        arrow::schema({arrow::field("result", arrow::dictionary(arrow::int16(), arrow::utf8()))});
     return s;
 }
 static std::shared_ptr<arrow::Schema> list_str_result_schema() {
@@ -126,13 +126,13 @@ static std::shared_ptr<arrow::Schema> list_str_result_schema() {
     return s;
 }
 static std::shared_ptr<arrow::Schema> dict_str_int_result_schema() {
-    static auto s = arrow::schema({
-        arrow::field("result", arrow::map(arrow::utf8(), arrow::int64()))});
+    static auto s =
+        arrow::schema({arrow::field("result", arrow::map(arrow::utf8(), arrow::int64()))});
     return s;
 }
 static std::shared_ptr<arrow::Schema> nested_list_result_schema() {
-    static auto s = arrow::schema({
-        arrow::field("result", arrow::list(arrow::list(arrow::int64())))});
+    static auto s =
+        arrow::schema({arrow::field("result", arrow::list(arrow::list(arrow::int64())))});
     return s;
 }
 static std::shared_ptr<arrow::Schema> optional_str_result_schema() {
@@ -159,7 +159,7 @@ static std::shared_ptr<arrow::Schema> list_int_result_schema() {
 
 // Wide-type result schemas (echo passthrough)
 static std::shared_ptr<arrow::Schema> result_schema_of(std::shared_ptr<arrow::DataType> t,
-                                                        bool nullable = false) {
+                                                       bool nullable = false) {
     return arrow::schema({arrow::field("result", std::move(t), nullable)});
 }
 
@@ -174,8 +174,8 @@ static Result echo_column(const Request& req, std::string_view param_name,
 }
 
 template <typename T>
-static std::shared_ptr<T> checked_cast_column(
-    const std::shared_ptr<arrow::RecordBatch>& batch, const std::string& name) {
+static std::shared_ptr<T> checked_cast_column(const std::shared_ptr<arrow::RecordBatch>& batch,
+                                              const std::string& name) {
     auto col = batch->GetColumnByName(name);
     if (!col) throw std::runtime_error("Column not found: " + name);
     auto typed = std::dynamic_pointer_cast<T>(col);
@@ -183,8 +183,8 @@ static std::shared_ptr<T> checked_cast_column(
     return typed;
 }
 
-static std::shared_ptr<arrow::RecordBatch> deserialize_dataclass(
-    const Request& req, std::string_view param_name) {
+static std::shared_ptr<arrow::RecordBatch> deserialize_dataclass(const Request& req,
+                                                                 std::string_view param_name) {
     auto col = req.batch()->GetColumnByName(std::string(param_name));
     std::string_view view;
     if (auto bin = std::dynamic_pointer_cast<arrow::BinaryArray>(col)) {
@@ -204,15 +204,14 @@ static std::shared_ptr<arrow::RecordBatch> deserialize_dataclass(
     return batch;
 }
 
-static std::shared_ptr<arrow::RecordBatch> make_header_batch(
-    int64_t total_expected, const std::string& description) {
+static std::shared_ptr<arrow::RecordBatch> make_header_batch(int64_t total_expected,
+                                                             const std::string& description) {
     arrow::Int64Builder int_builder;
     arrow::StringBuilder str_builder;
     VGI_RPC_THROW_NOT_OK(int_builder.Append(total_expected));
     VGI_RPC_THROW_NOT_OK(str_builder.Append(description));
-    return arrow::RecordBatch::Make(
-        conformance_header_schema(), 1,
-        {unwrap(int_builder.Finish()), unwrap(str_builder.Finish())});
+    return arrow::RecordBatch::Make(conformance_header_schema(), 1,
+                                    {unwrap(int_builder.Finish()), unwrap(str_builder.Finish())});
 }
 
 // Format a double the way Python's repr does (e.g. 2.0 -> "2.0", 1.5 -> "1.5").
@@ -232,9 +231,8 @@ static std::string fmt_py_double(double v) {
 // =========================================================================
 
 static std::shared_ptr<arrow::DataType> point_struct_type() {
-    static auto t = arrow::struct_({
-        arrow::field("x", arrow::float64(), false),
-        arrow::field("y", arrow::float64(), false)});
+    static auto t = arrow::struct_(
+        {arrow::field("x", arrow::float64(), false), arrow::field("y", arrow::float64(), false)});
     return t;
 }
 
@@ -329,16 +327,16 @@ static std::shared_ptr<arrow::RecordBatch> make_rich_header_batch(int64_t seed) 
         VGI_RPC_THROW_NOT_OK(dv.Append(status_names[idx]));
         arrow::Int16Builder iv;
         VGI_RPC_THROW_NOT_OK(iv.Append(0));
-        enum_arr = unwrap(arrow::DictionaryArray::FromArrays(
-            arrow::dictionary(arrow::int16(), arrow::utf8()),
-            unwrap(iv.Finish()), unwrap(dv.Finish())));
+        enum_arr = unwrap(
+            arrow::DictionaryArray::FromArrays(arrow::dictionary(arrow::int16(), arrow::utf8()),
+                                               unwrap(iv.Finish()), unwrap(dv.Finish())));
     }
 
     // nested_point: Point(seed, seed*2)
     auto np_x = std::make_shared<arrow::DoubleBuilder>(pool);
     auto np_y = std::make_shared<arrow::DoubleBuilder>(pool);
     arrow::StructBuilder np_b(point_struct_type(), pool,
-        std::vector<std::shared_ptr<arrow::ArrayBuilder>>{np_x, np_y});
+                              std::vector<std::shared_ptr<arrow::ArrayBuilder>>{np_x, np_y});
     {
         VGI_RPC_THROW_NOT_OK(np_b.Append());
         VGI_RPC_THROW_NOT_OK(np_x->Append(static_cast<double>(seed)));
@@ -365,7 +363,7 @@ static std::shared_ptr<arrow::RecordBatch> make_rich_header_batch(int64_t seed) 
     auto on_x = std::make_shared<arrow::DoubleBuilder>(pool);
     auto on_y = std::make_shared<arrow::DoubleBuilder>(pool);
     arrow::StructBuilder on_b(point_struct_type(), pool,
-        std::vector<std::shared_ptr<arrow::ArrayBuilder>>{on_x, on_y});
+                              std::vector<std::shared_ptr<arrow::ArrayBuilder>>{on_x, on_y});
     if (seed % 3 == 0) {
         VGI_RPC_THROW_NOT_OK(on_b.Append());
         VGI_RPC_THROW_NOT_OK(on_x->Append(static_cast<double>(seed)));
@@ -377,8 +375,8 @@ static std::shared_ptr<arrow::RecordBatch> make_rich_header_batch(int64_t seed) 
     // list_of_nested: [Point(seed, seed+1)]
     auto ln_x = std::make_shared<arrow::DoubleBuilder>(pool);
     auto ln_y = std::make_shared<arrow::DoubleBuilder>(pool);
-    auto ln_struct = std::make_shared<arrow::StructBuilder>(point_struct_type(), pool,
-        std::vector<std::shared_ptr<arrow::ArrayBuilder>>{ln_x, ln_y});
+    auto ln_struct = std::make_shared<arrow::StructBuilder>(
+        point_struct_type(), pool, std::vector<std::shared_ptr<arrow::ArrayBuilder>>{ln_x, ln_y});
     arrow::ListBuilder ln_b(pool, ln_struct);
     {
         VGI_RPC_THROW_NOT_OK(ln_b.Append());
@@ -417,12 +415,12 @@ static std::shared_ptr<arrow::RecordBatch> make_rich_header_batch(int64_t seed) 
     }
 
     std::vector<std::shared_ptr<arrow::Array>> cols = {
-        unwrap(str_b.Finish()), unwrap(bytes_b.Finish()), unwrap(int_b.Finish()),
-        unwrap(float_b.Finish()), unwrap(bool_b.Finish()), unwrap(loi_b.Finish()),
-        unwrap(los_b.Finish()), unwrap(df_b.Finish()), enum_arr,
-        unwrap(np_b.Finish()), unwrap(os_b.Finish()), unwrap(oi_b.Finish()),
-        unwrap(on_b.Finish()), unwrap(ln_b.Finish()), unwrap(nl_b.Finish()),
-        unwrap(ai_b.Finish()), unwrap(af_b.Finish()), unwrap(dss_b.Finish())};
+        unwrap(str_b.Finish()),   unwrap(bytes_b.Finish()), unwrap(int_b.Finish()),
+        unwrap(float_b.Finish()), unwrap(bool_b.Finish()),  unwrap(loi_b.Finish()),
+        unwrap(los_b.Finish()),   unwrap(df_b.Finish()),    enum_arr,
+        unwrap(np_b.Finish()),    unwrap(os_b.Finish()),    unwrap(oi_b.Finish()),
+        unwrap(on_b.Finish()),    unwrap(ln_b.Finish()),    unwrap(nl_b.Finish()),
+        unwrap(ai_b.Finish()),    unwrap(af_b.Finish()),    unwrap(dss_b.Finish())};
 
     return arrow::RecordBatch::Make(rich_header_schema(), 1, std::move(cols));
 }
@@ -541,8 +539,8 @@ static Result inspect_point_handler(const Request& req, CallContext&) {
     auto batch = deserialize_dataclass(req, "point");
     auto x_col = checked_cast_column<arrow::DoubleArray>(batch, "x");
     auto y_col = checked_cast_column<arrow::DoubleArray>(batch, "y");
-    auto result_str = std::format("Point({}, {})",
-        fmt_py_double(x_col->Value(0)), fmt_py_double(y_col->Value(0)));
+    auto result_str = std::format("Point({}, {})", fmt_py_double(x_col->Value(0)),
+                                  fmt_py_double(y_col->Value(0)));
     arrow::StringBuilder builder;
     VGI_RPC_THROW_NOT_OK(builder.Append(result_str));
     return Result::value(str_result_schema(), {unwrap(builder.Finish())});
@@ -584,7 +582,7 @@ static Result echo_timestamp_handler(const Request& req, CallContext&) {
 }
 static Result echo_timestamp_utc_handler(const Request& req, CallContext&) {
     return echo_column(req, "value",
-        result_schema_of(arrow::timestamp(arrow::TimeUnit::MICRO, "UTC")));
+                       result_schema_of(arrow::timestamp(arrow::TimeUnit::MICRO, "UTC")));
 }
 static Result echo_time_handler(const Request& req, CallContext&) {
     return echo_column(req, "value", result_schema_of(arrow::time64(arrow::TimeUnit::MICRO)));
@@ -606,7 +604,7 @@ static Result echo_fixed_binary_handler(const Request& req, CallContext&) {
 }
 static Result echo_dict_encoded_string_handler(const Request& req, CallContext&) {
     return echo_column(req, "value",
-        result_schema_of(arrow::dictionary(arrow::int16(), arrow::utf8())));
+                       result_schema_of(arrow::dictionary(arrow::int16(), arrow::utf8())));
 }
 
 // =========================================================================
@@ -634,8 +632,8 @@ static Result with_defaults_handler(const Request& req, CallContext&) {
     auto required = req.get<int64_t>("required");
     auto optional_str = req.get<std::string>("optional_str");
     auto optional_int = req.get<int64_t>("optional_int");
-    auto result = std::format("required={}, optional_str={}, optional_int={}",
-                              required, optional_str, optional_int);
+    auto result = std::format("required={}, optional_str={}, optional_int={}", required,
+                              optional_str, optional_int);
     arrow::StringBuilder builder;
     VGI_RPC_THROW_NOT_OK(builder.Append(result));
     return Result::value(str_result_schema(), {unwrap(builder.Finish())});
@@ -770,13 +768,17 @@ class CounterState : public ProducerState {
 public:
     CounterState(int64_t count) : count_(count) {}
     void produce(OutputCollector& out, CallContext&) override {
-        if (current_ >= count_) { out.finish(); return; }
+        if (current_ >= count_) {
+            out.finish();
+            return;
+        }
         arrow::Int64Builder idx, val;
         VGI_RPC_THROW_NOT_OK(idx.Append(current_));
         VGI_RPC_THROW_NOT_OK(val.Append(current_ * 10));
         out.emit_arrays({unwrap(idx.Finish()), unwrap(val.Finish())});
         ++current_;
     }
+
 private:
     int64_t count_, current_ = 0;
 };
@@ -789,13 +791,17 @@ public:
 class SingleProducerState : public ProducerState {
 public:
     void produce(OutputCollector& out, CallContext&) override {
-        if (emitted_) { out.finish(); return; }
+        if (emitted_) {
+            out.finish();
+            return;
+        }
         emitted_ = true;
         arrow::Int64Builder idx, val;
         VGI_RPC_THROW_NOT_OK(idx.Append(0));
         VGI_RPC_THROW_NOT_OK(val.Append(0));
         out.emit_arrays({unwrap(idx.Finish()), unwrap(val.Finish())});
     }
+
 private:
     bool emitted_ = false;
 };
@@ -805,7 +811,10 @@ public:
     LargeProducerState(int64_t rows_per_batch, int64_t batch_count)
         : rows_per_batch_(rows_per_batch), batch_count_(batch_count) {}
     void produce(OutputCollector& out, CallContext&) override {
-        if (current_ >= batch_count_) { out.finish(); return; }
+        if (current_ >= batch_count_) {
+            out.finish();
+            return;
+        }
         int64_t offset = current_ * rows_per_batch_;
         arrow::Int64Builder idx, val;
         for (int64_t i = 0; i < rows_per_batch_; ++i) {
@@ -815,6 +824,7 @@ public:
         out.emit_arrays({unwrap(idx.Finish()), unwrap(val.Finish())});
         ++current_;
     }
+
 private:
     int64_t rows_per_batch_, batch_count_, current_ = 0;
 };
@@ -824,7 +834,10 @@ class OversizedBatchState : public ProducerState {
 public:
     OversizedBatchState(int64_t rows_per_batch) : rows_per_batch_(rows_per_batch) {}
     void produce(OutputCollector& out, CallContext&) override {
-        if (emitted_) { out.finish(); return; }
+        if (emitted_) {
+            out.finish();
+            return;
+        }
         emitted_ = true;
         arrow::Int64Builder idx, val;
         for (int64_t i = 0; i < rows_per_batch_; ++i) {
@@ -833,6 +846,7 @@ public:
         }
         out.emit_arrays({unwrap(idx.Finish()), unwrap(val.Finish())});
     }
+
 private:
     int64_t rows_per_batch_;
     bool emitted_ = false;
@@ -842,7 +856,10 @@ class LoggingProducerState : public ProducerState {
 public:
     LoggingProducerState(int64_t count) : count_(count) {}
     void produce(OutputCollector& out, CallContext&) override {
-        if (current_ >= count_) { out.finish(); return; }
+        if (current_ >= count_) {
+            out.finish();
+            return;
+        }
         out.client_log(LogLevel::INFO, std::format("producing batch {}", current_));
         arrow::Int64Builder idx, val;
         VGI_RPC_THROW_NOT_OK(idx.Append(current_));
@@ -850,6 +867,7 @@ public:
         out.emit_arrays({unwrap(idx.Finish()), unwrap(val.Finish())});
         ++current_;
     }
+
 private:
     int64_t count_, current_ = 0;
 };
@@ -867,6 +885,7 @@ public:
         out.emit_arrays({unwrap(idx.Finish()), unwrap(val.Finish())});
         ++current_;
     }
+
 private:
     int64_t n_, current_ = 0;
 };
@@ -876,13 +895,17 @@ class HeaderProducerState : public ProducerState {
 public:
     HeaderProducerState(int64_t count) : count_(count) {}
     void produce(OutputCollector& out, CallContext&) override {
-        if (current_ >= count_) { out.finish(); return; }
+        if (current_ >= count_) {
+            out.finish();
+            return;
+        }
         arrow::Int64Builder idx, val;
         VGI_RPC_THROW_NOT_OK(idx.Append(current_));
         VGI_RPC_THROW_NOT_OK(val.Append(current_ * 10));
         out.emit_arrays({unwrap(idx.Finish()), unwrap(val.Finish())});
         ++current_;
     }
+
 private:
     int64_t count_, current_ = 0;
 };
@@ -892,10 +915,15 @@ class DynamicProducerState : public ProducerState {
 public:
     DynamicProducerState(int64_t count, bool include_strings, bool include_floats,
                          std::shared_ptr<arrow::Schema> schema)
-        : count_(count), include_strings_(include_strings),
-          include_floats_(include_floats), schema_(std::move(schema)) {}
+        : count_(count),
+          include_strings_(include_strings),
+          include_floats_(include_floats),
+          schema_(std::move(schema)) {}
     void produce(OutputCollector& out, CallContext&) override {
-        if (current_ >= count_) { out.finish(); return; }
+        if (current_ >= count_) {
+            out.finish();
+            return;
+        }
         std::vector<std::shared_ptr<arrow::Array>> cols;
         arrow::Int64Builder idx;
         VGI_RPC_THROW_NOT_OK(idx.Append(current_));
@@ -913,6 +941,7 @@ public:
         out.emit_batch(arrow::RecordBatch::Make(schema_, 1, std::move(cols)));
         ++current_;
     }
+
 private:
     int64_t count_, current_ = 0;
     bool include_strings_, include_floats_;
@@ -931,6 +960,7 @@ public:
         ++current_;
     }
     void on_cancel(CallContext&) override { ++g_cancel_probe.on_cancel_calls; }
+
 private:
     int64_t current_ = 0;
 };
@@ -940,7 +970,10 @@ class SessionCounterProducerState : public ProducerState {
 public:
     SessionCounterProducerState(int64_t count) : count_(count) {}
     void produce(OutputCollector& out, CallContext& ctx) override {
-        if (current_ >= count_) { out.finish(); return; }
+        if (current_ >= count_) {
+            out.finish();
+            return;
+        }
         // Resolved per turn, not captured at init: across HTTP turns the
         // sticky middleware rebinds the session on every request, which is
         // exactly the property this exercises.
@@ -951,6 +984,7 @@ public:
         out.emit_arrays({unwrap(val.Finish())});
         ++current_;
     }
+
 private:
     int64_t count_, current_ = 0;
 };
@@ -970,6 +1004,7 @@ public:
         }
         out.emit_arrays({unwrap(builder.Finish())});
     }
+
 private:
     double factor_;
 };
@@ -986,6 +1021,7 @@ public:
         VGI_RPC_THROW_NOT_OK(count_builder.Append(exchange_count_));
         out.emit_arrays({unwrap(sum_builder.Finish()), unwrap(count_builder.Finish())});
     }
+
 private:
     double running_sum_ = 0.0;
     int64_t exchange_count_ = 0;
@@ -1004,7 +1040,7 @@ class ZeroColumnExchangeState : public ExchangeState {
 public:
     void exchange(const AnnotatedBatch&, OutputCollector& out, CallContext&) override {
         out.emit_batch(arrow::RecordBatch::Make(empty_schema(), 0,
-            std::vector<std::shared_ptr<arrow::Array>>{}));
+                                                std::vector<std::shared_ptr<arrow::Array>>{}));
     }
 };
 
@@ -1019,6 +1055,7 @@ public:
         }
         out.emit_batch(input.batch);
     }
+
 private:
     int64_t fail_on_;
     int64_t exchange_count_ = 0;
@@ -1036,6 +1073,7 @@ public:
         }
         out.emit_arrays({unwrap(idx.Finish()), unwrap(val.Finish())});
     }
+
 private:
     int64_t rows_per_batch_;
 };
@@ -1072,17 +1110,15 @@ static Stream make_produce_n(const Request& req, CallContext&) {
             std::make_shared<CounterState>(req.get<int64_t>("count")), nullptr};
 }
 static Stream make_produce_empty(const Request&, CallContext&) {
-    return {counter_schema(), empty_schema(),
-            std::make_shared<EmptyProducerState>(), nullptr};
+    return {counter_schema(), empty_schema(), std::make_shared<EmptyProducerState>(), nullptr};
 }
 static Stream make_produce_single(const Request&, CallContext&) {
-    return {counter_schema(), empty_schema(),
-            std::make_shared<SingleProducerState>(), nullptr};
+    return {counter_schema(), empty_schema(), std::make_shared<SingleProducerState>(), nullptr};
 }
 static Stream make_produce_large(const Request& req, CallContext&) {
     return {counter_schema(), empty_schema(),
-            std::make_shared<LargeProducerState>(
-                req.get<int64_t>("rows_per_batch"), req.get<int64_t>("batch_count")),
+            std::make_shared<LargeProducerState>(req.get<int64_t>("rows_per_batch"),
+                                                 req.get<int64_t>("batch_count")),
             nullptr};
 }
 static Stream make_produce_with_logs(const Request& req, CallContext&) {
@@ -1091,37 +1127,33 @@ static Stream make_produce_with_logs(const Request& req, CallContext&) {
 }
 static Stream make_produce_error_mid(const Request& req, CallContext&) {
     return {counter_schema(), empty_schema(),
-            std::make_shared<ErrorAfterNState>(req.get<int64_t>("emit_before_error")),
-            nullptr};
+            std::make_shared<ErrorAfterNState>(req.get<int64_t>("emit_before_error")), nullptr};
 }
 static Stream make_produce_error_init(const Request&, CallContext&) {
     throw std::runtime_error("intentional init error");
 }
 static Stream make_produce_oversized_batch(const Request& req, CallContext&) {
     return {counter_schema(), empty_schema(),
-            std::make_shared<OversizedBatchState>(req.get<int64_t>("rows_per_batch")),
-            nullptr};
+            std::make_shared<OversizedBatchState>(req.get<int64_t>("rows_per_batch")), nullptr};
 }
 
 static Stream make_produce_with_header(const Request& req, CallContext&) {
     auto count = req.get<int64_t>("count");
     auto header = make_header_batch(count, std::format("producing {} batches", count));
-    return {counter_schema(), empty_schema(),
-            std::make_shared<HeaderProducerState>(count), header};
+    return {counter_schema(), empty_schema(), std::make_shared<HeaderProducerState>(count), header};
 }
 static Stream make_produce_with_header_and_logs(const Request& req, CallContext& ctx) {
     auto count = req.get<int64_t>("count");
     ctx.client_log(LogLevel::INFO, "stream init log");
     auto header = make_header_batch(count, std::format("producing {} with logs", count));
-    return {counter_schema(), empty_schema(),
-            std::make_shared<HeaderProducerState>(count), header};
+    return {counter_schema(), empty_schema(), std::make_shared<HeaderProducerState>(count), header};
 }
 
 static Stream make_produce_with_rich_header(const Request& req, CallContext&) {
     auto seed = req.get<int64_t>("seed");
     auto count = req.get<int64_t>("count");
-    return {counter_schema(), empty_schema(),
-            std::make_shared<HeaderProducerState>(count), make_rich_header_batch(seed)};
+    return {counter_schema(), empty_schema(), std::make_shared<HeaderProducerState>(count),
+            make_rich_header_batch(seed)};
 }
 
 static Stream make_produce_dynamic_schema(const Request& req, CallContext&) {
@@ -1133,14 +1165,15 @@ static Stream make_produce_dynamic_schema(const Request& req, CallContext&) {
     if (include_strings) fields.push_back(arrow::field("label", arrow::utf8()));
     if (include_floats) fields.push_back(arrow::field("score", arrow::float64()));
     auto out_schema = arrow::schema(fields);
-    return {out_schema, empty_schema(),
-            std::make_shared<DynamicProducerState>(count, include_strings, include_floats, out_schema),
-            make_rich_header_batch(seed)};
+    return {
+        out_schema, empty_schema(),
+        std::make_shared<DynamicProducerState>(count, include_strings, include_floats, out_schema),
+        make_rich_header_batch(seed)};
 }
 
 static Stream make_cancellable_producer(const Request&, CallContext&) {
-    return {counter_schema(), empty_schema(),
-            std::make_shared<CancellableProducerState>(), nullptr};
+    return {counter_schema(), empty_schema(), std::make_shared<CancellableProducerState>(),
+            nullptr};
 }
 
 static Stream make_stream_session_counter(const Request& req, CallContext&) {
@@ -1161,28 +1194,26 @@ static Stream make_exchange_accumulate(const Request&, CallContext&) {
             std::make_shared<AccumulatingExchangeState>(), nullptr};
 }
 static Stream make_exchange_with_logs(const Request&, CallContext&) {
-    return {scale_output_schema(), scale_input_schema(),
-            std::make_shared<LoggingExchangeState>(), nullptr};
+    return {scale_output_schema(), scale_input_schema(), std::make_shared<LoggingExchangeState>(),
+            nullptr};
 }
 static Stream make_exchange_zero_columns(const Request&, CallContext&) {
-    return {empty_schema(), empty_schema(),
-            std::make_shared<ZeroColumnExchangeState>(), nullptr};
+    return {empty_schema(), empty_schema(), std::make_shared<ZeroColumnExchangeState>(), nullptr};
 }
 static Stream make_exchange_error_on_nth(const Request& req, CallContext&) {
     return {scale_output_schema(), scale_input_schema(),
             std::make_shared<FailOnExchangeNState>(req.get<int64_t>("fail_on")), nullptr};
 }
 static Stream make_exchange_cast_compatible(const Request&, CallContext&) {
-    return {scale_output_schema(), scale_input_schema(),
-            std::make_shared<ScaleExchangeState>(1.0), nullptr};
+    return {scale_output_schema(), scale_input_schema(), std::make_shared<ScaleExchangeState>(1.0),
+            nullptr};
 }
 static Stream make_exchange_error_on_init(const Request&, CallContext&) {
     throw std::runtime_error("intentional exchange init error");
 }
 static Stream make_exchange_oversized(const Request& req, CallContext&) {
     return {counter_schema(), scale_input_schema(),
-            std::make_shared<OversizedExchangeState>(req.get<int64_t>("rows_per_batch")),
-            nullptr};
+            std::make_shared<OversizedExchangeState>(req.get<int64_t>("rows_per_batch")), nullptr};
 }
 static Stream make_exchange_with_header(const Request& req, CallContext&) {
     auto factor = req.get<double>("factor");
@@ -1209,8 +1240,7 @@ static Stream make_exchange_session_counter(const Request&, CallContext&) {
 // Main
 // =========================================================================
 
-static std::shared_ptr<arrow::Schema> params(
-    std::vector<std::shared_ptr<arrow::Field>> fields) {
+static std::shared_ptr<arrow::Schema> params(std::vector<std::shared_ptr<arrow::Field>> fields) {
     return arrow::schema(std::move(fields));
 }
 
@@ -1346,7 +1376,8 @@ int main(int argc, char** argv) {
         } else if (arg == "--access-log-max-record-bytes" && i + 1 < argc) {
             access_log_max_record_bytes = std::stoll(take_value(i));
         } else if ((arg == "--access-log-max-bytes" || arg == "--access-log-when" ||
-                    arg == "--access-log-backup-count") && i + 1 < argc) {
+                    arg == "--access-log-backup-count") &&
+                   i + 1 < argc) {
             ++i;  // rotation knobs: accepted so the harness can launch us
         }
     }
@@ -1356,135 +1387,130 @@ int main(int argc, char** argv) {
     // --- Scalar Echo ---
     builder
         .add_unary("echo_string", params({arrow::field("value", arrow::utf8())}),
-            str_result_schema(), echo_string_handler, "Echo a string value.")
+                   str_result_schema(), echo_string_handler, "Echo a string value.")
         .add_unary("echo_bytes", params({arrow::field("data", arrow::binary())}),
-            bytes_result_schema(), echo_bytes_handler, "Echo a bytes value.")
+                   bytes_result_schema(), echo_bytes_handler, "Echo a bytes value.")
         .add_unary("oversized_unary", params({arrow::field("target_bytes", arrow::int64())}),
-            bytes_result_schema(), oversized_unary_handler,
-            "Return a bytes payload of approximately target_bytes bytes.")
-        .add_unary("echo_int", params({arrow::field("value", arrow::int64())}),
-            int_result_schema(), echo_int_handler, "Echo an integer value.")
+                   bytes_result_schema(), oversized_unary_handler,
+                   "Return a bytes payload of approximately target_bytes bytes.")
+        .add_unary("echo_int", params({arrow::field("value", arrow::int64())}), int_result_schema(),
+                   echo_int_handler, "Echo an integer value.")
         .add_unary("echo_float", params({arrow::field("value", arrow::float64())}),
-            float_result_schema(), echo_float_handler, "Echo a float value.")
+                   float_result_schema(), echo_float_handler, "Echo a float value.")
         .add_unary("echo_bool", params({arrow::field("value", arrow::boolean())}),
-            bool_result_schema(), echo_bool_handler, "Echo a boolean value.");
+                   bool_result_schema(), echo_bool_handler, "Echo a boolean value.");
 
     // --- Void ---
-    builder
-        .add_void("void_noop", empty_schema(), void_noop_handler, "No-op returning void.")
+    builder.add_void("void_noop", empty_schema(), void_noop_handler, "No-op returning void.")
         .add_void("void_with_param", params({arrow::field("value", arrow::int64())}),
-            void_with_param_handler, "Accept a parameter, return void.");
+                  void_with_param_handler, "Accept a parameter, return void.");
 
     // --- Complex Type Echo ---
     builder
-        .add_unary("echo_enum",
+        .add_unary(
+            "echo_enum",
             params({arrow::field("status", arrow::dictionary(arrow::int16(), arrow::utf8()))}),
             enum_result_schema(), echo_enum_handler, "Echo an enum value.")
         .add_unary("echo_list", params({arrow::field("values", arrow::list(arrow::utf8()))}),
-            list_str_result_schema(), echo_list_handler, "Echo a list of strings.")
+                   list_str_result_schema(), echo_list_handler, "Echo a list of strings.")
         .add_unary("echo_dict",
-            params({arrow::field("mapping", arrow::map(arrow::utf8(), arrow::int64()))}),
-            dict_str_int_result_schema(), echo_dict_handler, "Echo a dict mapping.")
+                   params({arrow::field("mapping", arrow::map(arrow::utf8(), arrow::int64()))}),
+                   dict_str_int_result_schema(), echo_dict_handler, "Echo a dict mapping.")
         .add_unary("echo_nested_list",
-            params({arrow::field("matrix", arrow::list(arrow::list(arrow::int64())))}),
-            nested_list_result_schema(), echo_nested_list_handler, "Echo a nested list.");
+                   params({arrow::field("matrix", arrow::list(arrow::list(arrow::int64())))}),
+                   nested_list_result_schema(), echo_nested_list_handler, "Echo a nested list.");
 
     // --- Optional/Nullable ---
     builder
-        .add_unary("echo_optional_string",
-            params({arrow::field("value", arrow::utf8(), true)}),
-            optional_str_result_schema(), echo_optional_string_handler,
-            "Echo an optional string (may be None).")
-        .add_unary("echo_optional_int",
-            params({arrow::field("value", arrow::int64(), true)}),
-            optional_int_result_schema(), echo_optional_int_handler,
-            "Echo an optional int (may be None).");
+        .add_unary("echo_optional_string", params({arrow::field("value", arrow::utf8(), true)}),
+                   optional_str_result_schema(), echo_optional_string_handler,
+                   "Echo an optional string (may be None).")
+        .add_unary("echo_optional_int", params({arrow::field("value", arrow::int64(), true)}),
+                   optional_int_result_schema(), echo_optional_int_handler,
+                   "Echo an optional int (may be None).");
 
     // --- Dataclass Round-trip ---
     builder
         .add_unary("echo_point", params({arrow::field("point", arrow::binary())}),
-            binary_result_schema(), echo_point_handler, "Echo a Point dataclass.")
+                   binary_result_schema(), echo_point_handler, "Echo a Point dataclass.")
         .add_unary("echo_all_types", params({arrow::field("data", arrow::binary())}),
-            binary_result_schema(), echo_all_types_handler,
-            "Echo an AllTypes dataclass exercising every type mapping.")
+                   binary_result_schema(), echo_all_types_handler,
+                   "Echo an AllTypes dataclass exercising every type mapping.")
         .add_unary("echo_bounding_box", params({arrow::field("box", arrow::binary())}),
-            binary_result_schema(), echo_bounding_box_handler,
-            "Echo a BoundingBox with nested Points.");
+                   binary_result_schema(), echo_bounding_box_handler,
+                   "Echo a BoundingBox with nested Points.");
 
     // --- Dataclass as Parameter ---
-    builder
-        .add_unary("inspect_point", params({arrow::field("point", arrow::binary())}),
-            str_result_schema(), inspect_point_handler,
-            "Accept a Point param (pa.binary() on wire), return formatted string.");
+    builder.add_unary("inspect_point", params({arrow::field("point", arrow::binary())}),
+                      str_result_schema(), inspect_point_handler,
+                      "Accept a Point param (pa.binary() on wire), return formatted string.");
 
     // --- Annotated Types ---
     builder
         .add_unary("echo_int32", params({arrow::field("value", arrow::int32())}),
-            int32_result_schema(), echo_int32_handler, "Echo an int32 value.")
+                   int32_result_schema(), echo_int32_handler, "Echo an int32 value.")
         .add_unary("echo_float32", params({arrow::field("value", arrow::float32())}),
-            float32_result_schema(), echo_float32_handler, "Echo a float32 value.");
+                   float32_result_schema(), echo_float32_handler, "Echo a float32 value.");
 
     // --- Wide Arrow Types ---
     builder
         .add_unary("echo_int8", params({arrow::field("value", arrow::int8())}),
-            result_schema_of(arrow::int8()), echo_int8_handler, "Echo an int8 value.")
+                   result_schema_of(arrow::int8()), echo_int8_handler, "Echo an int8 value.")
         .add_unary("echo_int16", params({arrow::field("value", arrow::int16())}),
-            result_schema_of(arrow::int16()), echo_int16_handler, "Echo an int16 value.")
+                   result_schema_of(arrow::int16()), echo_int16_handler, "Echo an int16 value.")
         .add_unary("echo_uint8", params({arrow::field("value", arrow::uint8())}),
-            result_schema_of(arrow::uint8()), echo_uint8_handler, "Echo a uint8 value.")
+                   result_schema_of(arrow::uint8()), echo_uint8_handler, "Echo a uint8 value.")
         .add_unary("echo_uint16", params({arrow::field("value", arrow::uint16())}),
-            result_schema_of(arrow::uint16()), echo_uint16_handler, "Echo a uint16 value.")
+                   result_schema_of(arrow::uint16()), echo_uint16_handler, "Echo a uint16 value.")
         .add_unary("echo_uint32", params({arrow::field("value", arrow::uint32())}),
-            result_schema_of(arrow::uint32()), echo_uint32_handler, "Echo a uint32 value.")
+                   result_schema_of(arrow::uint32()), echo_uint32_handler, "Echo a uint32 value.")
         .add_unary("echo_uint64", params({arrow::field("value", arrow::uint64())}),
-            result_schema_of(arrow::uint64()), echo_uint64_handler, "Echo a uint64 value.")
+                   result_schema_of(arrow::uint64()), echo_uint64_handler, "Echo a uint64 value.")
         .add_unary("echo_date", params({arrow::field("value", arrow::date32())}),
-            result_schema_of(arrow::date32()), echo_date_handler, "Echo a date32 value.")
+                   result_schema_of(arrow::date32()), echo_date_handler, "Echo a date32 value.")
         .add_unary("echo_timestamp",
-            params({arrow::field("value", arrow::timestamp(arrow::TimeUnit::MICRO))}),
-            result_schema_of(arrow::timestamp(arrow::TimeUnit::MICRO)),
-            echo_timestamp_handler, "Echo a naive microsecond timestamp.")
+                   params({arrow::field("value", arrow::timestamp(arrow::TimeUnit::MICRO))}),
+                   result_schema_of(arrow::timestamp(arrow::TimeUnit::MICRO)),
+                   echo_timestamp_handler, "Echo a naive microsecond timestamp.")
         .add_unary("echo_timestamp_utc",
-            params({arrow::field("value", arrow::timestamp(arrow::TimeUnit::MICRO, "UTC"))}),
-            result_schema_of(arrow::timestamp(arrow::TimeUnit::MICRO, "UTC")),
-            echo_timestamp_utc_handler, "Echo a UTC-tagged microsecond timestamp.")
+                   params({arrow::field("value", arrow::timestamp(arrow::TimeUnit::MICRO, "UTC"))}),
+                   result_schema_of(arrow::timestamp(arrow::TimeUnit::MICRO, "UTC")),
+                   echo_timestamp_utc_handler, "Echo a UTC-tagged microsecond timestamp.")
         .add_unary("echo_time",
-            params({arrow::field("value", arrow::time64(arrow::TimeUnit::MICRO))}),
-            result_schema_of(arrow::time64(arrow::TimeUnit::MICRO)),
-            echo_time_handler, "Echo a microsecond time-of-day value.")
+                   params({arrow::field("value", arrow::time64(arrow::TimeUnit::MICRO))}),
+                   result_schema_of(arrow::time64(arrow::TimeUnit::MICRO)), echo_time_handler,
+                   "Echo a microsecond time-of-day value.")
         .add_unary("echo_duration",
-            params({arrow::field("value", arrow::duration(arrow::TimeUnit::MICRO))}),
-            result_schema_of(arrow::duration(arrow::TimeUnit::MICRO)),
-            echo_duration_handler, "Echo a microsecond duration.")
-        .add_unary("echo_decimal",
-            params({arrow::field("value", arrow::decimal128(20, 4))}),
-            result_schema_of(arrow::decimal128(20, 4)), echo_decimal_handler,
-            "Echo a decimal128(20, 4) value.")
-        .add_unary("echo_large_string",
-            params({arrow::field("value", arrow::large_utf8())}),
-            result_schema_of(arrow::large_utf8()), echo_large_string_handler,
-            "Echo a large_string value.")
-        .add_unary("echo_large_binary",
-            params({arrow::field("value", arrow::large_binary())}),
-            result_schema_of(arrow::large_binary()), echo_large_binary_handler,
-            "Echo a large_binary value.")
+                   params({arrow::field("value", arrow::duration(arrow::TimeUnit::MICRO))}),
+                   result_schema_of(arrow::duration(arrow::TimeUnit::MICRO)), echo_duration_handler,
+                   "Echo a microsecond duration.")
+        .add_unary("echo_decimal", params({arrow::field("value", arrow::decimal128(20, 4))}),
+                   result_schema_of(arrow::decimal128(20, 4)), echo_decimal_handler,
+                   "Echo a decimal128(20, 4) value.")
+        .add_unary("echo_large_string", params({arrow::field("value", arrow::large_utf8())}),
+                   result_schema_of(arrow::large_utf8()), echo_large_string_handler,
+                   "Echo a large_string value.")
+        .add_unary("echo_large_binary", params({arrow::field("value", arrow::large_binary())}),
+                   result_schema_of(arrow::large_binary()), echo_large_binary_handler,
+                   "Echo a large_binary value.")
         .add_unary("echo_fixed_binary",
-            params({arrow::field("value", arrow::fixed_size_binary(8))}),
-            result_schema_of(arrow::fixed_size_binary(8)), echo_fixed_binary_handler,
-            "Echo a fixed_size_binary(8) value.")
+                   params({arrow::field("value", arrow::fixed_size_binary(8))}),
+                   result_schema_of(arrow::fixed_size_binary(8)), echo_fixed_binary_handler,
+                   "Echo a fixed_size_binary(8) value.")
         .add_unary("echo_wide_types", params({arrow::field("data", arrow::binary())}),
-            binary_result_schema(), echo_wide_types_handler,
-            "Round-trip every Arrow primitive width via a single dataclass.")
+                   binary_result_schema(), echo_wide_types_handler,
+                   "Round-trip every Arrow primitive width via a single dataclass.")
         .add_unary("echo_container_wide_types", params({arrow::field("data", arrow::binary())}),
-            binary_result_schema(), echo_container_wide_types_handler,
-            "Round-trip wide Arrow types nested inside list/dict/optional.")
+                   binary_result_schema(), echo_container_wide_types_handler,
+                   "Round-trip wide Arrow types nested inside list/dict/optional.")
         .add_unary("echo_embedded_arrow", params({arrow::field("data", arrow::binary())}),
-            binary_result_schema(), echo_embedded_arrow_handler,
-            "Round-trip a RecordBatch and Schema carried as nested IPC.")
+                   binary_result_schema(), echo_embedded_arrow_handler,
+                   "Round-trip a RecordBatch and Schema carried as nested IPC.")
         .add_unary("echo_deep_nested", params({arrow::field("data", arrow::binary())}),
-            binary_result_schema(), echo_deep_nested_handler,
-            "Round-trip multi-level nested containers and dictionary-encoded strings.")
-        .add_unary("echo_dict_encoded_string",
+                   binary_result_schema(), echo_deep_nested_handler,
+                   "Round-trip multi-level nested containers and dictionary-encoded strings.")
+        .add_unary(
+            "echo_dict_encoded_string",
             params({arrow::field("value", arrow::dictionary(arrow::int16(), arrow::utf8()))}),
             result_schema_of(arrow::dictionary(arrow::int16(), arrow::utf8())),
             echo_dict_encoded_string_handler,
@@ -1492,178 +1518,177 @@ int main(int argc, char** argv) {
 
     // --- Multi-Param & Defaults ---
     builder
-        .add_unary("add_floats",
+        .add_unary(
+            "add_floats",
             params({arrow::field("a", arrow::float64()), arrow::field("b", arrow::float64())}),
             float_result_schema(), add_floats_handler, "Add two floats.")
-        .add_unary("concatenate",
+        .add_unary(
+            "concatenate",
             params({arrow::field("prefix", arrow::utf8()), arrow::field("suffix", arrow::utf8()),
                     arrow::field("separator", arrow::utf8())}),
-            str_result_schema(), concatenate_handler,
-            "Concatenate prefix + separator + suffix.")
+            str_result_schema(), concatenate_handler, "Concatenate prefix + separator + suffix.")
         .add_unary("with_defaults",
-            params({arrow::field("required", arrow::int64()),
-                    arrow::field("optional_str", arrow::utf8()),
-                    arrow::field("optional_int", arrow::int64())}),
-            str_result_schema(), with_defaults_handler,
-            "Return a formatted string showing all param values.");
+                   params({arrow::field("required", arrow::int64()),
+                           arrow::field("optional_str", arrow::utf8()),
+                           arrow::field("optional_int", arrow::int64())}),
+                   str_result_schema(), with_defaults_handler,
+                   "Return a formatted string showing all param values.");
 
     // --- Error Propagation ---
     builder
         .add_unary("raise_value_error", params({arrow::field("message", arrow::utf8())}),
-            str_result_schema(), raise_value_error_handler,
-            "Raise a ValueError with the given message.")
+                   str_result_schema(), raise_value_error_handler,
+                   "Raise a ValueError with the given message.")
         .add_unary("raise_runtime_error", params({arrow::field("message", arrow::utf8())}),
-            str_result_schema(), raise_runtime_error_handler,
-            "Raise a RuntimeError with the given message.")
+                   str_result_schema(), raise_runtime_error_handler,
+                   "Raise a RuntimeError with the given message.")
         .add_unary("raise_type_error", params({arrow::field("message", arrow::utf8())}),
-            str_result_schema(), raise_type_error_handler,
-            "Raise a TypeError with the given message.");
+                   str_result_schema(), raise_type_error_handler,
+                   "Raise a TypeError with the given message.");
 
     // --- Client-Directed Logging ---
     builder
         .add_unary("echo_with_info_log", params({arrow::field("value", arrow::utf8())}),
-            str_result_schema(), echo_with_info_log_handler,
-            "Echo value, emitting one INFO log.")
+                   str_result_schema(), echo_with_info_log_handler,
+                   "Echo value, emitting one INFO log.")
         .add_unary("echo_with_multi_logs", params({arrow::field("value", arrow::utf8())}),
-            str_result_schema(), echo_with_multi_logs_handler,
-            "Echo value, emitting DEBUG + INFO + WARN logs.")
+                   str_result_schema(), echo_with_multi_logs_handler,
+                   "Echo value, emitting DEBUG + INFO + WARN logs.")
         .add_unary("echo_with_log_extras", params({arrow::field("value", arrow::utf8())}),
-            str_result_schema(), echo_with_log_extras_handler,
-            "Echo value, emitting an INFO log with extra key-value pairs.")
+                   str_result_schema(), echo_with_log_extras_handler,
+                   "Echo value, emitting an INFO log with extra key-value pairs.")
         .add_unary("echo_with_all_log_levels", params({arrow::field("value", arrow::utf8())}),
-            str_result_schema(), echo_with_all_log_levels_handler,
-            "Echo value, emitting one log at each of TRACE/DEBUG/INFO/WARN/ERROR.");
+                   str_result_schema(), echo_with_all_log_levels_handler,
+                   "Echo value, emitting one log at each of TRACE/DEBUG/INFO/WARN/ERROR.");
 
     // --- Cancellation probe (unary) ---
     builder
-        .add_unary("cancel_probe_counters", empty_schema(),
-            list_int_result_schema(), cancel_probe_counters_handler,
-            "Return [produce_calls, exchange_calls, on_cancel_calls].")
+        .add_unary("cancel_probe_counters", empty_schema(), list_int_result_schema(),
+                   cancel_probe_counters_handler,
+                   "Return [produce_calls, exchange_calls, on_cancel_calls].")
         .add_void("reset_cancel_probe", empty_schema(), reset_cancel_probe_handler,
-            "Reset all cancel-probe counters to zero on the server.");
+                  "Reset all cancel-probe counters to zero on the server.");
 
     // --- Sticky session (unary; HTTP-only at runtime) ---
     builder
         .add_unary("open_counter", params({arrow::field("initial", arrow::int64())}),
-            int_result_schema(), open_counter_handler,
-            "Open a sticky session holding a counter; return its initial value.")
+                   int_result_schema(), open_counter_handler,
+                   "Open a sticky session holding a counter; return its initial value.")
         .add_unary("increment_counter", params({arrow::field("by", arrow::int64())}),
-            int_result_schema(), increment_counter_handler,
-            "Increment the sticky session's counter; return the post-increment value.")
-        .add_unary("close_counter", empty_schema(),
-            int_result_schema(), close_counter_handler,
-            "Close the sticky session; return the counter's final value before close.");
+                   int_result_schema(), increment_counter_handler,
+                   "Increment the sticky session's counter; return the post-increment value.")
+        .add_unary("close_counter", empty_schema(), int_result_schema(), close_counter_handler,
+                   "Close the sticky session; return the counter's final value before close.");
 
     // --- Producer Streams ---
     builder
         .add_producer("produce_n", params({arrow::field("count", arrow::int64())}),
-            counter_schema(), make_produce_n, "Produce count batches with {index, value}.")
+                      counter_schema(), make_produce_n,
+                      "Produce count batches with {index, value}.")
         .add_producer("produce_empty", empty_schema(), counter_schema(), make_produce_empty,
-            "Produce zero batches (finish immediately).")
+                      "Produce zero batches (finish immediately).")
         .add_producer("produce_single", empty_schema(), counter_schema(), make_produce_single,
-            "Produce exactly one batch.")
+                      "Produce exactly one batch.")
         .add_producer("produce_large_batches",
-            params({arrow::field("rows_per_batch", arrow::int64()),
-                    arrow::field("batch_count", arrow::int64())}),
-            counter_schema(), make_produce_large,
-            "Produce batch_count batches of rows_per_batch rows each.")
+                      params({arrow::field("rows_per_batch", arrow::int64()),
+                              arrow::field("batch_count", arrow::int64())}),
+                      counter_schema(), make_produce_large,
+                      "Produce batch_count batches of rows_per_batch rows each.")
         .add_producer("produce_with_logs", params({arrow::field("count", arrow::int64())}),
-            counter_schema(), make_produce_with_logs,
-            "Produce batches with an INFO log before each.")
+                      counter_schema(), make_produce_with_logs,
+                      "Produce batches with an INFO log before each.")
         .add_producer("produce_error_mid_stream",
-            params({arrow::field("emit_before_error", arrow::int64())}),
-            counter_schema(), make_produce_error_mid,
-            "Raise after emitting emit_before_error batches.")
+                      params({arrow::field("emit_before_error", arrow::int64())}), counter_schema(),
+                      make_produce_error_mid, "Raise after emitting emit_before_error batches.")
         .add_producer("produce_error_on_init", empty_schema(), counter_schema(),
-            make_produce_error_init, "Raise during stream initialization.")
+                      make_produce_error_init, "Raise during stream initialization.")
         .add_producer("produce_oversized_batch",
-            params({arrow::field("rows_per_batch", arrow::int64())}),
-            counter_schema(), make_produce_oversized_batch,
-            "Emit one oversized batch of int64 rows, then finish.");
+                      params({arrow::field("rows_per_batch", arrow::int64())}), counter_schema(),
+                      make_produce_oversized_batch,
+                      "Emit one oversized batch of int64 rows, then finish.");
 
     // --- Producer Streams With Headers ---
     builder
         .add_producer("produce_with_header", params({arrow::field("count", arrow::int64())}),
-            counter_schema(), make_produce_with_header,
-            "Produce batches with a stream header.", conformance_header_schema())
+                      counter_schema(), make_produce_with_header,
+                      "Produce batches with a stream header.", conformance_header_schema())
         .add_producer("produce_with_header_and_logs",
-            params({arrow::field("count", arrow::int64())}),
-            counter_schema(), make_produce_with_header_and_logs,
-            "Produce batches with a header and INFO logs.", conformance_header_schema())
-        .add_producer("produce_with_rich_header",
+                      params({arrow::field("count", arrow::int64())}), counter_schema(),
+                      make_produce_with_header_and_logs,
+                      "Produce batches with a header and INFO logs.", conformance_header_schema())
+        .add_producer(
+            "produce_with_rich_header",
             params({arrow::field("seed", arrow::int64()), arrow::field("count", arrow::int64())}),
             counter_schema(), make_produce_with_rich_header,
             "Produce batches with a rich multi-type stream header.", rich_header_schema())
-        .add_producer("produce_dynamic_schema",
+        .add_producer(
+            "produce_dynamic_schema",
             params({arrow::field("seed", arrow::int64()), arrow::field("count", arrow::int64()),
                     arrow::field("include_strings", arrow::boolean()),
                     arrow::field("include_floats", arrow::boolean())}),
             counter_schema(), make_produce_dynamic_schema,
-            "Produce batches with a dynamic output schema and rich header.",
-            rich_header_schema());
+            "Produce batches with a dynamic output schema and rich header.", rich_header_schema());
 
     // --- Cancellation producer ---
-    builder
-        .add_producer("cancellable_producer", empty_schema(), counter_schema(),
-            make_cancellable_producer,
-            "Produce one batch per tick forever — designed to be cancelled.");
+    builder.add_producer("cancellable_producer", empty_schema(), counter_schema(),
+                         make_cancellable_producer,
+                         "Produce one batch per tick forever — designed to be cancelled.");
 
     // --- Sticky session streaming (HTTP-only at runtime) ---
-    builder
-        .add_producer("stream_session_counter",
-            params({arrow::field("count", arrow::int64())}),
-            session_value_schema(), make_stream_session_counter,
-            "Emit count increments of the sticky session counter via a producer stream.");
+    builder.add_producer(
+        "stream_session_counter", params({arrow::field("count", arrow::int64())}),
+        session_value_schema(), make_stream_session_counter,
+        "Emit count increments of the sticky session counter via a producer stream.");
 
     // --- Exchange Streams ---
     builder
         .add_exchange("exchange_scale", params({arrow::field("factor", arrow::float64())}),
-            scale_input_schema(), scale_output_schema(), make_exchange_scale,
-            "Multiply input values by factor.")
-        .add_exchange("exchange_accumulate", empty_schema(),
-            accum_input_schema(), accum_output_schema(), make_exchange_accumulate,
-            "Accumulate running sum and exchange count across exchanges.")
-        .add_exchange("exchange_with_logs", empty_schema(),
-            scale_input_schema(), scale_output_schema(), make_exchange_with_logs,
-            "Exchange with INFO + DEBUG logs per exchange.")
-        .add_exchange("exchange_zero_columns", empty_schema(),
-            empty_schema(), empty_schema(), make_exchange_zero_columns,
-            "Exchange stream with zero-column input and output.")
+                      scale_input_schema(), scale_output_schema(), make_exchange_scale,
+                      "Multiply input values by factor.")
+        .add_exchange("exchange_accumulate", empty_schema(), accum_input_schema(),
+                      accum_output_schema(), make_exchange_accumulate,
+                      "Accumulate running sum and exchange count across exchanges.")
+        .add_exchange("exchange_with_logs", empty_schema(), scale_input_schema(),
+                      scale_output_schema(), make_exchange_with_logs,
+                      "Exchange with INFO + DEBUG logs per exchange.")
+        .add_exchange("exchange_zero_columns", empty_schema(), empty_schema(), empty_schema(),
+                      make_exchange_zero_columns,
+                      "Exchange stream with zero-column input and output.")
         .add_exchange("exchange_error_on_nth", params({arrow::field("fail_on", arrow::int64())}),
-            scale_input_schema(), scale_output_schema(), make_exchange_error_on_nth,
-            "Raise on the Nth exchange (1-indexed).")
-        .add_exchange("exchange_cast_compatible", empty_schema(),
-            scale_input_schema(), scale_output_schema(), make_exchange_cast_compatible,
-            "Exchange expecting float64 input — tests server-side cast.")
-        .add_exchange("exchange_error_on_init", empty_schema(),
-            scale_input_schema(), scale_output_schema(), make_exchange_error_on_init,
-            "Raise during exchange stream initialization.")
+                      scale_input_schema(), scale_output_schema(), make_exchange_error_on_nth,
+                      "Raise on the Nth exchange (1-indexed).")
+        .add_exchange("exchange_cast_compatible", empty_schema(), scale_input_schema(),
+                      scale_output_schema(), make_exchange_cast_compatible,
+                      "Exchange expecting float64 input — tests server-side cast.")
+        .add_exchange("exchange_error_on_init", empty_schema(), scale_input_schema(),
+                      scale_output_schema(), make_exchange_error_on_init,
+                      "Raise during exchange stream initialization.")
         .add_exchange("exchange_oversized",
-            params({arrow::field("rows_per_batch", arrow::int64())}),
-            scale_input_schema(), counter_schema(), make_exchange_oversized,
-            "Exchange that emits an oversized output batch for any input.");
+                      params({arrow::field("rows_per_batch", arrow::int64())}),
+                      scale_input_schema(), counter_schema(), make_exchange_oversized,
+                      "Exchange that emits an oversized output batch for any input.");
 
     // --- Exchange Streams With Headers ---
     builder
         .add_exchange("exchange_with_header", params({arrow::field("factor", arrow::float64())}),
-            scale_input_schema(), scale_output_schema(), make_exchange_with_header,
-            "Exchange stream with a header.", conformance_header_schema())
+                      scale_input_schema(), scale_output_schema(), make_exchange_with_header,
+                      "Exchange stream with a header.", conformance_header_schema())
         .add_exchange("exchange_with_rich_header",
-            params({arrow::field("seed", arrow::int64()), arrow::field("factor", arrow::float64())}),
-            scale_input_schema(), scale_output_schema(), make_exchange_with_rich_header,
-            "Exchange stream with a rich multi-type header.", rich_header_schema());
+                      params({arrow::field("seed", arrow::int64()),
+                              arrow::field("factor", arrow::float64())}),
+                      scale_input_schema(), scale_output_schema(), make_exchange_with_rich_header,
+                      "Exchange stream with a rich multi-type header.", rich_header_schema());
 
     // --- Cancellation exchange ---
-    builder
-        .add_exchange("cancellable_exchange", empty_schema(),
-            scale_input_schema(), scale_output_schema(), make_cancellable_exchange,
-            "Echo each input batch — designed to be cancelled by the client.");
+    builder.add_exchange("cancellable_exchange", empty_schema(), scale_input_schema(),
+                         scale_output_schema(), make_cancellable_exchange,
+                         "Echo each input batch — designed to be cancelled by the client.");
 
     // --- Sticky session streaming exchange (HTTP-only at runtime) ---
-    builder
-        .add_exchange("exchange_session_counter", empty_schema(),
-            session_by_schema(), session_value_schema(), make_exchange_session_counter,
-            "Exchange stream adding each input by column to the sticky session counter.");
+    builder.add_exchange(
+        "exchange_session_counter", empty_schema(), session_by_schema(), session_value_schema(),
+        make_exchange_session_counter,
+        "Exchange stream adding each input by column to the sticky session counter.");
 
     // A fixed marker rather than a real platform header: the contract under
     // test is capture-and-replay, and a stable name is what lets the shared

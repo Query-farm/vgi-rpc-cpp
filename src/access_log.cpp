@@ -20,8 +20,7 @@ std::string base64_encode(const uint8_t* data, size_t len) {
     size_t i = 0;
     for (; i + 3 <= len; i += 3) {
         uint32_t n = (static_cast<uint32_t>(data[i]) << 16) |
-                     (static_cast<uint32_t>(data[i + 1]) << 8) |
-                     static_cast<uint32_t>(data[i + 2]);
+                     (static_cast<uint32_t>(data[i + 1]) << 8) | static_cast<uint32_t>(data[i + 2]);
         out.push_back(tbl[(n >> 18) & 0x3F]);
         out.push_back(tbl[(n >> 12) & 0x3F]);
         out.push_back(tbl[(n >> 6) & 0x3F]);
@@ -34,8 +33,8 @@ std::string base64_encode(const uint8_t* data, size_t len) {
         out.push_back('=');
         out.push_back('=');
     } else if (i + 2 == len) {
-        uint32_t n = (static_cast<uint32_t>(data[i]) << 16) |
-                     (static_cast<uint32_t>(data[i + 1]) << 8);
+        uint32_t n =
+            (static_cast<uint32_t>(data[i]) << 16) | (static_cast<uint32_t>(data[i + 1]) << 8);
         out.push_back(tbl[(n >> 18) & 0x3F]);
         out.push_back(tbl[(n >> 12) & 0x3F]);
         out.push_back(tbl[(n >> 6) & 0x3F]);
@@ -55,10 +54,9 @@ namespace {
 // framing fields plus the twelve always-required ones.  §5b's sentinel form
 // keeps exactly these (plus error_message when the call failed).
 const char* const kEnvelopeKeys[] = {
-    "timestamp", "level",     "logger",      "message",     "server_id",
-    "protocol",  "protocol_hash", "method",  "method_type", "principal",
-    "auth_domain", "authenticated", "remote_addr", "duration_ms", "status",
-    "error_type",
+    "timestamp",     "level",       "logger",      "message",    "server_id",   "protocol",
+    "protocol_hash", "method",      "method_type", "principal",  "auth_domain", "authenticated",
+    "remote_addr",   "duration_ms", "status",      "error_type",
 };
 
 // RFC 3339 UTC with millisecond precision: YYYY-MM-DDTHH:MM:SS.sssZ
@@ -83,15 +81,13 @@ std::string utc_timestamp_ms() {
 
 }  // namespace
 
-AccessLogWriter::AccessLogWriter(const std::string& path,
-                                 std::string server_id,
-                                 std::string protocol_name,
-                                 std::string protocol_hash,
+AccessLogWriter::AccessLogWriter(const std::string& path, std::string server_id,
+                                 std::string protocol_name, std::string protocol_hash,
                                  int64_t max_record_bytes)
-    : server_id_(std::move(server_id))
-    , protocol_name_(std::move(protocol_name))
-    , protocol_hash_(std::move(protocol_hash))
-    , max_record_bytes_(max_record_bytes > 0 ? max_record_bytes : kDefaultMaxRecordBytes) {
+    : server_id_(std::move(server_id)),
+      protocol_name_(std::move(protocol_name)),
+      protocol_hash_(std::move(protocol_hash)),
+      max_record_bytes_(max_record_bytes > 0 ? max_record_bytes : kDefaultMaxRecordBytes) {
     if (path.empty()) return;
     out_.open(path, std::ios::out | std::ios::app);
     enabled_ = out_.is_open();
@@ -108,8 +104,7 @@ void AccessLogWriter::emit(const AccessRecord& rec) {
     j["timestamp"] = utc_timestamp_ms();
     j["level"] = "INFO";
     j["logger"] = "vgi_rpc.access";
-    j["message"] =
-        protocol_name_ + "." + rec.method + (rec.status == "ok" ? " ok" : " error");
+    j["message"] = protocol_name_ + "." + rec.method + (rec.status == "ok" ? " ok" : " error");
     j["server_id"] = server_id_;
     j["protocol"] = protocol_name_;
     j["protocol_hash"] = protocol_hash_;
@@ -123,8 +118,7 @@ void AccessLogWriter::emit(const AccessRecord& rec) {
     j["status"] = rec.status;
     j["error_type"] = rec.error_type;
     if (rec.status == "error") {
-        j["error_message"] =
-            rec.error_message.empty() ? std::string("error") : rec.error_message;
+        j["error_message"] = rec.error_message.empty() ? std::string("error") : rec.error_message;
     }
     if (!rec.request_id.empty()) {
         // Must equal the X-Request-ID the response carried.  An id that
@@ -151,8 +145,7 @@ void AccessLogWriter::emit(const AccessRecord& rec) {
     // yet since this emitter carries no claims; rung 3 is the sentinel form.
     std::string line = j.dump();
     if (static_cast<int64_t>(line.size()) > max_record_bytes_ && j.contains("request_data")) {
-        j["original_request_bytes"] =
-            static_cast<int64_t>(rec.request_data_b64.size());
+        j["original_request_bytes"] = static_cast<int64_t>(rec.request_data_b64.size());
         j.erase("request_data");
         j["truncated"] = true;
         line = j.dump();

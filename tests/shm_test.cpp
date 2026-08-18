@@ -23,9 +23,9 @@ namespace {
 // Windows has no POSIX shared memory, so there is nothing here to exercise —
 // the library reports shm = "false" and peers stay on the pipe.  Skipped
 // rather than compiled out, so the absence is visible in the test report.
-#define REQUIRE_SHM()                                                    \
-    do {                                                                 \
-        if (!shm_available()) SKIP("shared memory is POSIX-only");        \
+#define REQUIRE_SHM()                                              \
+    do {                                                           \
+        if (!shm_available()) SKIP("shared memory is POSIX-only"); \
     } while (0)
 
 // A distinct name per test, so a leftover segment from a crashed run cannot
@@ -50,7 +50,9 @@ std::shared_ptr<arrow::RecordBatch> big_int_batch() {
     return int_batch((shm_min_batch_bytes() / 8) * 2);
 }
 
-int64_t big_batch_bytes() { return (shm_min_batch_bytes() / 8) * 2 * 8; }
+int64_t big_batch_bytes() {
+    return (shm_min_batch_bytes() / 8) * 2 * 8;
+}
 
 std::shared_ptr<arrow::RecordBatch> dictionary_batch() {
     arrow::StringDictionary32Builder builder;

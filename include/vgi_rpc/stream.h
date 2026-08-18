@@ -20,8 +20,7 @@ public:
     virtual ~StreamState() noexcept = default;
 
     // Called once per input batch (tick for producer, data for exchange)
-    virtual void process(const AnnotatedBatch& input,
-                        OutputCollector& out, CallContext& ctx) = 0;
+    virtual void process(const AnnotatedBatch& input, OutputCollector& out, CallContext& ctx) = 0;
 
     // Called when the client cancels the stream (sends a batch carrying
     // vgi_rpc.cancel metadata).  Default is a no-op.  Implementations may
@@ -36,8 +35,7 @@ public:
     virtual void produce(OutputCollector& out, CallContext& ctx) = 0;
 
     // Delegates to produce(), ignoring tick input
-    void process(const AnnotatedBatch& /*input*/,
-                OutputCollector& out, CallContext& ctx) override {
+    void process(const AnnotatedBatch& /*input*/, OutputCollector& out, CallContext& ctx) override {
         produce(out, ctx);
     }
 };
@@ -46,11 +44,9 @@ public:
 class ExchangeState : public StreamState {
 public:
     // Override this to process input and emit output
-    virtual void exchange(const AnnotatedBatch& input,
-                         OutputCollector& out, CallContext& ctx) = 0;
+    virtual void exchange(const AnnotatedBatch& input, OutputCollector& out, CallContext& ctx) = 0;
 
-    void process(const AnnotatedBatch& input,
-                OutputCollector& out, CallContext& ctx) override {
+    void process(const AnnotatedBatch& input, OutputCollector& out, CallContext& ctx) override {
         exchange(input, out, ctx);
     }
 };

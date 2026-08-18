@@ -21,9 +21,9 @@ namespace vgi_rpc {
 class VGI_RPC_EXPORT KindedError : public std::runtime_error {
 public:
     KindedError(std::string kind, std::string exception_type, const std::string& what)
-        : std::runtime_error(what)
-        , kind_(std::move(kind))
-        , exception_type_(std::move(exception_type)) {}
+        : std::runtime_error(what),
+          kind_(std::move(kind)),
+          exception_type_(std::move(exception_type)) {}
 
     const std::string& kind() const noexcept { return kind_; }
     const std::string& exception_type() const noexcept { return exception_type_; }

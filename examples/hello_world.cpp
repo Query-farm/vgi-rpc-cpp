@@ -19,24 +19,25 @@ int main() {
         arrow::field("result", arrow::float64()),
     });
 
-    auto server = vgi_rpc::ServerBuilder()
-        .add_unary("add", params_schema, result_schema,
-            [](const vgi_rpc::Request& req, vgi_rpc::CallContext& /*ctx*/) {
-                double a = req.get<double>("a");
-                double b = req.get<double>("b");
-                double sum = a + b;
+    auto server =
+        vgi_rpc::ServerBuilder()
+            .add_unary(
+                "add", params_schema, result_schema,
+                [](const vgi_rpc::Request& req, vgi_rpc::CallContext& /*ctx*/) {
+                    double a = req.get<double>("a");
+                    double b = req.get<double>("b");
+                    double sum = a + b;
 
-                arrow::DoubleBuilder builder;
-                VGI_RPC_THROW_NOT_OK(builder.Append(sum));
-                auto array = vgi_rpc::unwrap(builder.Finish());
+                    arrow::DoubleBuilder builder;
+                    VGI_RPC_THROW_NOT_OK(builder.Append(sum));
+                    auto array = vgi_rpc::unwrap(builder.Finish());
 
-                return vgi_rpc::Result::value(
-                    arrow::schema({arrow::field("result", arrow::float64())}),
-                    {array});
-            },
-            "Add two numbers together.")
-        .enable_describe("HelloWorld")
-        .build();
+                    return vgi_rpc::Result::value(
+                        arrow::schema({arrow::field("result", arrow::float64())}), {array});
+                },
+                "Add two numbers together.")
+            .enable_describe("HelloWorld")
+            .build();
 
     server->run();
     return 0;

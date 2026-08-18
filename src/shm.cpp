@@ -20,10 +20,10 @@
 #include <stdexcept>
 
 #ifndef _WIN32
-  #include <fcntl.h>
-  #include <sys/mman.h>
-  #include <sys/stat.h>
-  #include <unistd.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #endif
 
 namespace vgi_rpc {
@@ -47,8 +47,12 @@ uint64_t load_u64(const uint8_t* p) {
     return v;
 }
 
-void store_u32(uint8_t* p, uint32_t v) { std::memcpy(p, &v, sizeof(v)); }
-void store_u64(uint8_t* p, uint64_t v) { std::memcpy(p, &v, sizeof(v)); }
+void store_u32(uint8_t* p, uint32_t v) {
+    std::memcpy(p, &v, sizeof(v));
+}
+void store_u64(uint8_t* p, uint64_t v) {
+    std::memcpy(p, &v, sizeof(v));
+}
 
 bool has_dictionary_columns(const std::shared_ptr<arrow::Schema>& schema) {
     for (const auto& field : schema->fields()) {
@@ -83,8 +87,8 @@ std::string serialize_dictionary_batch(const std::shared_ptr<arrow::RecordBatch>
         auto msg = std::move(msg_result).ValueUnsafe();
         if (!msg) break;  // EOS
         int64_t written = 0;
-        VGI_RPC_THROW_NOT_OK(msg->SerializeTo(kept.get(), arrow::ipc::IpcWriteOptions::Defaults(),
-                                              &written));
+        VGI_RPC_THROW_NOT_OK(
+            msg->SerializeTo(kept.get(), arrow::ipc::IpcWriteOptions::Defaults(), &written));
     }
     auto buf = unwrap(kept->Finish());
     return std::string(reinterpret_cast<const char*>(buf->data()),
@@ -144,8 +148,8 @@ public:
     arrow::Status Write(const void* data, int64_t nbytes) override {
         if (position_ + nbytes > capacity_) {
             return arrow::Status::CapacityError(
-                "shared-memory reservation too small: needed at least ",
-                position_ + nbytes, ", reserved ", capacity_);
+                "shared-memory reservation too small: needed at least ", position_ + nbytes,
+                ", reserved ", capacity_);
         }
         std::memcpy(base_ + position_, data, static_cast<size_t>(nbytes));
         position_ += nbytes;
@@ -234,7 +238,7 @@ std::shared_ptr<ShmSegment> ShmSegment::create(const std::string& name, size_t s
         return nullptr;
     }
 
-    struct stat st {};
+    struct stat st{};
     size_t actual = size;
     if (::fstat(fd, &st) == 0 && st.st_size > 0) actual = static_cast<size_t>(st.st_size);
 
@@ -267,7 +271,7 @@ std::shared_ptr<ShmSegment> ShmSegment::attach(const std::string& name, size_t s
 
     // Trust the kernel's size over the peer's hint: macOS rounds a segment up
     // to a page boundary, and the header was written with the rounded value.
-    struct stat st {};
+    struct stat st{};
     size_t actual = size;
     if (::fstat(fd, &st) == 0 && st.st_size > 0) {
         actual = static_cast<size_t>(st.st_size);
@@ -282,8 +286,7 @@ std::shared_ptr<ShmSegment> ShmSegment::attach(const std::string& name, size_t s
     if (base == MAP_FAILED) return nullptr;
 
     const auto* header = static_cast<const uint8_t*>(base);
-    if (std::memcmp(header, kMagic, sizeof(kMagic)) != 0 ||
-        load_u32(header + 4) != kShmVersion ||
+    if (std::memcmp(header, kMagic, sizeof(kMagic)) != 0 || load_u32(header + 4) != kShmVersion ||
         load_u64(header + 8) != static_cast<uint64_t>(actual - kShmHeaderSize)) {
         ::munmap(base, actual);
         return nullptr;
@@ -302,7 +305,9 @@ ShmSegment::~ShmSegment() {
 
 #else  // _WIN32
 
-std::shared_ptr<ShmSegment> ShmSegment::create(const std::string&, size_t) { return nullptr; }
+std::shared_ptr<ShmSegment> ShmSegment::create(const std::string&, size_t) {
+    return nullptr;
+}
 
 std::shared_ptr<ShmSegment> ShmSegment::attach(const std::string&, size_t) {
     return nullptr;  // reported as shm = "false" by __transport_options__
@@ -312,13 +317,21 @@ ShmSegment::~ShmSegment() = default;
 
 #endif  // _WIN32
 
-uint32_t ShmSegment::num_allocs() const noexcept { return load_u32(bytes() + 16); }
+uint32_t ShmSegment::num_allocs() const noexcept {
+    return load_u32(bytes() + 16);
+}
 
-uint32_t ShmSegment::live_allocations() const noexcept { return num_allocs(); }
+uint32_t ShmSegment::live_allocations() const noexcept {
+    return num_allocs();
+}
 
-void ShmSegment::reset() { set_num_allocs(0); }
+void ShmSegment::reset() {
+    set_num_allocs(0);
+}
 
-void ShmSegment::set_num_allocs(uint32_t n) noexcept { store_u32(bytes() + 16, n); }
+void ShmSegment::set_num_allocs(uint32_t n) noexcept {
+    store_u32(bytes() + 16, n);
+}
 
 std::optional<int64_t> ShmSegment::allocate(int64_t size) {
     if (size <= 0) return std::nullopt;
@@ -333,8 +346,7 @@ std::optional<int64_t> ShmSegment::allocate(int64_t size) {
     // regions are tracked, so a freed neighbour widens the gap on its own —
     // that is what "implicit coalescing" means here.
     auto insert_at = [&](uint32_t index, uint64_t offset) {
-        std::memmove(table + (index + 1) * kShmAllocStructSize,
-                     table + index * kShmAllocStructSize,
+        std::memmove(table + (index + 1) * kShmAllocStructSize, table + index * kShmAllocStructSize,
                      (count - index) * kShmAllocStructSize);
         store_u64(table + index * kShmAllocStructSize, offset);
         store_u64(table + index * kShmAllocStructSize + 8, static_cast<uint64_t>(size));
@@ -362,8 +374,7 @@ void ShmSegment::free_alloc(int64_t offset) {
     uint8_t* table = bytes() + kShmHeaderStructSize;
     for (uint32_t i = 0; i < count; ++i) {
         if (load_u64(table + i * kShmAllocStructSize) == static_cast<uint64_t>(offset)) {
-            std::memmove(table + i * kShmAllocStructSize,
-                         table + (i + 1) * kShmAllocStructSize,
+            std::memmove(table + i * kShmAllocStructSize, table + (i + 1) * kShmAllocStructSize,
                          (count - i - 1) * kShmAllocStructSize);
             set_num_allocs(count - 1);
             return;

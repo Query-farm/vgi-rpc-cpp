@@ -26,10 +26,8 @@ namespace vgi_rpc {
 // NOT thread-safe.  One OutputCollector is created per stream tick/exchange.
 class VGI_RPC_EXPORT OutputCollector {
 public:
-    OutputCollector(std::shared_ptr<arrow::Schema> output_schema,
-                    bool producer_mode,
-                    const std::string& server_id = "",
-                    const std::string& request_id = "");
+    OutputCollector(std::shared_ptr<arrow::Schema> output_schema, bool producer_mode,
+                    const std::string& server_id = "", const std::string& request_id = "");
 
     // Emit a pre-built data batch
     void emit_batch(std::shared_ptr<arrow::RecordBatch> batch);

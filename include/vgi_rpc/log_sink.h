@@ -25,8 +25,7 @@ class VGI_RPC_EXPORT LogSink {
 public:
     LogSink(std::string server_id, std::string request_id);
 
-    void emit(LogLevel level, std::string_view message,
-              const nlohmann::json& extra = {});
+    void emit(LogLevel level, std::string_view message, const nlohmann::json& extra = {});
 
     void emit(const Message& msg);
 

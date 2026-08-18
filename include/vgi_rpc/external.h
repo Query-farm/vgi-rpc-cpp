@@ -50,8 +50,7 @@ public:
     virtual ~ExternalStorage() = default;
 
     // Store `data` and return the URL a client should fetch it from.
-    virtual std::string upload(const std::string& data,
-                               const std::string& content_encoding) = 0;
+    virtual std::string upload(const std::string& data, const std::string& content_encoding) = 0;
 
     // Retrieve an object previously uploaded — by this server, or by a client
     // through a vended upload URL.

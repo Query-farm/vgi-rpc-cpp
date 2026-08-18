@@ -12,21 +12,21 @@
 #include <utility>
 
 #ifdef VGI_RPC_WITH_S3
-  #include <aws/core/Aws.h>
-  #include <aws/core/auth/AWSCredentialsProviderChain.h>
-  #include <aws/core/client/ClientConfiguration.h>
-  #include <aws/core/utils/memory/stl/AWSString.h>
-  #include <aws/core/utils/stream/PreallocatedStreamBuf.h>
-  #include <aws/s3/S3Client.h>
-  #include <aws/s3/model/GetObjectRequest.h>
-  #include <aws/s3/model/PutObjectRequest.h>
-  #include <sstream>
+#include <aws/core/Aws.h>
+#include <aws/core/auth/AWSCredentialsProviderChain.h>
+#include <aws/core/client/ClientConfiguration.h>
+#include <aws/core/utils/memory/stl/AWSString.h>
+#include <aws/core/utils/stream/PreallocatedStreamBuf.h>
+#include <aws/s3/S3Client.h>
+#include <aws/s3/model/GetObjectRequest.h>
+#include <aws/s3/model/PutObjectRequest.h>
+#include <sstream>
 #endif
 
 #ifdef VGI_RPC_WITH_GCS
-  #include <google/cloud/storage/client.h>
-  #include <google/cloud/storage/signed_url_options.h>
-  #include <chrono>
+#include <google/cloud/storage/client.h>
+#include <google/cloud/storage/signed_url_options.h>
+#include <chrono>
 #endif
 
 namespace vgi_rpc {
@@ -172,14 +172,16 @@ struct AwsRuntime {
     Aws::SDKOptions options;
 };
 
-void ensure_aws_initialized() { static AwsRuntime runtime; }
+void ensure_aws_initialized() {
+    static AwsRuntime runtime;
+}
 
 class S3ExternalStorage final : public ExternalStorage {
 public:
     S3ExternalStorage(std::string bucket, std::string prefix, const ExternalStorageConfig& config)
-        : bucket_(std::move(bucket))
-        , prefix_(std::move(prefix))
-        , ttl_(config.signed_url_ttl_seconds) {
+        : bucket_(std::move(bucket)),
+          prefix_(std::move(prefix)),
+          ttl_(config.signed_url_ttl_seconds) {
         ensure_aws_initialized();
         Aws::Client::ClientConfiguration client_config;
         if (!config.region.empty()) client_config.region = config.region;
@@ -237,11 +239,11 @@ public:
 
 private:
     std::string presign(const char* method, const std::string& key) {
-        auto url = client_->GeneratePresignedUrl(
-            bucket_, key,
-            std::string(method) == "PUT" ? Aws::Http::HttpMethod::HTTP_PUT
-                                         : Aws::Http::HttpMethod::HTTP_GET,
-            static_cast<uint64_t>(ttl_));
+        auto url = client_->GeneratePresignedUrl(bucket_, key,
+                                                 std::string(method) == "PUT"
+                                                     ? Aws::Http::HttpMethod::HTTP_PUT
+                                                     : Aws::Http::HttpMethod::HTTP_GET,
+                                                 static_cast<uint64_t>(ttl_));
         if (url.empty()) throw std::runtime_error("S3 pre-signing produced no URL");
         return std::string(url.c_str());
     }
@@ -263,11 +265,11 @@ private:
 class GcsExternalStorage final : public ExternalStorage {
 public:
     GcsExternalStorage(std::string bucket, std::string prefix, const ExternalStorageConfig& config)
-        : bucket_(std::move(bucket))
-        , prefix_(std::move(prefix))
-        , ttl_(config.signed_url_ttl_seconds)
-        , signing_account_(config.signing_account)
-        , client_(google::cloud::storage::Client()) {}
+        : bucket_(std::move(bucket)),
+          prefix_(std::move(prefix)),
+          ttl_(config.signed_url_ttl_seconds),
+          signing_account_(config.signing_account),
+          client_(google::cloud::storage::Client()) {}
 
     std::string upload(const std::string& data, const std::string& content_encoding) override {
         namespace gcs = google::cloud::storage;
@@ -276,10 +278,10 @@ public:
         auto metadata =
             content_encoding.empty()
                 ? client_.InsertObject(bucket_, key, data)
-                : client_.InsertObject(bucket_, key, data,
-                                       gcs::WithObjectMetadata(
-                                           gcs::ObjectMetadata().set_content_encoding(
-                                               content_encoding)));
+                : client_.InsertObject(
+                      bucket_, key, data,
+                      gcs::WithObjectMetadata(
+                          gcs::ObjectMetadata().set_content_encoding(content_encoding)));
         if (!metadata) {
             throw std::runtime_error("GCS upload failed: " + metadata.status().message());
         }

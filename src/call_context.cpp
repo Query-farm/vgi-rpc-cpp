@@ -5,12 +5,11 @@
 
 namespace vgi_rpc {
 
-CallContext::CallContext(std::shared_ptr<LogSink> sink,
-                         std::string server_id,
+CallContext::CallContext(std::shared_ptr<LogSink> sink, std::string server_id,
                          std::string request_id)
-    : sink_(std::move(sink))
-    , server_id_(std::move(server_id))
-    , request_id_(std::move(request_id)) {}
+    : sink_(std::move(sink)),
+      server_id_(std::move(server_id)),
+      request_id_(std::move(request_id)) {}
 
 void CallContext::client_log(LogLevel level, std::string_view message,
                              const nlohmann::json& extra) {

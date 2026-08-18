@@ -30,8 +30,7 @@ Result Result::from_annotated_batch(AnnotatedBatch ab) {
 Result Result::value(std::shared_ptr<arrow::Schema> schema,
                      std::vector<std::shared_ptr<arrow::Array>> arrays) {
     int64_t num_rows = arrays.empty() ? 0 : arrays[0]->length();
-    auto batch = arrow::RecordBatch::Make(std::move(schema), num_rows,
-                                          std::move(arrays));
+    auto batch = arrow::RecordBatch::Make(std::move(schema), num_rows, std::move(arrays));
     return Result::value(std::move(batch));
 }
 
@@ -42,12 +41,11 @@ Result Result::void_result() {
     return Result(std::move(ab));
 }
 
-std::shared_ptr<arrow::KeyValueMetadata> make_error_metadata(
-    const std::string& exception_type,
-    const std::string& message,
-    const std::string& server_id,
-    const std::string& request_id,
-    const std::string& error_kind) {
+std::shared_ptr<arrow::KeyValueMetadata> make_error_metadata(const std::string& exception_type,
+                                                             const std::string& message,
+                                                             const std::string& server_id,
+                                                             const std::string& request_id,
+                                                             const std::string& error_kind) {
     auto md = std::make_shared<arrow::KeyValueMetadata>();
     md->Append(keys::LOG_LEVEL, log_level_to_string(LogLevel::EXCEPTION));
     md->Append(keys::LOG_MESSAGE, message);
@@ -69,12 +67,9 @@ std::shared_ptr<arrow::KeyValueMetadata> make_error_metadata(
     return md;
 }
 
-Result Result::error(std::shared_ptr<arrow::Schema> schema,
-                     const std::string& exception_type,
-                     const std::string& message,
-                     const std::string& server_id,
-                     const std::string& request_id,
-                     const std::string& error_kind) {
+Result Result::error(std::shared_ptr<arrow::Schema> schema, const std::string& exception_type,
+                     const std::string& message, const std::string& server_id,
+                     const std::string& request_id, const std::string& error_kind) {
     AnnotatedBatch ab;
     ab.batch = make_empty_batch(schema);
     ab.custom_metadata =

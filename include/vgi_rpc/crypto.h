@@ -55,8 +55,7 @@ VGI_RPC_EXPORT std::array<uint8_t, 32> sha256(const uint8_t* data, size_t len);
 // HMAC-SHA256 (RFC 2104).
 VGI_RPC_EXPORT std::array<uint8_t, 32> hmac_sha256(const uint8_t* key, size_t key_len,
                                                    const uint8_t* msg, size_t msg_len);
-VGI_RPC_EXPORT std::array<uint8_t, 32> hmac_sha256(const std::string& key,
-                                                   const std::string& msg);
+VGI_RPC_EXPORT std::array<uint8_t, 32> hmac_sha256(const std::string& key, const std::string& msg);
 
 // --- AEAD ------------------------------------------------------------------
 
@@ -71,16 +70,14 @@ inline constexpr size_t kAeadTagBytes = 16;
 // Returns nonce || ciphertext || tag.  The nonce is generated internally from
 // the system CSPRNG; a caller cannot supply one and so cannot repeat one.
 VGI_RPC_EXPORT std::string aead_seal(const std::array<uint8_t, kAeadKeyBytes>& key,
-                                     const std::string& plaintext,
-                                     const std::string& aad);
+                                     const std::string& plaintext, const std::string& aad);
 
 // Inverse of aead_seal.  Returns nullopt on any failure — a wrong key, a
 // wrong AAD, a truncated envelope, or a tampered byte — with no distinction
 // between them, deliberately.
-VGI_RPC_EXPORT std::optional<std::string> aead_open(
-    const std::array<uint8_t, kAeadKeyBytes>& key,
-    const std::string& sealed,
-    const std::string& aad);
+VGI_RPC_EXPORT std::optional<std::string> aead_open(const std::array<uint8_t, kAeadKeyBytes>& key,
+                                                    const std::string& sealed,
+                                                    const std::string& aad);
 
 // --- Encodings and comparison ---------------------------------------------
 

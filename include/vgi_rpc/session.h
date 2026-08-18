@@ -36,24 +36,22 @@ public:
 // into an oracle for whose sessions exist.
 enum class SessionLookup {
     OK,
-    NOT_PRESENTED,   // no VGI-Session header
-    UNSEALABLE,      // wrong key, wrong principal (AAD), or tampered bytes
-    WRONG_WORKER,    // sealed by a peer sharing our key, but not by us
-    MISSING,         // never existed, or already evicted
-    EXPIRED,         // past its TTL
+    NOT_PRESENTED,  // no VGI-Session header
+    UNSEALABLE,     // wrong key, wrong principal (AAD), or tampered bytes
+    WRONG_WORKER,   // sealed by a peer sharing our key, but not by us
+    MISSING,        // never existed, or already evicted
+    EXPIRED,        // past its TTL
 };
 
 // The AAD tail that binds a token to the identity that opened it.  Only the
 // stable identity feeds it — never claims, which churn as a credential
 // refreshes and would evict live sessions for no reason.
-VGI_RPC_EXPORT std::string session_aad(const std::string& domain,
-                                       const std::string& principal,
+VGI_RPC_EXPORT std::string session_aad(const std::string& domain, const std::string& principal,
                                        bool authenticated);
 
 class VGI_RPC_EXPORT SessionRegistry {
 public:
-    SessionRegistry(std::array<uint8_t, crypto::kAeadKeyBytes> key,
-                    std::string server_id,
+    SessionRegistry(std::array<uint8_t, crypto::kAeadKeyBytes> key, std::string server_id,
                     int default_ttl_seconds);
 
     // Register `state` and return the token the response should carry.
@@ -63,8 +61,7 @@ public:
     // Resolve a token presented under `aad`.  On OK, `out_state` and
     // `out_session_id` are populated.
     SessionLookup resolve(const std::string& token, const std::string& aad,
-                          std::shared_ptr<SessionState>* out_state,
-                          std::string* out_session_id);
+                          std::shared_ptr<SessionState>* out_state, std::string* out_session_id);
 
     // Drop a session and run its close hook.  Idempotent.
     bool close(const std::string& token, const std::string& aad);

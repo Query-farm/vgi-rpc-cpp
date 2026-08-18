@@ -7,24 +7,28 @@
 #include <stdexcept>
 
 #ifdef _WIN32
-  // windows.h defines min/max as macros and ERROR as a constant, all of
-  // which collide with ordinary C++ spellings; these three keep it to itself.
-  #define WIN32_LEAN_AND_MEAN
-  #define NOMINMAX
-  #define NOGDI
-  #include <windows.h>
-  #include <bcrypt.h>
+// windows.h defines min/max as macros and ERROR as a constant, all of
+// which collide with ordinary C++ spellings; these three keep it to itself.
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#define NOGDI
+#include <windows.h>
+#include <bcrypt.h>
 #else
-  #include <fcntl.h>
-  #include <unistd.h>
+#include <fcntl.h>
+#include <unistd.h>
 #endif
 
 namespace vgi_rpc::crypto {
 
 namespace {
 
-inline uint32_t rotl32(uint32_t x, int n) { return (x << n) | (x >> (32 - n)); }
-inline uint32_t rotr32(uint32_t x, uint32_t n) { return (x >> n) | (x << (32 - n)); }
+inline uint32_t rotl32(uint32_t x, int n) {
+    return (x << n) | (x >> (32 - n));
+}
+inline uint32_t rotr32(uint32_t x, uint32_t n) {
+    return (x >> n) | (x << (32 - n));
+}
 
 inline uint32_t load32_le(const uint8_t* p) {
     return static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) |
@@ -45,10 +49,14 @@ inline void store32_le(uint8_t* p, uint32_t v) {
 // ---------------------------------------------------------------------------
 
 void Sha256::reset() {
-    state_[0] = 0x6a09e667; state_[1] = 0xbb67ae85;
-    state_[2] = 0x3c6ef372; state_[3] = 0xa54ff53a;
-    state_[4] = 0x510e527f; state_[5] = 0x9b05688c;
-    state_[6] = 0x1f83d9ab; state_[7] = 0x5be0cd19;
+    state_[0] = 0x6a09e667;
+    state_[1] = 0xbb67ae85;
+    state_[2] = 0x3c6ef372;
+    state_[3] = 0xa54ff53a;
+    state_[4] = 0x510e527f;
+    state_[5] = 0x9b05688c;
+    state_[6] = 0x1f83d9ab;
+    state_[7] = 0x5be0cd19;
     bitlen_ = 0;
     buflen_ = 0;
 }
@@ -66,17 +74,16 @@ void Sha256::update(const uint8_t* data, size_t len) {
 
 void Sha256::transform(const uint8_t* chunk) {
     static constexpr uint32_t k[64] = {
-        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1,
-        0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
-        0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786,
-        0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
-        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147,
-        0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
-        0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
-        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
-        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a,
-        0x5b9cca4f, 0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
-        0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2};
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+        0xc67178f2};
 
     uint32_t w[64];
     for (int i = 0; i < 16; ++i) {
@@ -100,11 +107,23 @@ void Sha256::transform(const uint8_t* chunk) {
         uint32_t S0 = rotr32(a, 2) ^ rotr32(a, 13) ^ rotr32(a, 22);
         uint32_t maj = (a & b) ^ (a & c) ^ (b & c);
         uint32_t t2 = S0 + maj;
-        h = g; g = f; f = e; e = d + t1;
-        d = c; c = b; b = a; a = t1 + t2;
+        h = g;
+        g = f;
+        f = e;
+        e = d + t1;
+        d = c;
+        c = b;
+        b = a;
+        a = t1 + t2;
     }
-    state_[0] += a; state_[1] += b; state_[2] += c; state_[3] += d;
-    state_[4] += e; state_[5] += f; state_[6] += g; state_[7] += h;
+    state_[0] += a;
+    state_[1] += b;
+    state_[2] += c;
+    state_[3] += d;
+    state_[4] += e;
+    state_[5] += f;
+    state_[6] += g;
+    state_[7] += h;
 }
 
 std::array<uint8_t, 32> Sha256::digest() {
@@ -141,8 +160,8 @@ std::array<uint8_t, 32> sha256(const uint8_t* data, size_t len) {
     return h.digest();
 }
 
-std::array<uint8_t, 32> hmac_sha256(const uint8_t* key, size_t key_len,
-                                    const uint8_t* msg, size_t msg_len) {
+std::array<uint8_t, 32> hmac_sha256(const uint8_t* key, size_t key_len, const uint8_t* msg,
+                                    size_t msg_len) {
     // RFC 2104: keys longer than the block size are hashed first, shorter ones
     // zero-padded to it.
     uint8_t k0[64] = {};
@@ -185,31 +204,42 @@ void chacha20_block(const uint32_t in[16], uint8_t out[64]) {
     uint32_t x[16];
     std::memcpy(x, in, sizeof(x));
     auto quarter = [&](int a, int b, int c, int d) {
-        x[a] += x[b]; x[d] = rotl32(x[d] ^ x[a], 16);
-        x[c] += x[d]; x[b] = rotl32(x[b] ^ x[c], 12);
-        x[a] += x[b]; x[d] = rotl32(x[d] ^ x[a], 8);
-        x[c] += x[d]; x[b] = rotl32(x[b] ^ x[c], 7);
+        x[a] += x[b];
+        x[d] = rotl32(x[d] ^ x[a], 16);
+        x[c] += x[d];
+        x[b] = rotl32(x[b] ^ x[c], 12);
+        x[a] += x[b];
+        x[d] = rotl32(x[d] ^ x[a], 8);
+        x[c] += x[d];
+        x[b] = rotl32(x[b] ^ x[c], 7);
     };
     for (int i = 0; i < 10; ++i) {
-        quarter(0, 4, 8, 12);  quarter(1, 5, 9, 13);
-        quarter(2, 6, 10, 14); quarter(3, 7, 11, 15);
-        quarter(0, 5, 10, 15); quarter(1, 6, 11, 12);
-        quarter(2, 7, 8, 13);  quarter(3, 4, 9, 14);
+        quarter(0, 4, 8, 12);
+        quarter(1, 5, 9, 13);
+        quarter(2, 6, 10, 14);
+        quarter(3, 7, 11, 15);
+        quarter(0, 5, 10, 15);
+        quarter(1, 6, 11, 12);
+        quarter(2, 7, 8, 13);
+        quarter(3, 4, 9, 14);
     }
     for (int i = 0; i < 16; ++i) store32_le(out + i * 4, x[i] + in[i]);
 }
 
 void chacha20_init(uint32_t st[16], const uint8_t key[32], const uint8_t nonce[12],
                    uint32_t counter) {
-    st[0] = 0x61707865; st[1] = 0x3320646e; st[2] = 0x79622d32; st[3] = 0x6b206574;
+    st[0] = 0x61707865;
+    st[1] = 0x3320646e;
+    st[2] = 0x79622d32;
+    st[3] = 0x6b206574;
     for (int i = 0; i < 8; ++i) st[4 + i] = load32_le(key + i * 4);
     st[12] = counter;
     for (int i = 0; i < 3; ++i) st[13 + i] = load32_le(nonce + i * 4);
 }
 
 // XOR `len` bytes of ChaCha20 keystream (starting at `counter`) into `data`.
-void chacha20_xor(const uint8_t key[32], const uint8_t nonce[12], uint32_t counter,
-                  uint8_t* data, size_t len) {
+void chacha20_xor(const uint8_t key[32], const uint8_t nonce[12], uint32_t counter, uint8_t* data,
+                  size_t len) {
     uint32_t st[16];
     chacha20_init(st, key, nonce, counter);
     uint8_t block[64];
@@ -227,21 +257,32 @@ void chacha20_xor(const uint8_t key[32], const uint8_t nonce[12], uint32_t count
 // the output is the first and last four words of the *unfed-forward* state.
 void hchacha20(const uint8_t key[32], const uint8_t nonce16[16], uint8_t out[32]) {
     uint32_t x[16];
-    x[0] = 0x61707865; x[1] = 0x3320646e; x[2] = 0x79622d32; x[3] = 0x6b206574;
+    x[0] = 0x61707865;
+    x[1] = 0x3320646e;
+    x[2] = 0x79622d32;
+    x[3] = 0x6b206574;
     for (int i = 0; i < 8; ++i) x[4 + i] = load32_le(key + i * 4);
     for (int i = 0; i < 4; ++i) x[12 + i] = load32_le(nonce16 + i * 4);
 
     auto quarter = [&](int a, int b, int c, int d) {
-        x[a] += x[b]; x[d] = rotl32(x[d] ^ x[a], 16);
-        x[c] += x[d]; x[b] = rotl32(x[b] ^ x[c], 12);
-        x[a] += x[b]; x[d] = rotl32(x[d] ^ x[a], 8);
-        x[c] += x[d]; x[b] = rotl32(x[b] ^ x[c], 7);
+        x[a] += x[b];
+        x[d] = rotl32(x[d] ^ x[a], 16);
+        x[c] += x[d];
+        x[b] = rotl32(x[b] ^ x[c], 12);
+        x[a] += x[b];
+        x[d] = rotl32(x[d] ^ x[a], 8);
+        x[c] += x[d];
+        x[b] = rotl32(x[b] ^ x[c], 7);
     };
     for (int i = 0; i < 10; ++i) {
-        quarter(0, 4, 8, 12);  quarter(1, 5, 9, 13);
-        quarter(2, 6, 10, 14); quarter(3, 7, 11, 15);
-        quarter(0, 5, 10, 15); quarter(1, 6, 11, 12);
-        quarter(2, 7, 8, 13);  quarter(3, 4, 9, 14);
+        quarter(0, 4, 8, 12);
+        quarter(1, 5, 9, 13);
+        quarter(2, 6, 10, 14);
+        quarter(3, 7, 11, 15);
+        quarter(0, 5, 10, 15);
+        quarter(1, 6, 11, 12);
+        quarter(2, 7, 8, 13);
+        quarter(3, 4, 9, 14);
     }
     for (int i = 0; i < 4; ++i) store32_le(out + i * 4, x[i]);
     for (int i = 0; i < 4; ++i) store32_le(out + 16 + i * 4, x[12 + i]);
@@ -350,10 +391,18 @@ private:
     void carry() {
         uint32_t c = h_[1] >> 26;
         h_[1] &= 0x3ffffff;
-        h_[2] += c; c = h_[2] >> 26; h_[2] &= 0x3ffffff;
-        h_[3] += c; c = h_[3] >> 26; h_[3] &= 0x3ffffff;
-        h_[4] += c; c = h_[4] >> 26; h_[4] &= 0x3ffffff;
-        h_[0] += c * 5; c = h_[0] >> 26; h_[0] &= 0x3ffffff;
+        h_[2] += c;
+        c = h_[2] >> 26;
+        h_[2] &= 0x3ffffff;
+        h_[3] += c;
+        c = h_[3] >> 26;
+        h_[3] &= 0x3ffffff;
+        h_[4] += c;
+        c = h_[4] >> 26;
+        h_[4] &= 0x3ffffff;
+        h_[0] += c * 5;
+        c = h_[0] >> 26;
+        h_[0] &= 0x3ffffff;
         h_[1] += c;
     }
 
@@ -365,8 +414,8 @@ private:
 };
 
 // The RFC 8439 MAC input: aad ‖ pad16 ‖ ciphertext ‖ pad16 ‖ len(aad) ‖ len(ct).
-void poly1305_aead_tag(const uint8_t poly_key[32], const std::string& aad,
-                       const uint8_t* ct, size_t ct_len, uint8_t tag[16]) {
+void poly1305_aead_tag(const uint8_t poly_key[32], const std::string& aad, const uint8_t* ct,
+                       size_t ct_len, uint8_t tag[16]) {
     static const uint8_t zeros[16] = {};
     Poly1305 poly(poly_key);
     poly.update(reinterpret_cast<const uint8_t*>(aad.data()), aad.size());
@@ -384,8 +433,8 @@ void poly1305_aead_tag(const uint8_t poly_key[32], const std::string& aad,
 
 // Split a 24-byte XChaCha nonce into the derived subkey and the 12-byte
 // ChaCha20 nonce (four zero bytes followed by the trailing eight).
-void xchacha_derive(const uint8_t key[32], const uint8_t nonce24[24],
-                    uint8_t subkey[32], uint8_t nonce12[12]) {
+void xchacha_derive(const uint8_t key[32], const uint8_t nonce24[24], uint8_t subkey[32],
+                    uint8_t nonce12[12]) {
     hchacha20(key, nonce24, subkey);
     std::memset(nonce12, 0, 4);
     std::memcpy(nonce12 + 4, nonce24 + 16, 8);
@@ -393,8 +442,8 @@ void xchacha_derive(const uint8_t key[32], const uint8_t nonce24[24],
 
 }  // namespace
 
-std::string aead_seal(const std::array<uint8_t, kAeadKeyBytes>& key,
-                      const std::string& plaintext, const std::string& aad) {
+std::string aead_seal(const std::array<uint8_t, kAeadKeyBytes>& key, const std::string& plaintext,
+                      const std::string& aad) {
     auto nonce = random_bytes(kAeadNonceBytes);
 
     uint8_t subkey[32], nonce12[12];
@@ -410,8 +459,7 @@ std::string aead_seal(const std::array<uint8_t, kAeadKeyBytes>& key,
     }
 
     uint8_t tag[kAeadTagBytes];
-    poly1305_aead_tag(poly_key, aad, reinterpret_cast<const uint8_t*>(ct.data()), ct.size(),
-                      tag);
+    poly1305_aead_tag(poly_key, aad, reinterpret_cast<const uint8_t*>(ct.data()), ct.size(), tag);
 
     std::string out;
     out.reserve(kAeadNonceBytes + ct.size() + kAeadTagBytes);
@@ -488,8 +536,8 @@ std::string base64url_encode(const uint8_t* data, size_t len) {
         out.push_back(kB64Url[(n >> 18) & 0x3F]);
         out.push_back(kB64Url[(n >> 12) & 0x3F]);
     } else if (i + 2 == len) {
-        const uint32_t n = (static_cast<uint32_t>(data[i]) << 16) |
-                           (static_cast<uint32_t>(data[i + 1]) << 8);
+        const uint32_t n =
+            (static_cast<uint32_t>(data[i]) << 16) | (static_cast<uint32_t>(data[i + 1]) << 8);
         out.push_back(kB64Url[(n >> 18) & 0x3F]);
         out.push_back(kB64Url[(n >> 12) & 0x3F]);
         out.push_back(kB64Url[(n >> 6) & 0x3F]);

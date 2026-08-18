@@ -30,7 +30,7 @@ namespace vgi_rpc {
 struct StickySlot {
     std::shared_ptr<SessionState> resolved;  // session this request arrived on
     std::string session_id;
-    bool client_accepts = false;             // VGI-Session-Accept: true
+    bool client_accepts = false;  // VGI-Session-Accept: true
     bool draining = false;
 
     // Registers a state object and returns the token to mint on the response.
@@ -44,12 +44,9 @@ struct StickySlot {
 
 class VGI_RPC_EXPORT CallContext {
 public:
-    CallContext(std::shared_ptr<LogSink> sink,
-                std::string server_id,
-                std::string request_id);
+    CallContext(std::shared_ptr<LogSink> sink, std::string server_id, std::string request_id);
 
-    void client_log(LogLevel level, std::string_view message,
-                    const nlohmann::json& extra = {});
+    void client_log(LogLevel level, std::string_view message, const nlohmann::json& extra = {});
     void client_log(const Message& msg);
 
     const std::string& server_id() const noexcept { return server_id_; }

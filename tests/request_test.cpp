@@ -18,8 +18,7 @@ namespace {
 
 // Helper to create a single-row Request with one typed column
 template <typename BuilderT, typename ValueT>
-Request make_request(const std::string& col_name,
-                     const std::shared_ptr<arrow::DataType>& type,
+Request make_request(const std::string& col_name, const std::shared_ptr<arrow::DataType>& type,
                      const ValueT& value) {
     BuilderT builder;
     REQUIRE(builder.Append(value).ok());

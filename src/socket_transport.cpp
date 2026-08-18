@@ -19,13 +19,13 @@
 #include <string>
 
 #ifndef _WIN32
-  #include <arpa/inet.h>
-  #include <netinet/in.h>
-  #include <netinet/tcp.h>
-  #include <sys/socket.h>
-  #include <sys/stat.h>
-  #include <sys/un.h>
-  #include <unistd.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/un.h>
+#include <unistd.h>
 #endif
 
 namespace vgi_rpc {
@@ -116,8 +116,7 @@ void Server::serve_unix(const std::string& path) {
 
     int listen_fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
     if (listen_fd < 0) {
-        throw std::runtime_error(std::string("cannot create unix socket: ") +
-                                 std::strerror(errno));
+        throw std::runtime_error(std::string("cannot create unix socket: ") + std::strerror(errno));
     }
 
     sockaddr_un addr{};
@@ -147,8 +146,7 @@ void Server::serve_unix(const std::string& path) {
 void Server::serve_tcp(const std::string& host, int port) {
     int listen_fd = ::socket(AF_INET, SOCK_STREAM, 0);
     if (listen_fd < 0) {
-        throw std::runtime_error(std::string("cannot create tcp socket: ") +
-                                 std::strerror(errno));
+        throw std::runtime_error(std::string("cannot create tcp socket: ") + std::strerror(errno));
     }
     int one = 1;
     ::setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
@@ -164,8 +162,8 @@ void Server::serve_tcp(const std::string& host, int port) {
 
     if (::bind(listen_fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
         ::close(listen_fd);
-        throw std::runtime_error("cannot bind " + bind_host + ":" + std::to_string(port) +
-                                 ": " + std::strerror(errno));
+        throw std::runtime_error("cannot bind " + bind_host + ":" + std::to_string(port) + ": " +
+                                 std::strerror(errno));
     }
     if (::listen(listen_fd, 16) < 0) {
         ::close(listen_fd);

@@ -42,8 +42,8 @@ VGI_RPC_EXPORT const char* proof_reason_name(ProofReason reason);
 
 struct ProofResult {
     ProofReason reason = ProofReason::NO_PROOF;
-    std::string proxy_label;   // set only when verified
-    std::string claimed_kid;   // informational; attacker-controlled until verified
+    std::string proxy_label;  // set only when verified
+    std::string claimed_kid;  // informational; attacker-controlled until verified
     bool verified() const noexcept { return reason == ProofReason::OK; }
 };
 
@@ -53,9 +53,8 @@ public:
     // a malformed secret or a missing origin id in allow/require mode: a lax
     // parse turns a typo into a 100% rejection outage with no diagnostic, so
     // this fails closed at startup rather than degrading.
-    ProofVerifier(ProofMode mode, std::string origin_id,
-                  const std::string& secrets_spec, int skew_seconds,
-                  bool replay_cache, size_t replay_capacity = 100000);
+    ProofVerifier(ProofMode mode, std::string origin_id, const std::string& secrets_spec,
+                  int skew_seconds, bool replay_cache, size_t replay_capacity = 100000);
 
     ProofMode mode() const noexcept { return mode_; }
 

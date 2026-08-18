@@ -14,11 +14,9 @@
 namespace vgi_rpc {
 
 LogSink::LogSink(std::string server_id, std::string request_id)
-    : server_id_(std::move(server_id))
-    , request_id_(std::move(request_id)) {}
+    : server_id_(std::move(server_id)), request_id_(std::move(request_id)) {}
 
-void LogSink::emit(LogLevel level, std::string_view message,
-                   const nlohmann::json& extra) {
+void LogSink::emit(LogLevel level, std::string_view message, const nlohmann::json& extra) {
     auto md = std::make_shared<arrow::KeyValueMetadata>();
     md->Append(keys::LOG_LEVEL, log_level_to_string(level));
     md->Append(keys::LOG_MESSAGE, std::string(message));
@@ -41,8 +39,7 @@ void LogSink::emit(const Message& msg) {
     emit(msg.level, msg.message, msg.extra);
 }
 
-std::vector<AnnotatedBatch> LogSink::flush(
-    const std::shared_ptr<arrow::Schema>& schema) {
+std::vector<AnnotatedBatch> LogSink::flush(const std::shared_ptr<arrow::Schema>& schema) {
     std::vector<AnnotatedBatch> result;
     result.reserve(buffered_.size());
 

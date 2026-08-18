@@ -71,10 +71,9 @@ class ScaleState : public ExchangeState {
 public:
     ScaleState(double factor) : factor_(factor) {}
 
-    void exchange(const AnnotatedBatch& input,
-                  OutputCollector& out, CallContext& /*ctx*/) override {
-        auto col = std::static_pointer_cast<arrow::DoubleArray>(
-            input.batch->column(0));
+    void exchange(const AnnotatedBatch& input, OutputCollector& out,
+                  CallContext& /*ctx*/) override {
+        auto col = std::static_pointer_cast<arrow::DoubleArray>(input.batch->column(0));
 
         arrow::DoubleBuilder builder;
         for (int64_t i = 0; i < col->length(); ++i) {
@@ -99,22 +98,17 @@ static Stream make_scale(const Request& req, CallContext& /*ctx*/) {
 }
 
 int main() {
-    auto server = ServerBuilder()
-        .add_producer(
-            "produce_n",
-            arrow::schema({arrow::field("count", arrow::int64())}),
-            counter_schema(),
-            make_counter,
-            "Produce N batches with index and value=index*10")
-        .add_exchange(
-            "exchange_scale",
-            arrow::schema({arrow::field("factor", arrow::float64())}),
-            scale_input_schema(),
-            scale_output_schema(),
-            make_scale,
-            "Scale input values by a factor")
-        .enable_describe("StreamingExample")
-        .build();
+    auto server =
+        ServerBuilder()
+            .add_producer("produce_n", arrow::schema({arrow::field("count", arrow::int64())}),
+                          counter_schema(), make_counter,
+                          "Produce N batches with index and value=index*10")
+            .add_exchange("exchange_scale",
+                          arrow::schema({arrow::field("factor", arrow::float64())}),
+                          scale_input_schema(), scale_output_schema(), make_scale,
+                          "Scale input values by a factor")
+            .enable_describe("StreamingExample")
+            .build();
 
     server->run();
     return 0;

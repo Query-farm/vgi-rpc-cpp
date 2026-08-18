@@ -54,31 +54,55 @@ private:
 };
 
 // Template specializations for get<T>() — defined in request.cpp
-template <> double Request::get<double>(std::string_view name) const;
-template <> float Request::get<float>(std::string_view name) const;
-template <> int64_t Request::get<int64_t>(std::string_view name) const;
-template <> int32_t Request::get<int32_t>(std::string_view name) const;
-template <> bool Request::get<bool>(std::string_view name) const;
-template <> std::string Request::get<std::string>(std::string_view name) const;
-template <> std::vector<uint8_t> Request::get<std::vector<uint8_t>>(std::string_view name) const;
+template <>
+double Request::get<double>(std::string_view name) const;
+template <>
+float Request::get<float>(std::string_view name) const;
+template <>
+int64_t Request::get<int64_t>(std::string_view name) const;
+template <>
+int32_t Request::get<int32_t>(std::string_view name) const;
+template <>
+bool Request::get<bool>(std::string_view name) const;
+template <>
+std::string Request::get<std::string>(std::string_view name) const;
+template <>
+std::vector<uint8_t> Request::get<std::vector<uint8_t>>(std::string_view name) const;
 
 // Complex type get<T>() specializations — list types
-template <> std::vector<std::string> Request::get<std::vector<std::string>>(std::string_view name) const;
-template <> std::vector<int64_t> Request::get<std::vector<int64_t>>(std::string_view name) const;
-template <> std::vector<double> Request::get<std::vector<double>>(std::string_view name) const;
+template <>
+std::vector<std::string> Request::get<std::vector<std::string>>(std::string_view name) const;
+template <>
+std::vector<int64_t> Request::get<std::vector<int64_t>>(std::string_view name) const;
+template <>
+std::vector<double> Request::get<std::vector<double>>(std::string_view name) const;
 
 // Template specializations for get_optional<T>()
-template <> std::optional<double> Request::get_optional<double>(std::string_view name) const;
-template <> std::optional<float> Request::get_optional<float>(std::string_view name) const;
-template <> std::optional<int64_t> Request::get_optional<int64_t>(std::string_view name) const;
-template <> std::optional<int32_t> Request::get_optional<int32_t>(std::string_view name) const;
-template <> std::optional<bool> Request::get_optional<bool>(std::string_view name) const;
-template <> std::optional<std::string> Request::get_optional<std::string>(std::string_view name) const;
-template <> std::optional<std::vector<uint8_t>> Request::get_optional<std::vector<uint8_t>>(std::string_view name) const;
+template <>
+std::optional<double> Request::get_optional<double>(std::string_view name) const;
+template <>
+std::optional<float> Request::get_optional<float>(std::string_view name) const;
+template <>
+std::optional<int64_t> Request::get_optional<int64_t>(std::string_view name) const;
+template <>
+std::optional<int32_t> Request::get_optional<int32_t>(std::string_view name) const;
+template <>
+std::optional<bool> Request::get_optional<bool>(std::string_view name) const;
+template <>
+std::optional<std::string> Request::get_optional<std::string>(std::string_view name) const;
+template <>
+std::optional<std::vector<uint8_t>> Request::get_optional<std::vector<uint8_t>>(
+    std::string_view name) const;
 
 // Optional list type specializations
-template <> std::optional<std::vector<std::string>> Request::get_optional<std::vector<std::string>>(std::string_view name) const;
-template <> std::optional<std::vector<int64_t>> Request::get_optional<std::vector<int64_t>>(std::string_view name) const;
-template <> std::optional<std::vector<double>> Request::get_optional<std::vector<double>>(std::string_view name) const;
+template <>
+std::optional<std::vector<std::string>> Request::get_optional<std::vector<std::string>>(
+    std::string_view name) const;
+template <>
+std::optional<std::vector<int64_t>> Request::get_optional<std::vector<int64_t>>(
+    std::string_view name) const;
+template <>
+std::optional<std::vector<double>> Request::get_optional<std::vector<double>>(
+    std::string_view name) const;
 
 }  // namespace vgi_rpc

@@ -25,8 +25,7 @@ namespace {
 
 // Write a request IPC stream into a buffer.
 std::shared_ptr<arrow::Buffer> make_request_buffer(
-    const std::shared_ptr<arrow::Schema>& schema,
-    const std::shared_ptr<arrow::RecordBatch>& batch,
+    const std::shared_ptr<arrow::Schema>& schema, const std::shared_ptr<arrow::RecordBatch>& batch,
     const std::shared_ptr<arrow::KeyValueMetadata>& md) {
     auto sink = arrow::io::BufferOutputStream::Create().ValueUnsafe();
     AnnotatedBatch ab;
@@ -38,8 +37,7 @@ std::shared_ptr<arrow::Buffer> make_request_buffer(
 
 // Build a valid request buffer with method + version metadata.
 std::shared_ptr<arrow::Buffer> make_valid_request(
-    const std::string& method,
-    const std::shared_ptr<arrow::Schema>& schema,
+    const std::string& method, const std::shared_ptr<arrow::Schema>& schema,
     const std::shared_ptr<arrow::RecordBatch>& batch) {
     auto md = std::make_shared<arrow::KeyValueMetadata>();
     md->Append(keys::METHOD, method);
@@ -74,23 +72,20 @@ std::unique_ptr<Server> make_echo_server() {
     auto schema = arrow::schema({arrow::field("value", arrow::utf8())});
 
     ServerBuilder builder;
-    builder.add_unary("echo", schema, schema,
-        [](const Request& req, CallContext&) -> Result {
-            auto val = req.get<std::string>("value");
-            arrow::StringBuilder sb;
-            REQUIRE(sb.Append(val).ok());
-            auto arr = *sb.Finish();
-            return Result::value(req.schema(), {arr});
-        });
-    builder.add_void("noop", empty_schema(),
-        [](const Request&, CallContext&) {});
+    builder.add_unary("echo", schema, schema, [](const Request& req, CallContext&) -> Result {
+        auto val = req.get<std::string>("value");
+        arrow::StringBuilder sb;
+        REQUIRE(sb.Append(val).ok());
+        auto arr = *sb.Finish();
+        return Result::value(req.schema(), {arr});
+    });
+    builder.add_void("noop", empty_schema(), [](const Request&, CallContext&) {});
     return builder.build();
 }
 
 // Run a single request through a server and return the response buffer.
-std::shared_ptr<arrow::Buffer> run_request(
-    Server& server,
-    const std::shared_ptr<arrow::Buffer>& request_buf) {
+std::shared_ptr<arrow::Buffer> run_request(Server& server,
+                                           const std::shared_ptr<arrow::Buffer>& request_buf) {
     auto input = std::make_shared<arrow::io::BufferReader>(request_buf);
     auto output = arrow::io::BufferOutputStream::Create().ValueUnsafe();
     server.serve_one(input, output);
@@ -159,10 +154,9 @@ TEST_CASE("serve_one: unknown method -> AttributeError", "[server]") {
 TEST_CASE("serve_one: handler throws invalid_argument -> ValueError", "[server]") {
     auto schema = empty_schema();
     ServerBuilder builder;
-    builder.add_unary("throw_ia", schema, schema,
-        [](const Request&, CallContext&) -> Result {
-            throw std::invalid_argument("bad arg");
-        });
+    builder.add_unary("throw_ia", schema, schema, [](const Request&, CallContext&) -> Result {
+        throw std::invalid_argument("bad arg");
+    });
     auto server = builder.build();
     auto request_buf = make_valid_request("throw_ia", schema, make_empty_batch(schema));
 
@@ -174,10 +168,9 @@ TEST_CASE("serve_one: handler throws invalid_argument -> ValueError", "[server]"
 TEST_CASE("serve_one: handler throws out_of_range -> IndexError", "[server]") {
     auto schema = empty_schema();
     ServerBuilder builder;
-    builder.add_unary("throw_oor", schema, schema,
-        [](const Request&, CallContext&) -> Result {
-            throw std::out_of_range("index out");
-        });
+    builder.add_unary("throw_oor", schema, schema, [](const Request&, CallContext&) -> Result {
+        throw std::out_of_range("index out");
+    });
     auto server = builder.build();
     auto request_buf = make_valid_request("throw_oor", schema, make_empty_batch(schema));
 
@@ -189,10 +182,9 @@ TEST_CASE("serve_one: handler throws out_of_range -> IndexError", "[server]") {
 TEST_CASE("serve_one: handler throws logic_error -> TypeError", "[server]") {
     auto schema = empty_schema();
     ServerBuilder builder;
-    builder.add_unary("throw_le", schema, schema,
-        [](const Request&, CallContext&) -> Result {
-            throw std::logic_error("type problem");
-        });
+    builder.add_unary("throw_le", schema, schema, [](const Request&, CallContext&) -> Result {
+        throw std::logic_error("type problem");
+    });
     auto server = builder.build();
     auto request_buf = make_valid_request("throw_le", schema, make_empty_batch(schema));
 
@@ -204,10 +196,9 @@ TEST_CASE("serve_one: handler throws logic_error -> TypeError", "[server]") {
 TEST_CASE("serve_one: handler throws exception -> RuntimeError", "[server]") {
     auto schema = empty_schema();
     ServerBuilder builder;
-    builder.add_unary("throw_re", schema, schema,
-        [](const Request&, CallContext&) -> Result {
-            throw std::runtime_error("runtime issue");
-        });
+    builder.add_unary("throw_re", schema, schema, [](const Request&, CallContext&) -> Result {
+        throw std::runtime_error("runtime issue");
+    });
     auto server = builder.build();
     auto request_buf = make_valid_request("throw_re", schema, make_empty_batch(schema));
 
@@ -234,8 +225,8 @@ TEST_CASE("serve_one: successful unary echo round-trip", "[server]") {
     bool found_data = false;
     for (const auto& ab : contents.batches) {
         if (classify_batch(ab) == BatchType::DATA && ab.batch->num_rows() > 0) {
-            auto col = std::dynamic_pointer_cast<arrow::StringArray>(
-                ab.batch->GetColumnByName("value"));
+            auto col =
+                std::dynamic_pointer_cast<arrow::StringArray>(ab.batch->GetColumnByName("value"));
             REQUIRE(col);
             REQUIRE(col->GetString(0) == "hello");
             found_data = true;
@@ -276,8 +267,7 @@ TEST_CASE("serve_one: EOF (empty input) returns false", "[server]") {
 
 TEST_CASE("ServerBuilder: double build() throws", "[server]") {
     ServerBuilder builder;
-    builder.add_void("test", empty_schema(),
-        [](const Request&, CallContext&) {});
+    builder.add_void("test", empty_schema(), [](const Request&, CallContext&) {});
     auto server = builder.build();
     REQUIRE(server != nullptr);
     REQUIRE_THROWS_AS(builder.build(), std::logic_error);
@@ -285,12 +275,9 @@ TEST_CASE("ServerBuilder: double build() throws", "[server]") {
 
 TEST_CASE("ServerBuilder: duplicate method name throws", "[server]") {
     ServerBuilder builder;
-    builder.add_void("dup", empty_schema(),
-        [](const Request&, CallContext&) {});
-    REQUIRE_THROWS_AS(
-        builder.add_void("dup", empty_schema(),
-            [](const Request&, CallContext&) {}),
-        std::logic_error);
+    builder.add_void("dup", empty_schema(), [](const Request&, CallContext&) {});
+    REQUIRE_THROWS_AS(builder.add_void("dup", empty_schema(), [](const Request&, CallContext&) {}),
+                      std::logic_error);
 }
 
 // ── ServerBuilder::server_id() Test ──────────────────────────────────
@@ -298,16 +285,14 @@ TEST_CASE("ServerBuilder: duplicate method name throws", "[server]") {
 TEST_CASE("ServerBuilder: custom server_id is used", "[server]") {
     ServerBuilder builder;
     builder.server_id("my-test-id");
-    builder.add_void("test", empty_schema(),
-        [](const Request&, CallContext&) {});
+    builder.add_void("test", empty_schema(), [](const Request&, CallContext&) {});
     auto server = builder.build();
     REQUIRE(server->server_id() == "my-test-id");
 }
 
 TEST_CASE("ServerBuilder: default server_id is random", "[server]") {
     ServerBuilder builder;
-    builder.add_void("test", empty_schema(),
-        [](const Request&, CallContext&) {});
+    builder.add_void("test", empty_schema(), [](const Request&, CallContext&) {});
     auto server = builder.build();
     REQUIRE_FALSE(server->server_id().empty());
 }
@@ -316,30 +301,26 @@ TEST_CASE("ServerBuilder: default server_id is random", "[server]") {
 
 TEST_CASE("ServerBuilder: null params_schema in add_unary throws", "[server]") {
     ServerBuilder builder;
-    REQUIRE_THROWS_AS(
-        builder.add_unary("bad", nullptr, empty_schema(),
-            [](const Request&, CallContext&) -> Result {
-                return Result::void_result();
-            }),
-        std::invalid_argument);
+    REQUIRE_THROWS_AS(builder.add_unary("bad", nullptr, empty_schema(),
+                                        [](const Request&, CallContext&) -> Result {
+                                            return Result::void_result();
+                                        }),
+                      std::invalid_argument);
 }
 
 TEST_CASE("ServerBuilder: null result_schema in add_unary throws", "[server]") {
     ServerBuilder builder;
-    REQUIRE_THROWS_AS(
-        builder.add_unary("bad", empty_schema(), nullptr,
-            [](const Request&, CallContext&) -> Result {
-                return Result::void_result();
-            }),
-        std::invalid_argument);
+    REQUIRE_THROWS_AS(builder.add_unary("bad", empty_schema(), nullptr,
+                                        [](const Request&, CallContext&) -> Result {
+                                            return Result::void_result();
+                                        }),
+                      std::invalid_argument);
 }
 
 TEST_CASE("ServerBuilder: null params_schema in add_void throws", "[server]") {
     ServerBuilder builder;
-    REQUIRE_THROWS_AS(
-        builder.add_void("bad", nullptr,
-            [](const Request&, CallContext&) {}),
-        std::invalid_argument);
+    REQUIRE_THROWS_AS(builder.add_void("bad", nullptr, [](const Request&, CallContext&) {}),
+                      std::invalid_argument);
 }
 
 TEST_CASE("ServerBuilder: null params_schema in add_producer throws", "[server]") {
@@ -347,7 +328,7 @@ TEST_CASE("ServerBuilder: null params_schema in add_producer throws", "[server]"
     ServerBuilder builder;
     REQUIRE_THROWS_AS(
         builder.add_producer("bad", nullptr, schema,
-            [](const Request&, CallContext&) -> Stream { return {}; }),
+                             [](const Request&, CallContext&) -> Stream { return {}; }),
         std::invalid_argument);
 }
 
@@ -355,7 +336,7 @@ TEST_CASE("ServerBuilder: null output_schema in add_producer throws", "[server]"
     ServerBuilder builder;
     REQUIRE_THROWS_AS(
         builder.add_producer("bad", empty_schema(), nullptr,
-            [](const Request&, CallContext&) -> Stream { return {}; }),
+                             [](const Request&, CallContext&) -> Stream { return {}; }),
         std::invalid_argument);
 }
 
@@ -364,15 +345,15 @@ TEST_CASE("ServerBuilder: null schemas in add_exchange throw", "[server]") {
     ServerBuilder builder;
     REQUIRE_THROWS_AS(
         builder.add_exchange("bad", nullptr, schema, schema,
-            [](const Request&, CallContext&) -> Stream { return {}; }),
+                             [](const Request&, CallContext&) -> Stream { return {}; }),
         std::invalid_argument);
     REQUIRE_THROWS_AS(
         builder.add_exchange("bad", schema, nullptr, schema,
-            [](const Request&, CallContext&) -> Stream { return {}; }),
+                             [](const Request&, CallContext&) -> Stream { return {}; }),
         std::invalid_argument);
     REQUIRE_THROWS_AS(
         builder.add_exchange("bad", schema, schema, nullptr,
-            [](const Request&, CallContext&) -> Stream { return {}; }),
+                             [](const Request&, CallContext&) -> Stream { return {}; }),
         std::invalid_argument);
 }
 
@@ -382,22 +363,18 @@ TEST_CASE("describe: lists registered methods", "[server][describe]") {
     auto schema = arrow::schema({arrow::field("value", arrow::utf8())});
 
     ServerBuilder builder;
-    builder.add_unary("echo", schema, schema,
-        [](const Request& req, CallContext&) -> Result {
-            return Result::void_result();
-        });
-    builder.add_void("noop", empty_schema(),
-        [](const Request&, CallContext&) {});
+    builder.add_unary("echo", schema, schema, [](const Request& req, CallContext&) -> Result {
+        return Result::void_result();
+    });
+    builder.add_void("noop", empty_schema(), [](const Request&, CallContext&) {});
     builder.add_producer("produce", empty_schema(), schema,
-        [](const Request&, CallContext&) -> Stream {
-            return {};
-        });
+                         [](const Request&, CallContext&) -> Stream { return {}; });
     builder.enable_describe("test_protocol");
     auto server = builder.build();
 
     // Call __describe__
-    auto request_buf = make_valid_request(DESCRIBE_METHOD_NAME,
-        empty_schema(), make_empty_batch(empty_schema()));
+    auto request_buf =
+        make_valid_request(DESCRIBE_METHOD_NAME, empty_schema(), make_empty_batch(empty_schema()));
     auto response_buf = run_request(*server, request_buf);
     auto contents = read_response(response_buf);
 
@@ -423,7 +400,8 @@ TEST_CASE("describe: lists registered methods", "[server][describe]") {
             REQUIRE(std::find(methods.begin(), methods.end(), "produce") != methods.end());
 
             // __describe__ itself should NOT be listed
-            REQUIRE(std::find(methods.begin(), methods.end(), DESCRIBE_METHOD_NAME) == methods.end());
+            REQUIRE(std::find(methods.begin(), methods.end(), DESCRIBE_METHOD_NAME) ==
+                    methods.end());
 
             // Check protocol_name in custom_metadata
             if (ab.custom_metadata) {
@@ -442,25 +420,21 @@ TEST_CASE("describe: method types are correct", "[server][describe]") {
 
     ServerBuilder builder;
     builder.add_unary("my_unary", schema, schema,
-        [](const Request&, CallContext&) -> Result {
-            return Result::void_result();
-        });
+                      [](const Request&, CallContext&) -> Result { return Result::void_result(); });
     builder.add_producer("my_stream", empty_schema(), schema,
-        [](const Request&, CallContext&) -> Stream {
-            return {};
-        });
+                         [](const Request&, CallContext&) -> Stream { return {}; });
     builder.enable_describe();
     auto server = builder.build();
 
-    auto request_buf = make_valid_request(DESCRIBE_METHOD_NAME,
-        empty_schema(), make_empty_batch(empty_schema()));
+    auto request_buf =
+        make_valid_request(DESCRIBE_METHOD_NAME, empty_schema(), make_empty_batch(empty_schema()));
     auto response_buf = run_request(*server, request_buf);
     auto contents = read_response(response_buf);
 
     for (const auto& ab : contents.batches) {
         if (classify_batch(ab) == BatchType::DATA && ab.batch->num_rows() > 0) {
-            auto name_col = std::dynamic_pointer_cast<arrow::StringArray>(
-                ab.batch->GetColumnByName("name"));
+            auto name_col =
+                std::dynamic_pointer_cast<arrow::StringArray>(ab.batch->GetColumnByName("name"));
             auto type_col = std::dynamic_pointer_cast<arrow::StringArray>(
                 ab.batch->GetColumnByName("method_type"));
             REQUIRE(name_col != nullptr);

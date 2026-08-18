@@ -44,10 +44,9 @@ VGI_RPC_EXPORT std::optional<IpcStreamContents> read_ipc_stream(
     const std::shared_ptr<arrow::io::InputStream>& input);
 
 // Write a complete IPC stream (schema + batches + EOS) to an output stream.
-VGI_RPC_EXPORT void write_ipc_stream(
-    const std::shared_ptr<arrow::io::OutputStream>& output,
-    const std::shared_ptr<arrow::Schema>& schema,
-    const std::vector<AnnotatedBatch>& batches);
+VGI_RPC_EXPORT void write_ipc_stream(const std::shared_ptr<arrow::io::OutputStream>& output,
+                                     const std::shared_ptr<arrow::Schema>& schema,
+                                     const std::vector<AnnotatedBatch>& batches);
 
 // Byte length of the self-contained IPC stream `write_ipc_stream` would emit
 // for `batch`, computed without materializing it.  Lets a caller decide
@@ -55,7 +54,8 @@ VGI_RPC_EXPORT void write_ipc_stream(
 VGI_RPC_EXPORT int64_t ipc_stream_byte_size(const std::shared_ptr<arrow::RecordBatch>& batch);
 
 // Drain remaining batches from an IPC reader (consume through EOS).
-VGI_RPC_EXPORT void drain_reader(const std::shared_ptr<arrow::ipc::RecordBatchStreamReader>& reader);
+VGI_RPC_EXPORT void drain_reader(
+    const std::shared_ptr<arrow::ipc::RecordBatchStreamReader>& reader);
 
 // Largest count handed to a single read(2)/write(2)/recv(2)/send(2).
 //

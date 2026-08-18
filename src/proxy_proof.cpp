@@ -21,13 +21,13 @@ constexpr const char kProofLabel[] = "vgi.proxy.proof.v1";
 constexpr size_t kMaxHeaderBytes = 512;
 
 bool is_kid_char(char c) {
-    return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
-           c == '_' || c == '-';
+    return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' ||
+           c == '-';
 }
 
 bool is_b64url_char(char c) {
-    return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
-           c == '-' || c == '_';
+    return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' ||
+           c == '_';
 }
 
 bool valid_kid(const std::string& s) {
@@ -58,8 +58,8 @@ bool valid_origin_id(const std::string& s) {
     if (s.empty() || s.size() > 255) return false;
     for (char c : s) {
         const bool ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
-                        (c >= '0' && c <= '9') || c == '.' || c == '_' || c == ':' ||
-                        c == '/' || c == '-';
+                        (c >= '0' && c <= '9') || c == '.' || c == '_' || c == ':' || c == '/' ||
+                        c == '-';
         if (!ok) return false;
     }
     return true;
@@ -80,10 +80,9 @@ bool split_exact(const std::string& s, char sep, size_t n, std::vector<std::stri
 }
 
 int64_t unix_now() {
-    return static_cast<int64_t>(
-        std::chrono::duration_cast<std::chrono::seconds>(
-            std::chrono::system_clock::now().time_since_epoch())
-            .count());
+    return static_cast<int64_t>(std::chrono::duration_cast<std::chrono::seconds>(
+                                    std::chrono::system_clock::now().time_since_epoch())
+                                    .count());
 }
 
 }  // namespace
@@ -122,9 +121,9 @@ std::map<std::string, std::string> ProofVerifier::parse_secrets(const std::strin
             throw std::invalid_argument("proxy-proof kid is not [A-Za-z0-9_-]{1,64}: " + kid);
         }
         if (hex.size() != 64) {
-            throw std::invalid_argument(
-                "proxy-proof secret for '" + kid + "' must be 64 hex characters, got " +
-                std::to_string(hex.size()));
+            throw std::invalid_argument("proxy-proof secret for '" + kid +
+                                        "' must be 64 hex characters, got " +
+                                        std::to_string(hex.size()));
         }
         auto raw = crypto::hex_decode(hex);
         if (!raw) {
@@ -135,14 +134,13 @@ std::map<std::string, std::string> ProofVerifier::parse_secrets(const std::strin
     return out;
 }
 
-ProofVerifier::ProofVerifier(ProofMode mode, std::string origin_id,
-                             const std::string& secrets_spec, int skew_seconds,
-                             bool replay_cache, size_t replay_capacity)
-    : mode_(mode)
-    , origin_id_(std::move(origin_id))
-    , skew_seconds_(skew_seconds > 0 ? skew_seconds : 30)
-    , replay_cache_(replay_cache)
-    , replay_capacity_(replay_capacity) {
+ProofVerifier::ProofVerifier(ProofMode mode, std::string origin_id, const std::string& secrets_spec,
+                             int skew_seconds, bool replay_cache, size_t replay_capacity)
+    : mode_(mode),
+      origin_id_(std::move(origin_id)),
+      skew_seconds_(skew_seconds > 0 ? skew_seconds : 30),
+      replay_cache_(replay_cache),
+      replay_capacity_(replay_capacity) {
     if (mode_ == ProofMode::OFF) return;
 
     if (!valid_origin_id(origin_id_)) {

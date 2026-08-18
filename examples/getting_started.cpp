@@ -18,23 +18,24 @@ int main() {
         arrow::field("result", arrow::float64()),
     });
 
-    auto server = vgi_rpc::ServerBuilder()
-        .add_unary("add", params, result,
-            [](const vgi_rpc::Request& req, vgi_rpc::CallContext& /*ctx*/) {
-                double a = req.get<double>("a");
-                double b = req.get<double>("b");
+    auto server =
+        vgi_rpc::ServerBuilder()
+            .add_unary(
+                "add", params, result,
+                [](const vgi_rpc::Request& req, vgi_rpc::CallContext& /*ctx*/) {
+                    double a = req.get<double>("a");
+                    double b = req.get<double>("b");
 
-                arrow::DoubleBuilder builder;
-                VGI_RPC_THROW_NOT_OK(builder.Append(a + b));
-                auto array = vgi_rpc::unwrap(builder.Finish());
+                    arrow::DoubleBuilder builder;
+                    VGI_RPC_THROW_NOT_OK(builder.Append(a + b));
+                    auto array = vgi_rpc::unwrap(builder.Finish());
 
-                return vgi_rpc::Result::value(
-                    arrow::schema({arrow::field("result", arrow::float64())}),
-                    {array});
-            },
-            "Add two numbers.")
-        .enable_describe("MyServer")
-        .build();
+                    return vgi_rpc::Result::value(
+                        arrow::schema({arrow::field("result", arrow::float64())}), {array});
+                },
+                "Add two numbers.")
+            .enable_describe("MyServer")
+            .build();
 
     server->run();
     return 0;

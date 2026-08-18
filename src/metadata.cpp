@@ -19,8 +19,7 @@ const std::shared_ptr<arrow::Schema>& empty_schema() {
     return schema;
 }
 
-std::shared_ptr<arrow::RecordBatch> make_empty_batch(
-    const std::shared_ptr<arrow::Schema>& schema) {
+std::shared_ptr<arrow::RecordBatch> make_empty_batch(const std::shared_ptr<arrow::Schema>& schema) {
     std::vector<std::shared_ptr<arrow::Array>> arrays;
     arrays.reserve(schema->num_fields());
     for (int i = 0; i < schema->num_fields(); ++i) {
@@ -45,10 +44,8 @@ std::string random_hex(size_t length) {
     return result;
 }
 
-std::string get_metadata_value(
-    const std::shared_ptr<arrow::KeyValueMetadata>& metadata,
-    const std::string& key,
-    const std::string& default_value) {
+std::string get_metadata_value(const std::shared_ptr<arrow::KeyValueMetadata>& metadata,
+                               const std::string& key, const std::string& default_value) {
     if (!metadata) return default_value;
     auto idx = metadata->FindKey(key);
     if (idx < 0) return default_value;

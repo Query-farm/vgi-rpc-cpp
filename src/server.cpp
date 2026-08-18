@@ -23,12 +23,11 @@ void ServerBuilder::check_duplicate(const std::string& name) const {
     }
 }
 
-ServerBuilder& ServerBuilder::add_unary(
-    const std::string& name,
-    std::shared_ptr<arrow::Schema> params_schema,
-    std::shared_ptr<arrow::Schema> result_schema,
-    std::function<Result(const Request&, CallContext&)> handler,
-    const std::string& doc) {
+ServerBuilder& ServerBuilder::add_unary(const std::string& name,
+                                        std::shared_ptr<arrow::Schema> params_schema,
+                                        std::shared_ptr<arrow::Schema> result_schema,
+                                        std::function<Result(const Request&, CallContext&)> handler,
+                                        const std::string& doc) {
     if (!params_schema) throw std::invalid_argument("params_schema must not be null");
     if (!result_schema) throw std::invalid_argument("result_schema must not be null");
     check_duplicate(name);
@@ -45,11 +44,10 @@ ServerBuilder& ServerBuilder::add_unary(
     return *this;
 }
 
-ServerBuilder& ServerBuilder::add_void(
-    const std::string& name,
-    std::shared_ptr<arrow::Schema> params_schema,
-    std::function<void(const Request&, CallContext&)> handler,
-    const std::string& doc) {
+ServerBuilder& ServerBuilder::add_void(const std::string& name,
+                                       std::shared_ptr<arrow::Schema> params_schema,
+                                       std::function<void(const Request&, CallContext&)> handler,
+                                       const std::string& doc) {
     if (!params_schema) throw std::invalid_argument("params_schema must not be null");
     check_duplicate(name);
 
@@ -69,11 +67,9 @@ ServerBuilder& ServerBuilder::add_void(
 }
 
 ServerBuilder& ServerBuilder::add_producer(
-    const std::string& name,
-    std::shared_ptr<arrow::Schema> params_schema,
+    const std::string& name, std::shared_ptr<arrow::Schema> params_schema,
     std::shared_ptr<arrow::Schema> output_schema,
-    std::function<Stream(const Request&, CallContext&)> factory,
-    const std::string& doc,
+    std::function<Stream(const Request&, CallContext&)> factory, const std::string& doc,
     std::shared_ptr<arrow::Schema> header_schema) {
     if (!params_schema) throw std::invalid_argument("params_schema must not be null");
     if (!output_schema) throw std::invalid_argument("output_schema must not be null");
@@ -97,12 +93,9 @@ ServerBuilder& ServerBuilder::add_producer(
 }
 
 ServerBuilder& ServerBuilder::add_exchange(
-    const std::string& name,
-    std::shared_ptr<arrow::Schema> params_schema,
-    std::shared_ptr<arrow::Schema> input_schema,
-    std::shared_ptr<arrow::Schema> output_schema,
-    std::function<Stream(const Request&, CallContext&)> factory,
-    const std::string& doc,
+    const std::string& name, std::shared_ptr<arrow::Schema> params_schema,
+    std::shared_ptr<arrow::Schema> input_schema, std::shared_ptr<arrow::Schema> output_schema,
+    std::function<Stream(const Request&, CallContext&)> factory, const std::string& doc,
     std::shared_ptr<arrow::Schema> header_schema) {
     if (!params_schema) throw std::invalid_argument("params_schema must not be null");
     if (!input_schema) throw std::invalid_argument("input_schema must not be null");
@@ -182,9 +175,8 @@ std::unique_ptr<Server> ServerBuilder::build() {
     }
 
     return std::unique_ptr<Server>(new Server(
-        std::move(method_map), std::move(server_id),
-        protocol_name_, std::move(protocol_hash), protocol_version_,
-        access_log_path_, access_log_max_record_bytes_));
+        std::move(method_map), std::move(server_id), protocol_name_, std::move(protocol_hash),
+        protocol_version_, access_log_path_, access_log_max_record_bytes_));
 }
 
 // Server
@@ -254,23 +246,21 @@ std::string Server::protocol_version_error(
     return header + declared + trailer +
            (actual_surface < expected_surface
                 ? "client is too old; upgrade the VGI extension/client to a version supporting "
-                  "protocol_version " + protocol_version_ + "."
+                  "protocol_version " +
+                      protocol_version_ + "."
                 : "server is too old; upgrade the VGI worker to a version supporting "
-                  "protocol_version " + declared + ".");
+                  "protocol_version " +
+                      declared + ".");
 }
 
-Server::Server(std::unordered_map<std::string, MethodInfo> methods,
-               std::string server_id,
-               std::string protocol_name,
-               std::string protocol_hash,
-               std::string protocol_version,
-               const std::string& access_log_path,
-               int64_t access_log_max_record_bytes)
-    : methods_(std::move(methods))
-    , server_id_(std::move(server_id))
-    , protocol_name_(std::move(protocol_name))
-    , protocol_hash_(std::move(protocol_hash))
-    , protocol_version_(std::move(protocol_version)) {
+Server::Server(std::unordered_map<std::string, MethodInfo> methods, std::string server_id,
+               std::string protocol_name, std::string protocol_hash, std::string protocol_version,
+               const std::string& access_log_path, int64_t access_log_max_record_bytes)
+    : methods_(std::move(methods)),
+      server_id_(std::move(server_id)),
+      protocol_name_(std::move(protocol_name)),
+      protocol_hash_(std::move(protocol_hash)),
+      protocol_version_(std::move(protocol_version)) {
     // A worker that declares a version it cannot parse would silently enforce
     // nothing, which is worse than not declaring one: the operator believes
     // there is a gate. Refuse to build such a server at all.
@@ -281,9 +271,9 @@ Server::Server(std::unordered_map<std::string, MethodInfo> methods,
             "and no leading zeros (no prereleases or build metadata).");
     }
     if (!access_log_path.empty()) {
-        access_log_ = std::make_unique<AccessLogWriter>(
-            access_log_path, server_id_, protocol_name_, protocol_hash_,
-            access_log_max_record_bytes);
+        access_log_ =
+            std::make_unique<AccessLogWriter>(access_log_path, server_id_, protocol_name_,
+                                              protocol_hash_, access_log_max_record_bytes);
     }
 }
 

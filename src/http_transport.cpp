@@ -101,20 +101,19 @@ std::string error_body(const std::shared_ptr<arrow::Schema>& schema,
                        const std::string& server_id, const std::string& request_id,
                        const std::string& error_kind = "") {
     return build_body([&](const std::shared_ptr<arrow::io::OutputStream>& out) {
-        auto err = Result::error(schema, exception_type, message, server_id, request_id,
-                                 error_kind);
+        auto err =
+            Result::error(schema, exception_type, message, server_id, request_id, error_kind);
         write_ipc_stream(out, schema, {err.annotated_batch()});
     });
 }
 
 // Same name-set-strict / order+cast-tolerant coercion the pipe transport uses.
-std::shared_ptr<arrow::RecordBatch> coerce_input(
-    const std::shared_ptr<arrow::RecordBatch>& batch,
-    const std::shared_ptr<arrow::Schema>& target) {
+std::shared_ptr<arrow::RecordBatch> coerce_input(const std::shared_ptr<arrow::RecordBatch>& batch,
+                                                 const std::shared_ptr<arrow::Schema>& target) {
     if (batch->schema()->Equals(*target)) return batch;
     auto mismatch = [&]() {
-        return std::logic_error("Input schema mismatch: expected " + target->ToString() +
-                                ", got " + batch->schema()->ToString());
+        return std::logic_error("Input schema mismatch: expected " + target->ToString() + ", got " +
+                                batch->schema()->ToString());
     };
     std::set<std::string> bn, tn;
     for (const auto& f : batch->schema()->fields()) bn.insert(f->name());
@@ -167,8 +166,7 @@ bool run_producer_turns(const std::shared_ptr<arrow::ipc::RecordBatchWriter>& wr
                         const std::shared_ptr<StreamState>& state,
                         const std::shared_ptr<arrow::Schema>& schema, CallContext& ctx,
                         const std::string& server_id, const std::string& request_id,
-                        int64_t max_bytes, bool* errored,
-                        const CycleExternalizer& externalize) {
+                        int64_t max_bytes, bool* errored, const CycleExternalizer& externalize) {
     while (true) {
         OutputCollector oc(schema, /*producer=*/true, server_id, request_id);
         try {
@@ -185,8 +183,7 @@ bool run_producer_turns(const std::shared_ptr<arrow::ipc::RecordBatchWriter>& wr
         std::shared_ptr<arrow::KeyValueMetadata> pointer;
         if (externalize) pointer = externalize(oc.batches(), schema);
         if (pointer) {
-            VGI_RPC_THROW_NOT_OK(
-                writer->WriteRecordBatch(*make_empty_batch(schema), pointer));
+            VGI_RPC_THROW_NOT_OK(writer->WriteRecordBatch(*make_empty_batch(schema), pointer));
         } else {
             for (const auto& ab : oc.batches()) {
                 VGI_RPC_THROW_NOT_OK(ab.custom_metadata
@@ -232,7 +229,7 @@ bool accepts(const std::vector<std::string>& list, const std::string& codec) {
 
 // Which codec to answer with, and on which header to stamp it.
 struct CodecChoice {
-    std::string codec;        // empty = send identity
+    std::string codec;  // empty = send identity
     bool standard_header = true;
 };
 
@@ -264,7 +261,6 @@ CodecChoice choose_codec(const httplib::Request& req, bool compression_enabled) 
 }
 
 // --- Worker threads -------------------------------------------------------
-
 
 // --- CORS -----------------------------------------------------------------
 
@@ -322,11 +318,11 @@ std::optional<AuthReason> auth_reason_from_name(const std::string& name) {
 class HttpServer {
 public:
     HttpServer(Server& rpc, const HttpConfig& cfg)
-        : rpc_(rpc)
-        , cfg_(cfg)
-        , sessions_(cfg.token_key, rpc.server_id(), cfg.sticky_default_ttl)
-        , proof_(cfg.proof_mode, cfg.proof_origin_id, cfg.proof_secrets,
-                 cfg.proof_skew_seconds, cfg.proof_replay_cache) {
+        : rpc_(rpc),
+          cfg_(cfg),
+          sessions_(cfg.token_key, rpc.server_id(), cfg.sticky_default_ttl),
+          proof_(cfg.proof_mode, cfg.proof_origin_id, cfg.proof_secrets, cfg.proof_skew_seconds,
+                 cfg.proof_replay_cache) {
         if (!cfg.external_storage_url.empty()) {
             // Throws for a scheme this build cannot serve, so an operator who
             // configured a bucket learns at startup rather than on the first
@@ -386,12 +382,11 @@ private:
     // Externalize one stream output cycle, returning the pointer metadata that
     // replaces it, or nullptr to leave it inline.
     std::shared_ptr<arrow::KeyValueMetadata> externalize_cycle(
-        const std::vector<AnnotatedBatch>& batches,
-        const std::shared_ptr<arrow::Schema>& schema, int64_t* externalized_bytes) const;
+        const std::vector<AnnotatedBatch>& batches, const std::shared_ptr<arrow::Schema>& schema,
+        int64_t* externalized_bytes) const;
 
     // Replace a request pointer batch with the batch it points at.
-    std::optional<IpcStreamContents> resolve_request_pointer(
-        const AnnotatedBatch& first) const;
+    std::optional<IpcStreamContents> resolve_request_pointer(const AnnotatedBatch& first) const;
 
     Server& rpc_;
     HttpConfig cfg_;
@@ -466,16 +461,15 @@ void HttpServer::stamp_cors(const httplib::Request& req, httplib::Response& res)
     const std::string origin = req.get_header_value("Origin");
     if (cfg_.cors_origin != "*" && !origin.empty() && origin != cfg_.cors_origin) return;
 
-    res.set_header("Access-Control-Allow-Origin",
-                   cfg_.cors_origin == "*" ? "*" : cfg_.cors_origin);
+    res.set_header("Access-Control-Allow-Origin", cfg_.cors_origin == "*" ? "*" : cfg_.cors_origin);
     res.set_header("Vary", "Origin");
     res.set_header("Access-Control-Allow-Methods", "GET, HEAD, POST, DELETE, OPTIONS");
     // Echo what the browser asked for when it asked, so a header this server
     // has not heard of still reaches a method that has.
     const std::string requested = req.get_header_value("Access-Control-Request-Headers");
-    res.set_header("Access-Control-Allow-Headers",
-                   requested.empty() ? kAllowedRequestHeaders
-                                     : requested + ", " + kAllowedRequestHeaders);
+    res.set_header("Access-Control-Allow-Headers", requested.empty()
+                                                       ? kAllowedRequestHeaders
+                                                       : requested + ", " + kAllowedRequestHeaders);
     // Derived from the capability headers already stamped on this response
     // rather than restated: whatever this server advertises, a browser can
     // read.  A hand-maintained list is a list that drifts, and the failure is
@@ -510,8 +504,7 @@ void HttpServer::set_arrow_content(const httplib::Request& req, httplib::Respons
     if (choice.codec == "zstd" && !body.empty()) {
         const size_t bound = ZSTD_compressBound(body.size());
         std::string compressed(bound, '\0');
-        const size_t written =
-            ZSTD_compress(compressed.data(), bound, body.data(), body.size(), 3);
+        const size_t written = ZSTD_compress(compressed.data(), bound, body.data(), body.size(), 3);
         if (!ZSTD_isError(written)) {
             compressed.resize(written);
             body.swap(compressed);
@@ -577,10 +570,9 @@ std::shared_ptr<arrow::KeyValueMetadata> HttpServer::externalize_cycle(
     int64_t* externalized_bytes) const {
     if (!storage_ || cfg_.externalize_threshold < 0 || batches.empty()) return nullptr;
 
-    const std::string cycle =
-        build_body([&](const std::shared_ptr<arrow::io::OutputStream>& out) {
-            write_ipc_stream(out, schema, batches);
-        });
+    const std::string cycle = build_body([&](const std::shared_ptr<arrow::io::OutputStream>& out) {
+        write_ipc_stream(out, schema, batches);
+    });
     if (static_cast<int64_t>(cycle.size()) < cfg_.externalize_threshold) return nullptr;
 
     auto digest = crypto::sha256(reinterpret_cast<const uint8_t*>(cycle.data()), cycle.size());
@@ -967,8 +959,7 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res)
             arrow::StringBuilder up, down;
             arrow::TimestampBuilder exp(arrow::timestamp(arrow::TimeUnit::MICRO, "UTC"),
                                         arrow::default_memory_pool());
-            const int64_t expires_us =
-                (static_cast<int64_t>(std::time(nullptr)) + 3600) * 1000000;
+            const int64_t expires_us = (static_cast<int64_t>(std::time(nullptr)) + 3600) * 1000000;
             for (const auto& pair : pairs) {
                 VGI_RPC_THROW_NOT_OK(up.Append(pair.upload_url));
                 VGI_RPC_THROW_NOT_OK(down.Append(pair.download_url));
@@ -1003,8 +994,7 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res)
     StickySlot sticky;
     std::string resumed_token;
     if (cfg_.sticky) {
-        sticky.client_accepts =
-            req.get_header_value(SESSION_ACCEPT_HEADER) == "true";
+        sticky.client_accepts = req.get_header_value(SESSION_ACCEPT_HEADER) == "true";
         sticky.draining = sessions_.draining();
         sticky.open = [&](std::shared_ptr<SessionState> state, std::optional<int> ttl) {
             return sessions_.open(std::move(state), aad, ttl);
@@ -1020,9 +1010,10 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res)
                 // Every cause reports identically — see SessionLookup.
                 res.status = 200;
                 res.set_header(RPC_ERROR_HEADER, "true");
-                set_arrow_content(req, res, error_body(method_info.result_schema, "SessionLostError",
-                                           "session lost", rpc_.server_id(), request_id,
-                                           ERROR_KIND_SESSION_LOST));
+                set_arrow_content(
+                    req, res,
+                    error_body(method_info.result_schema, "SessionLostError", "session lost",
+                               rpc_.server_id(), request_id, ERROR_KIND_SESSION_LOST));
                 return;
             }
             sticky.resolved = std::move(state);
@@ -1093,10 +1084,11 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res)
             static_cast<int64_t>(body.size()) > cfg_.max_response_bytes) {
             res.status = 200;
             res.set_header(RPC_ERROR_HEADER, "true");
-            set_arrow_content(req, res, error_body(method_info.result_schema, "RpcError",
-                           "HTTP body exceeds max_response_bytes (" +
-                               std::to_string(body.size()) + " > " +
-                               std::to_string(cfg_.max_response_bytes) + ") for method '" +
+            set_arrow_content(
+                req, res,
+                error_body(method_info.result_schema, "RpcError",
+                           "HTTP body exceeds max_response_bytes (" + std::to_string(body.size()) +
+                               " > " + std::to_string(cfg_.max_response_bytes) + ") for method '" +
                                method_name + "'",
                            rpc_.server_id(), request_id));
             return;
@@ -1119,8 +1111,9 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res)
             res.status = 200;
             res.set_header(RPC_ERROR_HEADER, "true");
             apply_sticky();
-            set_arrow_content(req, res, error_body(empty_schema(), exception_type_of(e), e.what(),
-                                       rpc_.server_id(), request_id, error_kind_of(e)));
+            set_arrow_content(req, res,
+                              error_body(empty_schema(), exception_type_of(e), e.what(),
+                                         rpc_.server_id(), request_id, error_kind_of(e)));
             return;
         }
 
@@ -1131,8 +1124,7 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res)
         const std::string call_token = crypto::base64url_encode(
             // NUL-separated, built explicitly: `name + "\x00" + cursor` would
             // append an empty C string and silently drop the separator.
-            crypto::aead_seal(cfg_.token_key,
-                              method_name + std::string(1, '\0') + cursor, aad));
+            crypto::aead_seal(cfg_.token_key, method_name + std::string(1, '\0') + cursor, aad));
         auto output_schema = stream.output_schema;
         auto input_schema = stream.input_schema;
         const bool is_exchange = method_info.is_exchange;
@@ -1157,8 +1149,8 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res)
                 ob.push_back(AnnotatedBatch::with_metadata(make_empty_batch(output_schema),
                                                            init_metadata(cursor, call_token)));
                 write_ipc_stream(out, output_schema, ob);
-                streams_[cursor] = {stream.state, output_schema, input_schema, true,
-                                    method_name, aad};
+                streams_[cursor] = {stream.state, output_schema, input_schema,
+                                    true,         method_name,   aad};
             } else {
                 auto writer = unwrap(arrow::ipc::MakeStreamWriter(out, output_schema));
                 if (!stream.header) {
@@ -1169,15 +1161,14 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res)
                                 : writer->WriteRecordBatch(*lb.batch));
                     }
                 }
-                const bool finished =
-                    run_producer_turns(writer, out, stream.state, output_schema, ctx,
-                                       rpc_.server_id(), request_id, cfg_.max_response_bytes,
-                                       &errored, externalize);
+                const bool finished = run_producer_turns(
+                    writer, out, stream.state, output_schema, ctx, rpc_.server_id(), request_id,
+                    cfg_.max_response_bytes, &errored, externalize);
                 if (!finished) {
                     VGI_RPC_THROW_NOT_OK(writer->WriteRecordBatch(
                         *make_empty_batch(output_schema), init_metadata(cursor, call_token)));
-                    streams_[cursor] = {stream.state, output_schema, input_schema, false,
-                                        method_name, aad};
+                    streams_[cursor] = {stream.state, output_schema, input_schema,
+                                        false,        method_name,   aad};
                 }
                 VGI_RPC_THROW_NOT_OK(writer->Close());
             }
@@ -1259,9 +1250,10 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res)
         streams_.erase(sit);
         res.status = 200;
         apply_sticky();
-        set_arrow_content(req, res, build_body([&](const std::shared_ptr<arrow::io::OutputStream>& out) {
-                            write_ipc_stream(out, output_schema, {});
-                        }));
+        set_arrow_content(req, res,
+                          build_body([&](const std::shared_ptr<arrow::io::OutputStream>& out) {
+                              write_ipc_stream(out, output_schema, {});
+                          }));
         return;
     }
 
@@ -1270,8 +1262,9 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res)
         res.status = 200;
         res.set_header(RPC_ERROR_HEADER, "true");
         apply_sticky();
-        set_arrow_content(req, res, error_body(output_schema, exception_type_of(e), e.what(), rpc_.server_id(),
-                                   request_id, error_kind_of(e)));
+        set_arrow_content(req, res,
+                          error_body(output_schema, exception_type_of(e), e.what(),
+                                     rpc_.server_id(), request_id, error_kind_of(e)));
     };
 
     int64_t externalized = 0;
@@ -1293,8 +1286,8 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res)
             error_body(output_schema, "RpcError",
                        "Externalised payload exceeds max_externalized_response_bytes (" +
                            std::to_string(externalized) + " > " +
-                           std::to_string(cfg_.max_externalized_response_bytes) +
-                           ") for method '" + sess.method_name + "'",
+                           std::to_string(cfg_.max_externalized_response_bytes) + ") for method '" +
+                           sess.method_name + "'",
                        rpc_.server_id(), request_id));
         return true;
     };
@@ -1304,35 +1297,35 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res)
             auto coerced = coerce_input(batch, sess.input_schema);
             OutputCollector oc(output_schema, /*producer=*/false, rpc_.server_id(), request_id);
             sess.state->process(AnnotatedBatch::data(coerced), oc, ctx);
-            std::string body =
-                build_body([&](const std::shared_ptr<arrow::io::OutputStream>& out) {
-                    std::vector<AnnotatedBatch> batches = oc.batches();
-                    // Only the cursor is re-minted; re-issuing the call token
-                    // here would be exactly the work the split avoids. Merged,
-                    // not assigned: whatever the handler attached to its own
-                    // data batch has to survive the ride.
-                    for (auto& ab : batches) {
-                        if (ab.batch && ab.batch->num_rows() > 0) {
-                            ab.merge_metadata(cursor_metadata(cursor));
-                        }
+            std::string body = build_body([&](const std::shared_ptr<arrow::io::OutputStream>& out) {
+                std::vector<AnnotatedBatch> batches = oc.batches();
+                // Only the cursor is re-minted; re-issuing the call token
+                // here would be exactly the work the split avoids. Merged,
+                // not assigned: whatever the handler attached to its own
+                // data batch has to survive the ride.
+                for (auto& ab : batches) {
+                    if (ab.batch && ab.batch->num_rows() > 0) {
+                        ab.merge_metadata(cursor_metadata(cursor));
                     }
-                    if (batches.empty() || batches.back().batch->num_rows() == 0) {
-                        batches.push_back(AnnotatedBatch::with_metadata(
-                            make_empty_batch(output_schema), cursor_metadata(cursor)));
-                    }
-                    write_ipc_stream(out, output_schema, batches);
-                });
+                }
+                if (batches.empty() || batches.back().batch->num_rows() == 0) {
+                    batches.push_back(AnnotatedBatch::with_metadata(make_empty_batch(output_schema),
+                                                                    cursor_metadata(cursor)));
+                }
+                write_ipc_stream(out, output_schema, batches);
+            });
             if (cfg_.max_response_bytes >= 0 &&
                 static_cast<int64_t>(body.size()) > cfg_.max_response_bytes) {
                 res.status = 200;
                 res.set_header(RPC_ERROR_HEADER, "true");
                 apply_sticky();
-                set_arrow_content(req, res, error_body(output_schema, "RpcError",
-                               "HTTP body exceeds max_response_bytes (" +
-                                   std::to_string(body.size()) + " > " +
-                                   std::to_string(cfg_.max_response_bytes) +
-                                   ") for method '" + sess.method_name + "'",
-                               rpc_.server_id(), request_id));
+                set_arrow_content(req, res,
+                                  error_body(output_schema, "RpcError",
+                                             "HTTP body exceeds max_response_bytes (" +
+                                                 std::to_string(body.size()) + " > " +
+                                                 std::to_string(cfg_.max_response_bytes) +
+                                                 ") for method '" + sess.method_name + "'",
+                                             rpc_.server_id(), request_id));
                 return;
             }
             res.status = 200;
@@ -1341,19 +1334,17 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res)
         } else {
             bool finished = false;
             bool errored = false;
-            std::string body =
-                build_body([&](const std::shared_ptr<arrow::io::OutputStream>& out) {
-                    auto writer = unwrap(arrow::ipc::MakeStreamWriter(out, output_schema));
-                    finished = run_producer_turns(writer, out, sess.state, output_schema, ctx,
-                                                  rpc_.server_id(), request_id,
-                                                  cfg_.max_response_bytes, &errored,
-                                                  externalize);
-                    if (!finished) {
-                        VGI_RPC_THROW_NOT_OK(writer->WriteRecordBatch(
-                            *make_empty_batch(output_schema), cursor_metadata(cursor)));
-                    }
-                    VGI_RPC_THROW_NOT_OK(writer->Close());
-                });
+            std::string body = build_body([&](const std::shared_ptr<arrow::io::OutputStream>& out) {
+                auto writer = unwrap(arrow::ipc::MakeStreamWriter(out, output_schema));
+                finished = run_producer_turns(writer, out, sess.state, output_schema, ctx,
+                                              rpc_.server_id(), request_id, cfg_.max_response_bytes,
+                                              &errored, externalize);
+                if (!finished) {
+                    VGI_RPC_THROW_NOT_OK(writer->WriteRecordBatch(*make_empty_batch(output_schema),
+                                                                  cursor_metadata(cursor)));
+                }
+                VGI_RPC_THROW_NOT_OK(writer->Close());
+            });
             if (external_cap_exceeded()) return;
             if (finished) streams_.erase(cursor);
             res.status = 200;
@@ -1385,8 +1376,8 @@ void HttpServer::run() {
                 what = e.what();
             } catch (...) {
             }
-            std::cerr << "vgi_rpc: unhandled exception serving " << req.method << " "
-                      << req.path << ": " << what << "\n";
+            std::cerr << "vgi_rpc: unhandled exception serving " << req.method << " " << req.path
+                      << ": " << what << "\n";
             res.status = 500;
             res.set_content(nlohmann::json{{"error", "internal"}, {"detail", what}}.dump(),
                             "application/json");
@@ -1440,9 +1431,8 @@ void HttpServer::run() {
         res.status = 204;
     });
 
-    svr.Post(R"(/(.+))", [this](const httplib::Request& req, httplib::Response& res) {
-        handle_rpc(req, res);
-    });
+    svr.Post(R"(/(.+))",
+             [this](const httplib::Request& req, httplib::Response& res) { handle_rpc(req, res); });
 
     int bound;
     if (cfg_.port == 0) {

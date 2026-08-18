@@ -38,8 +38,8 @@ struct MethodInfo {
 
     // For streaming
     std::shared_ptr<arrow::Schema> input_schema;   // nullptr for unary
-    std::shared_ptr<arrow::Schema> output_schema;   // nullptr for unary
-    std::shared_ptr<arrow::Schema> header_schema;   // nullptr if no header
+    std::shared_ptr<arrow::Schema> output_schema;  // nullptr for unary
+    std::shared_ptr<arrow::Schema> header_schema;  // nullptr if no header
     std::function<Stream(const Request&, CallContext&)> stream_factory;
     // true = exchange (bidi), false = producer.  Used to pick the stream
     // dispatch shape; not surfaced in __describe__ (which reports null).
@@ -59,38 +59,32 @@ public:
     ServerBuilder() = default;
 
     // Register a unary method
-    ServerBuilder& add_unary(
-        const std::string& name,
-        std::shared_ptr<arrow::Schema> params_schema,
-        std::shared_ptr<arrow::Schema> result_schema,
-        std::function<Result(const Request&, CallContext&)> handler,
-        const std::string& doc = "");
+    ServerBuilder& add_unary(const std::string& name, std::shared_ptr<arrow::Schema> params_schema,
+                             std::shared_ptr<arrow::Schema> result_schema,
+                             std::function<Result(const Request&, CallContext&)> handler,
+                             const std::string& doc = "");
 
     // Register a void unary method
-    ServerBuilder& add_void(
-        const std::string& name,
-        std::shared_ptr<arrow::Schema> params_schema,
-        std::function<void(const Request&, CallContext&)> handler,
-        const std::string& doc = "");
+    ServerBuilder& add_void(const std::string& name, std::shared_ptr<arrow::Schema> params_schema,
+                            std::function<void(const Request&, CallContext&)> handler,
+                            const std::string& doc = "");
 
     // Register a producer stream method
-    ServerBuilder& add_producer(
-        const std::string& name,
-        std::shared_ptr<arrow::Schema> params_schema,
-        std::shared_ptr<arrow::Schema> output_schema,
-        std::function<Stream(const Request&, CallContext&)> factory,
-        const std::string& doc = "",
-        std::shared_ptr<arrow::Schema> header_schema = nullptr);
+    ServerBuilder& add_producer(const std::string& name,
+                                std::shared_ptr<arrow::Schema> params_schema,
+                                std::shared_ptr<arrow::Schema> output_schema,
+                                std::function<Stream(const Request&, CallContext&)> factory,
+                                const std::string& doc = "",
+                                std::shared_ptr<arrow::Schema> header_schema = nullptr);
 
     // Register an exchange stream method
-    ServerBuilder& add_exchange(
-        const std::string& name,
-        std::shared_ptr<arrow::Schema> params_schema,
-        std::shared_ptr<arrow::Schema> input_schema,
-        std::shared_ptr<arrow::Schema> output_schema,
-        std::function<Stream(const Request&, CallContext&)> factory,
-        const std::string& doc = "",
-        std::shared_ptr<arrow::Schema> header_schema = nullptr);
+    ServerBuilder& add_exchange(const std::string& name,
+                                std::shared_ptr<arrow::Schema> params_schema,
+                                std::shared_ptr<arrow::Schema> input_schema,
+                                std::shared_ptr<arrow::Schema> output_schema,
+                                std::function<Stream(const Request&, CallContext&)> factory,
+                                const std::string& doc = "",
+                                std::shared_ptr<arrow::Schema> header_schema = nullptr);
 
     // Set a deterministic server ID (defaults to random_hex(12) if not set).
     ServerBuilder& server_id(std::string id);
@@ -115,8 +109,7 @@ public:
     // record per completed call.  Empty path (the default) disables it.
     // `max_record_bytes` caps one emitted line; over-cap records shed fields
     // per docs/access-log-spec.md §5b rather than being dropped downstream.
-    ServerBuilder& access_log(std::string path,
-                              int64_t max_record_bytes = kDefaultMaxRecordBytes);
+    ServerBuilder& access_log(std::string path, int64_t max_record_bytes = kDefaultMaxRecordBytes);
 
     // Build the server
     std::unique_ptr<Server> build();
@@ -183,28 +176,21 @@ public:
     // when the method raised — the caller needs that to set X-VGI-RPC-Error,
     // which is the only thing distinguishing a failure from a result on a
     // response that is 200 either way.
-    bool serve_unary_http(const MethodInfo& method_info,
-                          const Request& request,
+    bool serve_unary_http(const MethodInfo& method_info, const Request& request,
                           const std::string& request_id,
-                          const std::shared_ptr<arrow::io::OutputStream>& output,
-                          CallContext& ctx);
+                          const std::shared_ptr<arrow::io::OutputStream>& output, CallContext& ctx);
 
 private:
-    Server(std::unordered_map<std::string, MethodInfo> methods,
-           std::string server_id,
-           std::string protocol_name,
-           std::string protocol_hash,
-           std::string protocol_version,
+    Server(std::unordered_map<std::string, MethodInfo> methods, std::string server_id,
+           std::string protocol_name, std::string protocol_hash, std::string protocol_version,
            const std::string& access_log_path,
            int64_t access_log_max_record_bytes = kDefaultMaxRecordBytes);
 
-    void serve_unary(const MethodInfo& method_info,
-                     const Request& request,
+    void serve_unary(const MethodInfo& method_info, const Request& request,
                      const std::string& request_id,
                      const std::shared_ptr<arrow::io::OutputStream>& output);
 
-    void serve_stream(const MethodInfo& method_info,
-                      const Request& request,
+    void serve_stream(const MethodInfo& method_info, const Request& request,
                       const std::string& request_id,
                       const std::shared_ptr<arrow::io::InputStream>& input,
                       const std::shared_ptr<arrow::io::OutputStream>& output);

@@ -26,10 +26,8 @@ namespace vgi_rpc {
 // branches on (e.g. "session_lost"); `exception_type` stays the human-facing
 // name.  See docs/sticky-sessions-spec.md §6.
 VGI_RPC_EXPORT std::shared_ptr<arrow::KeyValueMetadata> make_error_metadata(
-    const std::string& exception_type,
-    const std::string& message,
-    const std::string& server_id = "",
-    const std::string& request_id = "",
+    const std::string& exception_type, const std::string& message,
+    const std::string& server_id = "", const std::string& request_id = "",
     const std::string& error_kind = "");
 
 class VGI_RPC_EXPORT Result {
@@ -48,12 +46,9 @@ public:
     static Result void_result();
 
     // Error result (0-row batch with EXCEPTION metadata)
-    static Result error(std::shared_ptr<arrow::Schema> schema,
-                        const std::string& exception_type,
-                        const std::string& message,
-                        const std::string& server_id = "",
-                        const std::string& request_id = "",
-                        const std::string& error_kind = "");
+    static Result error(std::shared_ptr<arrow::Schema> schema, const std::string& exception_type,
+                        const std::string& message, const std::string& server_id = "",
+                        const std::string& request_id = "", const std::string& error_kind = "");
 
     const AnnotatedBatch& annotated_batch() const noexcept { return batch_; }
     const std::shared_ptr<arrow::Schema>& schema() const;

@@ -21,12 +21,12 @@
 #include <arrow/util/key_value_metadata.h>
 
 #ifdef _WIN32
-  #include <fcntl.h>
-  #include <io.h>
-  #include <stdio.h>
-  #define STDIN_FILENO 0
+#include <fcntl.h>
+#include <io.h>
+#include <stdio.h>
+#define STDIN_FILENO 0
 #else
-  #include <unistd.h>
+#include <unistd.h>
 #endif
 
 #include <algorithm>
@@ -42,13 +42,10 @@ namespace vgi_rpc {
 namespace {
 
 // Write an error batch to a mid-stream IPC writer
-void write_stream_error(
-    const std::shared_ptr<arrow::ipc::RecordBatchWriter>& writer,
-    const std::shared_ptr<arrow::Schema>& schema,
-    const std::string& exception_type,
-    const std::string& message,
-    const std::string& server_id,
-    const std::string& request_id) {
+void write_stream_error(const std::shared_ptr<arrow::ipc::RecordBatchWriter>& writer,
+                        const std::shared_ptr<arrow::Schema>& schema,
+                        const std::string& exception_type, const std::string& message,
+                        const std::string& server_id, const std::string& request_id) {
     auto error_batch = make_empty_batch(schema);
     auto md = make_error_metadata(exception_type, message, server_id, request_id);
     VGI_RPC_THROW_NOT_OK(writer->WriteRecordBatch(*error_batch, md));
@@ -64,8 +61,8 @@ std::shared_ptr<arrow::RecordBatch> coerce_input_batch(
     if (batch->schema()->Equals(*target)) return batch;
 
     auto mismatch = [&]() {
-        return std::logic_error("Input schema mismatch: expected " + target->ToString() +
-                                ", got " + batch->schema()->ToString());
+        return std::logic_error("Input schema mismatch: expected " + target->ToString() + ", got " +
+                                batch->schema()->ToString());
     };
 
     std::set<std::string> batch_names, target_names;
@@ -174,8 +171,7 @@ bool Server::serve_one(const std::shared_ptr<arrow::io::InputStream>& input,
     if (method_name.empty()) {
         auto error_result = Result::error(
             empty_schema(), "ProtocolError",
-            "Missing 'vgi_rpc.method' in request batch custom_metadata.",
-            server_id_, request_id);
+            "Missing 'vgi_rpc.method' in request batch custom_metadata.", server_id_, request_id);
         write_ipc_stream(output, empty_schema(), {error_result.annotated_batch()});
         VGI_RPC_THROW_NOT_OK(output->Flush());
         return true;
@@ -184,11 +180,11 @@ bool Server::serve_one(const std::shared_ptr<arrow::io::InputStream>& input,
     // 3. Validate request version
     auto version = get_metadata_value(custom_metadata, keys::REQUEST_VERSION);
     if (version.empty()) {
-        auto error_result = Result::error(
-            empty_schema(), "VersionError",
-            "Missing 'vgi_rpc.request_version' in request batch custom_metadata. "
-            "Set the 'vgi_rpc.request_version' custom_metadata value to '1'.",
-            server_id_, request_id);
+        auto error_result =
+            Result::error(empty_schema(), "VersionError",
+                          "Missing 'vgi_rpc.request_version' in request batch custom_metadata. "
+                          "Set the 'vgi_rpc.request_version' custom_metadata value to '1'.",
+                          server_id_, request_id);
         write_ipc_stream(output, empty_schema(), {error_result.annotated_batch()});
         VGI_RPC_THROW_NOT_OK(output->Flush());
         return true;
@@ -196,8 +192,7 @@ bool Server::serve_one(const std::shared_ptr<arrow::io::InputStream>& input,
     if (version != REQUEST_VERSION_VALUE) {
         auto error_result = Result::error(
             empty_schema(), "VersionError",
-            "Unsupported request version '" + version + "', expected '1'.",
-            server_id_, request_id);
+            "Unsupported request version '" + version + "', expected '1'.", server_id_, request_id);
         write_ipc_stream(output, empty_schema(), {error_result.annotated_batch()});
         VGI_RPC_THROW_NOT_OK(output->Flush());
         return true;
@@ -258,10 +253,10 @@ bool Server::serve_one(const std::shared_ptr<arrow::io::InputStream>& input,
         if (!shm_) {
             // A negotiation violation: fail loudly rather than hand the method
             // a zero-row batch the caller never sent.
-            auto error_result = Result::error(
-                empty_schema(), "ProtocolError",
-                "Request carries a shared-memory pointer but no segment is attached.",
-                server_id_, request_id);
+            auto error_result =
+                Result::error(empty_schema(), "ProtocolError",
+                              "Request carries a shared-memory pointer but no segment is attached.",
+                              server_id_, request_id);
             write_ipc_stream(output, empty_schema(), {error_result.annotated_batch()});
             VGI_RPC_THROW_NOT_OK(output->Flush());
             return true;
@@ -269,8 +264,8 @@ bool Server::serve_one(const std::shared_ptr<arrow::io::InputStream>& input,
         try {
             batch = resolve_shm_batch(batch, &custom_metadata, shm_, &shm_free_offset);
         } catch (const std::exception& e) {
-            auto error_result = Result::error(empty_schema(), "ProtocolError", e.what(),
-                                              server_id_, request_id);
+            auto error_result =
+                Result::error(empty_schema(), "ProtocolError", e.what(), server_id_, request_id);
             write_ipc_stream(output, empty_schema(), {error_result.annotated_batch()});
             VGI_RPC_THROW_NOT_OK(output->Flush());
             return true;
@@ -308,8 +303,7 @@ void Server::refresh_shm(const std::shared_ptr<arrow::KeyValueMetadata>& custom_
     shm_name_ = shm_ ? name : std::string();
 }
 
-bool Server::serve_unary_http(const MethodInfo& method_info,
-                              const Request& request,
+bool Server::serve_unary_http(const MethodInfo& method_info, const Request& request,
                               const std::string& request_id,
                               const std::shared_ptr<arrow::io::OutputStream>& output,
                               CallContext& ctx) {
@@ -361,8 +355,7 @@ bool Server::serve_unary_http(const MethodInfo& method_info,
     return status == "error";
 }
 
-void Server::serve_unary(const MethodInfo& method_info,
-                         const Request& request,
+void Server::serve_unary(const MethodInfo& method_info, const Request& request,
                          const std::string& request_id,
                          const std::shared_ptr<arrow::io::OutputStream>& output) {
     auto log_sink = std::make_shared<LogSink>(server_id_, request_id);
@@ -370,8 +363,7 @@ void Server::serve_unary(const MethodInfo& method_info,
     serve_unary_http(method_info, request, request_id, output, ctx);
 }
 
-void Server::serve_stream(const MethodInfo& method_info,
-                          const Request& request,
+void Server::serve_stream(const MethodInfo& method_info, const Request& request,
                           const std::string& request_id,
                           const std::shared_ptr<arrow::io::InputStream>& input,
                           const std::shared_ptr<arrow::io::OutputStream>& output) {
@@ -389,8 +381,7 @@ void Server::serve_stream(const MethodInfo& method_info,
     Stream stream_result = Stream{};
 
     auto handle_factory_error = [&](const std::string& error_type, const char* msg) {
-        auto error_result = Result::error(
-            empty_schema(), error_type, msg, server_id_, request_id);
+        auto error_result = Result::error(empty_schema(), error_type, msg, server_id_, request_id);
         write_ipc_stream(output, empty_schema(), {error_result.annotated_batch()});
         VGI_RPC_THROW_NOT_OK(output->Flush());
 
@@ -401,8 +392,10 @@ void Server::serve_stream(const MethodInfo& method_info,
         try {
             read_ipc_stream(input);
         } catch (const std::exception& e) {
-            fprintf(stderr, "vgi_rpc: warning: error draining input after factory error: %s\n", e.what());
-        } catch (...) {}
+            fprintf(stderr, "vgi_rpc: warning: error draining input after factory error: %s\n",
+                    e.what());
+        } catch (...) {
+        }
     };
 
     try {
@@ -474,7 +467,8 @@ void Server::serve_stream(const MethodInfo& method_info,
     auto init_logs = log_sink->flush(output_schema);
     for (auto& log_ab : init_logs) {
         if (log_ab.custom_metadata) {
-            VGI_RPC_THROW_NOT_OK(output_writer->WriteRecordBatch(*log_ab.batch, log_ab.custom_metadata));
+            VGI_RPC_THROW_NOT_OK(
+                output_writer->WriteRecordBatch(*log_ab.batch, log_ab.custom_metadata));
         } else {
             VGI_RPC_THROW_NOT_OK(output_writer->WriteRecordBatch(*log_ab.batch));
         }
@@ -503,16 +497,16 @@ void Server::serve_stream(const MethodInfo& method_info,
                     state->on_cancel(cancel_ctx);
                 } catch (const std::exception& e) {
                     fprintf(stderr, "vgi_rpc: warning: on_cancel hook failed: %s\n", e.what());
-                } catch (...) {}
+                } catch (...) {
+                }
                 break;
             }
 
             AnnotatedBatch input_ab;
-            input_ab.custom_metadata =
-                batch_with_md.custom_metadata
-                    ? std::static_pointer_cast<arrow::KeyValueMetadata>(
-                          batch_with_md.custom_metadata->Copy())
-                    : nullptr;
+            input_ab.custom_metadata = batch_with_md.custom_metadata
+                                           ? std::static_pointer_cast<arrow::KeyValueMetadata>(
+                                                 batch_with_md.custom_metadata->Copy())
+                                           : nullptr;
 
             // A large exchange input may arrive as a pointer into the peer's
             // segment; resolve it before coercion so the schema check sees the
@@ -530,9 +524,7 @@ void Server::serve_stream(const MethodInfo& method_info,
 
             // Exchange streams coerce the inbound batch to the declared input
             // schema (reorder + compatible casts); producer ticks are empty.
-            input_ab.batch = is_producer
-                ? raw_input
-                : coerce_input_batch(raw_input, input_schema);
+            input_ab.batch = is_producer ? raw_input : coerce_input_batch(raw_input, input_schema);
 
             OutputCollector out(output_schema, is_producer, server_id_, request_id);
             CallContext stream_ctx(log_sink, server_id_, request_id);
@@ -543,7 +535,8 @@ void Server::serve_stream(const MethodInfo& method_info,
             auto stream_logs = log_sink->flush(output_schema);
             for (auto& log_ab : stream_logs) {
                 if (log_ab.custom_metadata) {
-                    VGI_RPC_THROW_NOT_OK(output_writer->WriteRecordBatch(*log_ab.batch, log_ab.custom_metadata));
+                    VGI_RPC_THROW_NOT_OK(
+                        output_writer->WriteRecordBatch(*log_ab.batch, log_ab.custom_metadata));
                 } else {
                     VGI_RPC_THROW_NOT_OK(output_writer->WriteRecordBatch(*log_ab.batch));
                 }
@@ -552,7 +545,8 @@ void Server::serve_stream(const MethodInfo& method_info,
             for (auto ab : out.batches()) {
                 ab.batch = maybe_write_to_shm(ab.batch, &ab.custom_metadata, call_shm_);
                 if (ab.custom_metadata) {
-                    VGI_RPC_THROW_NOT_OK(output_writer->WriteRecordBatch(*ab.batch, ab.custom_metadata));
+                    VGI_RPC_THROW_NOT_OK(
+                        output_writer->WriteRecordBatch(*ab.batch, ab.custom_metadata));
                 } else {
                     VGI_RPC_THROW_NOT_OK(output_writer->WriteRecordBatch(*ab.batch));
                 }
@@ -566,21 +560,29 @@ void Server::serve_stream(const MethodInfo& method_info,
             if (out.is_finished()) break;
         }
     } catch (const std::invalid_argument& e) {
-        status = "error"; error_type = "ValueError"; error_message = e.what();
-        write_stream_error(output_writer, output_schema, "ValueError",
-                           e.what(), server_id_, request_id);
+        status = "error";
+        error_type = "ValueError";
+        error_message = e.what();
+        write_stream_error(output_writer, output_schema, "ValueError", e.what(), server_id_,
+                           request_id);
     } catch (const std::out_of_range& e) {
-        status = "error"; error_type = "IndexError"; error_message = e.what();
-        write_stream_error(output_writer, output_schema, "IndexError",
-                           e.what(), server_id_, request_id);
+        status = "error";
+        error_type = "IndexError";
+        error_message = e.what();
+        write_stream_error(output_writer, output_schema, "IndexError", e.what(), server_id_,
+                           request_id);
     } catch (const std::logic_error& e) {
-        status = "error"; error_type = "TypeError"; error_message = e.what();
-        write_stream_error(output_writer, output_schema, "TypeError",
-                           e.what(), server_id_, request_id);
+        status = "error";
+        error_type = "TypeError";
+        error_message = e.what();
+        write_stream_error(output_writer, output_schema, "TypeError", e.what(), server_id_,
+                           request_id);
     } catch (const std::exception& e) {
-        status = "error"; error_type = "RuntimeError"; error_message = e.what();
-        write_stream_error(output_writer, output_schema, "RuntimeError",
-                           e.what(), server_id_, request_id);
+        status = "error";
+        error_type = "RuntimeError";
+        error_message = e.what();
+        write_stream_error(output_writer, output_schema, "RuntimeError", e.what(), server_id_,
+                           request_id);
     }
 
     // Close output writer (writes EOS) — suppress errors if pipe is broken
@@ -589,7 +591,8 @@ void Server::serve_stream(const MethodInfo& method_info,
         VGI_RPC_THROW_NOT_OK(output->Flush());
     } catch (const std::exception& e) {
         fprintf(stderr, "vgi_rpc: warning: error closing stream writer: %s\n", e.what());
-    } catch (...) {}
+    } catch (...) {
+    }
 
     // Drain remaining input
     drain_reader(input_reader);

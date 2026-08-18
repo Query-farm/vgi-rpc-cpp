@@ -24,9 +24,8 @@ struct AnnotatedBatch {
         return {std::move(b), nullptr};
     }
 
-    static AnnotatedBatch with_metadata(
-        std::shared_ptr<arrow::RecordBatch> b,
-        std::shared_ptr<arrow::KeyValueMetadata> md) {
+    static AnnotatedBatch with_metadata(std::shared_ptr<arrow::RecordBatch> b,
+                                        std::shared_ptr<arrow::KeyValueMetadata> md) {
         return {std::move(b), std::move(md)};
     }
 
