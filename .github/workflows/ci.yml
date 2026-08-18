@@ -23,6 +23,18 @@ env:
   AWS_REQUEST_CHECKSUM_CALCULATION: when_required
 
 jobs:
+  # Cheap and fast, and it fails the whole run before anything is built: a
+  # formatting-only diff arriving on top of a real change is what the
+  # formatter exists to prevent.
+  format:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install clang-format
+        run: pipx install 'clang-format~=22.1'
+      - name: Check formatting
+        run: ./scripts/format.sh --check
+
   build:
     strategy:
       fail-fast: false
