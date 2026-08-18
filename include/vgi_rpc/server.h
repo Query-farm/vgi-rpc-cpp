@@ -198,7 +198,6 @@ private:
            const std::string& access_log_path,
            int64_t access_log_max_record_bytes = kDefaultMaxRecordBytes);
 
-
     void serve_unary(const MethodInfo& method_info,
                      const Request& request,
                      const std::string& request_id,

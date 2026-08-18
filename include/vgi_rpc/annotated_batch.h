@@ -30,6 +30,26 @@ struct AnnotatedBatch {
         return {std::move(b), std::move(md)};
     }
 
+    // Fold `md` into whatever this batch already carries, `md` winning on a
+    // key conflict. A transport that stamps its own key on an outgoing batch
+    // must merge rather than assign: the handler may have attached metadata of
+    // its own, and overwriting it drops it silently.
+    void merge_metadata(const std::shared_ptr<arrow::KeyValueMetadata>& md) {
+        if (!md) return;
+        if (!custom_metadata) {
+            custom_metadata = md->Copy();
+            return;
+        }
+        auto merged = custom_metadata->Copy();
+        for (int64_t i = 0; i < md->size(); ++i) {
+            if (const auto index = merged->FindKey(md->key(i)); index >= 0) {
+                (void)merged->Delete(index);
+            }
+            merged->Append(md->key(i), md->value(i));
+        }
+        custom_metadata = std::move(merged);
+    }
+
     // Classify this batch (delegates to classify_batch in wire.h).
     // Defined in wire.cpp to avoid circular include.
     BatchType type() const;

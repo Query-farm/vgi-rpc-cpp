@@ -36,9 +36,10 @@ void OutputCollector::emit_batch(std::shared_ptr<arrow::RecordBatch> batch) {
 void OutputCollector::emit_batch(std::shared_ptr<arrow::RecordBatch> batch,
                                  std::shared_ptr<arrow::KeyValueMetadata> metadata) {
     emit_batch(std::move(batch));
-    // The batch just appended is the last one; attaching afterwards keeps the
-    // validation in the single-argument overload rather than duplicating it.
-    if (metadata && !batches_.empty()) {
+    // The delegated call either appended or threw, so the batch just appended
+    // is the last one; attaching afterwards keeps the validation in the
+    // single-argument overload rather than duplicating it here.
+    if (metadata) {
         batches_.back().custom_metadata = std::move(metadata);
     }
 }

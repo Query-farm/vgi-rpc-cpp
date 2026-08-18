@@ -938,7 +938,6 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res)
         }
     }
 
-
     const AuthIdentity id = identify(req);
     const std::string aad = session_aad(id.domain, id.principal, id.authenticated);
 
@@ -1309,10 +1308,12 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res)
                 build_body([&](const std::shared_ptr<arrow::io::OutputStream>& out) {
                     std::vector<AnnotatedBatch> batches = oc.batches();
                     // Only the cursor is re-minted; re-issuing the call token
-                    // here would be exactly the work the split avoids.
+                    // here would be exactly the work the split avoids. Merged,
+                    // not assigned: whatever the handler attached to its own
+                    // data batch has to survive the ride.
                     for (auto& ab : batches) {
                         if (ab.batch && ab.batch->num_rows() > 0) {
-                            ab.custom_metadata = cursor_metadata(cursor);
+                            ab.merge_metadata(cursor_metadata(cursor));
                         }
                     }
                     if (batches.empty() || batches.back().batch->num_rows() == 0) {

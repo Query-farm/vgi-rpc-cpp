@@ -19,8 +19,6 @@
 
 #include "vgi_rpc/annotated_batch.h"
 #include "vgi_rpc/export.h"
-#include <arrow/util/key_value_metadata.h>
-
 #include "vgi_rpc/log.h"
 
 namespace vgi_rpc {

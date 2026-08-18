@@ -24,10 +24,10 @@ std::shared_ptr<arrow::RecordBatch> make_empty_batch(
     std::vector<std::shared_ptr<arrow::Array>> arrays;
     arrays.reserve(schema->num_fields());
     for (int i = 0; i < schema->num_fields(); ++i) {
-        // `MakeArrayOfNull` rather than `MakeEmptyArray`: the latter goes
-        // through `MakeBuilder`, which has no builder for an extension type,
-        // so a schema carrying one (a UUID column, say) killed the transport
-        // before the client ever saw a schema message.
+        // `MakeArrayOfNull` rather than `MakeEmptyArray`: the two agree
+        // byte-for-byte over IPC on every type checked, but the former builds
+        // the array directly while the latter routes through `MakeBuilder`,
+        // which has no builder for some types. Nothing here needs a builder.
         arrays.push_back(
             unwrap(arrow::MakeArrayOfNull(schema->field(i)->type(), 0), "make_empty_batch"));
     }

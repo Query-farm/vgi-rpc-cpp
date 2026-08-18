@@ -5,7 +5,9 @@
 #include "vgi_rpc/metadata.h"
 #include "vgi_rpc/describe.h"
 
+#include <array>
 #include <optional>
+#include <stdexcept>
 #include <stdexcept>
 #include <utility>
 
@@ -189,28 +191,31 @@ std::unique_ptr<Server> ServerBuilder::build() {
 
 namespace {
 
-// `major.minor` of a canonical semver string, or nothing when it is not one.
-std::optional<std::pair<int, int>> semver_prefix(const std::string& version) {
-    int major = 0;
-    int minor = 0;
+// The canonical-semver grammar the wire spec fixes: MAJOR.MINOR.PATCH, each a
+// non-negative integer with no leading zeros, and nothing else — no prerelease,
+// no build metadata, no sign, no whitespace. Mirrors `SEMVER_REGEX` in the
+// reference implementation, which rejects anything looser outright.
+std::optional<std::array<int, 3>> parse_semver(const std::string& version) {
+    std::array<int, 3> parts{};
     size_t offset = 0;
-    for (int* part : {&major, &minor}) {
-        size_t consumed = 0;
-        try {
-            *part = std::stoi(version.substr(offset), &consumed);
-        } catch (const std::exception&) {
-            return std::nullopt;
-        }
-        offset += consumed;
-        if (part == &major) {
+    for (size_t i = 0; i < parts.size(); ++i) {
+        if (i > 0) {
             if (offset >= version.size() || version[offset] != '.') return std::nullopt;
             ++offset;
         }
+        const size_t start = offset;
+        while (offset < version.size() && version[offset] >= '0' && version[offset] <= '9') {
+            ++offset;
+        }
+        const size_t digits = offset - start;
+        // No leading zeros, except the literal `0`.
+        if (digits == 0 || (digits > 1 && version[start] == '0')) return std::nullopt;
+        // Anything long enough to overflow an int is malformed for our purposes.
+        if (digits > 9) return std::nullopt;
+        parts[i] = std::stoi(version.substr(start, digits));
     }
-    // A trailing `.patch` is required but ignored: the surface does not change
-    // within a major.minor.
-    if (offset >= version.size() || version[offset] != '.') return std::nullopt;
-    return std::pair{major, minor};
+    if (offset != version.size()) return std::nullopt;
+    return parts;
 }
 
 }  // namespace
@@ -218,38 +223,39 @@ std::optional<std::pair<int, int>> semver_prefix(const std::string& version) {
 std::string Server::protocol_version_error(
     const std::shared_ptr<arrow::KeyValueMetadata>& custom_metadata) const {
     if (protocol_version_.empty()) return {};
-    const auto expected = semver_prefix(protocol_version_);
-    if (!expected) return {};
+    // The constructor rejected anything unparseable, so the server's own
+    // version is known good by the time a request can reach this.
+    const auto expected = *parse_semver(protocol_version_);
 
     const std::string header = "VGI client/worker protocol_version mismatch.\n  Client: ";
     const auto trailer = "\n  Server: " + protocol_version_ + "\n  Direction: ";
 
-    if (!custom_metadata) {
-        return header + "<not declared>" + trailer +
-               "the client sent no " + std::string(keys::PROTOCOL_VERSION) +
-               " metadata key. This is either a framework bug or a non-VGI client.";
-    }
-    const auto index = custom_metadata->FindKey(keys::PROTOCOL_VERSION);
+    const auto index = custom_metadata ? custom_metadata->FindKey(keys::PROTOCOL_VERSION) : -1;
     if (index < 0) {
-        return header + "<not declared>" + trailer +
-               "the client sent no " + std::string(keys::PROTOCOL_VERSION) +
-               " metadata key. This is either a framework bug or a non-VGI client.";
+        return header + "<not declared>" + trailer + "the client did not send a " +
+               std::string(keys::PROTOCOL_VERSION) +
+               " metadata key. This is either a vgi-rpc framework bug or a non-VGI client "
+               "connecting to a VGI worker.";
     }
 
     const auto& declared = custom_metadata->value(index);
-    const auto actual = semver_prefix(declared);
+    const auto actual = parse_semver(declared);
     if (!actual) {
         return header + declared + trailer +
-               "client sent a malformed protocol_version; expected canonical semver "
+               "client sent a malformed protocol_version. Expected canonical semver "
                "MAJOR.MINOR.PATCH.";
     }
-    if (*actual == *expected) return {};
+    // Exact major+minor match; patch is ignored, since the surface does not
+    // change within one.
+    const std::pair actual_surface{(*actual)[0], (*actual)[1]};
+    const std::pair expected_surface{expected[0], expected[1]};
+    if (actual_surface == expected_surface) return {};
 
     return header + declared + trailer +
-           (*actual < *expected
-                ? "client is too old; upgrade it to a version supporting protocol_version " +
-                      protocol_version_ + "."
-                : "server is too old; upgrade the worker to a version supporting "
+           (actual_surface < expected_surface
+                ? "client is too old; upgrade the VGI extension/client to a version supporting "
+                  "protocol_version " + protocol_version_ + "."
+                : "server is too old; upgrade the VGI worker to a version supporting "
                   "protocol_version " + declared + ".");
 }
 
@@ -265,6 +271,15 @@ Server::Server(std::unordered_map<std::string, MethodInfo> methods,
     , protocol_name_(std::move(protocol_name))
     , protocol_hash_(std::move(protocol_hash))
     , protocol_version_(std::move(protocol_version)) {
+    // A worker that declares a version it cannot parse would silently enforce
+    // nothing, which is worse than not declaring one: the operator believes
+    // there is a gate. Refuse to build such a server at all.
+    if (!protocol_version_.empty() && !parse_semver(protocol_version_)) {
+        throw std::invalid_argument(
+            "Invalid protocol version '" + protocol_version_ +
+            "': expected canonical semver MAJOR.MINOR.PATCH with non-negative integers "
+            "and no leading zeros (no prereleases or build metadata).");
+    }
     if (!access_log_path.empty()) {
         access_log_ = std::make_unique<AccessLogWriter>(
             access_log_path, server_id_, protocol_name_, protocol_hash_,
