@@ -21,6 +21,13 @@ set(CMAKE_VISIBILITY_INLINES_HIDDEN ON)
 find_package(Arrow CONFIG REQUIRED)
 find_package(nlohmann_json CONFIG REQUIRED)
 find_package(httplib CONFIG REQUIRED)
+# libsodium supplies every primitive the wire needs: XChaCha20-Poly1305 (the
+# 24-byte-nonce AEAD the token envelopes use, which OpenSSL does not ship),
+# SHA-256, HMAC-SHA256, a CSPRNG and a constant-time compare. Audited code in
+# place of ours, and the same library the Python reference reaches through
+# PyNaCl — so the two implementations agree by construction rather than by
+# both having been written from the same RFC.
+find_package(unofficial-sodium CONFIG REQUIRED)
 
 # Cloud backends for external-location payloads.  Off by default: aws-sdk-cpp
 # and google-cloud-cpp are long builds, and a deployment that externalises over
@@ -103,6 +110,10 @@ target_link_libraries(vgi_rpc PUBLIC
     httplib::httplib
 )
 
+# PRIVATE: libsodium is entirely behind `vgi_rpc::crypto`, so a consumer sees
+# no sodium header and links no sodium symbol of its own.
+target_link_libraries(vgi_rpc PRIVATE unofficial-sodium::sodium)
+
 # shm_open/shm_unlink moved from librt into libc in glibc 2.34.  Linking it
 # where it exists costs nothing (it is a stub on modern glibc) and is what
 # keeps the shared-memory channel building on older distributions.
@@ -114,13 +125,6 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         # the machine that built it.
         target_link_libraries(vgi_rpc PUBLIC rt)
     endif()
-endif()
-
-# BCryptGenRandom (src/crypto.cpp) lives in bcrypt.lib, which MSVC does not
-# link by default.  PUBLIC because the symbol is reached from this library's
-# own objects, which a consumer links directly when building statically.
-if(WIN32)
-    target_link_libraries(vgi_rpc PUBLIC bcrypt)
 endif()
 
 # PRIVATE: the SDKs are an implementation detail of src/external.cpp, and the

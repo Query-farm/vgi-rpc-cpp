@@ -6,5 +6,8 @@ Name: vgi_rpc
 Description: C++20 RPC framework built on Apache Arrow IPC
 Version: @PROJECT_VERSION@
 Requires: arrow
+# .private: only a static link needs it on the command line; a shared
+# vgi_rpc has already resolved it.
+Requires.private: libsodium
 Libs: -L${libdir} -lvgi_rpc
 Cflags: -I${includedir}

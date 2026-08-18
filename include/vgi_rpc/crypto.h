@@ -1,15 +1,19 @@
 // © Copyright 2025-2026, Query.Farm LLC - https://query.farm
 // SPDX-License-Identifier: Apache-2.0
 
-/// Self-contained primitives for the HTTP transport's authenticated surfaces:
-/// state-token sealing (XChaCha20-Poly1305), proxy-proof MACs (HMAC-SHA256),
-/// and the encodings both ride on.
+/// Primitives for the HTTP transport's authenticated surfaces: state-token
+/// sealing (XChaCha20-Poly1305), proxy-proof MACs (HMAC-SHA256), and the
+/// encodings both ride on.
 ///
-/// Implemented here rather than against OpenSSL so the library keeps the
-/// dependency surface it already had — the protocol_hash SHA-256 was written
-/// the same way, for the same reason.  Every algorithm is a published,
-/// fixed-shape standard (FIPS 180-4, RFC 2104, RFC 8439), so there is no
-/// moving target to track.
+/// libsodium underneath, not our own arithmetic. It is the only common library
+/// that ships XChaCha20-Poly1305 — OpenSSL has the IETF 12-byte-nonce variant
+/// and not this one, and the 24-byte nonce is the whole reason the envelope
+/// can generate nonces at random. It is also what the Python reference reaches
+/// through PyNaCl, so the two ends agree by construction rather than by both
+/// having been written from the same RFC.
+///
+/// Only the base64url and hex encodings are ours, because libsodium's base64
+/// writes the padded variant and this wire carries unpadded.
 #pragma once
 
 #include <array>
@@ -25,7 +29,7 @@ namespace vgi_rpc::crypto {
 
 // --- Digests ---------------------------------------------------------------
 
-// Streaming SHA-256 (FIPS 180-4).
+// Streaming SHA-256 (FIPS 180-4). libsodium underneath.
 class VGI_RPC_EXPORT Sha256 {
 public:
     Sha256() { reset(); }
@@ -42,12 +46,13 @@ public:
 
 private:
     void reset();
-    void transform(const uint8_t* chunk);
 
-    uint32_t state_[8]{};
-    uint64_t bitlen_ = 0;
-    uint8_t buf_[64]{};
-    size_t buflen_ = 0;
+    // libsodium's `crypto_hash_sha256_state` by value, without putting
+    // <sodium.h> in this header — a consumer of the SDK should not have to
+    // find libsodium's includes to use a digest. Sized with room to spare and
+    // static_assert'd against the real type in crypto.cpp, so a libsodium that
+    // grew its state fails to compile rather than to run.
+    alignas(8) unsigned char state_[128]{};
 };
 
 VGI_RPC_EXPORT std::array<uint8_t, 32> sha256(const uint8_t* data, size_t len);

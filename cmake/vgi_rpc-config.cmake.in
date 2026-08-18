@@ -4,6 +4,36 @@ include(CMakeFindDependencyMacro)
 find_dependency(Arrow CONFIG)
 find_dependency(nlohmann_json CONFIG)
 find_dependency(httplib CONFIG)
+# libsodium is linked PRIVATE, but a *static* vgi_rpc still names it in its
+# exported interface — CMake records private link libraries as
+# $<LINK_ONLY:...> — so the target has to exist for a consumer. This is the
+# same trap that made httplib's line necessary.
+#
+# It cannot be a plain find_dependency, though: vcpkg's unofficial-sodium
+# config resolves the library through `_VCPKG_INSTALLED_DIR`, a variable only
+# the vcpkg toolchain sets. A consumer who points CMAKE_PREFIX_PATH at a vcpkg
+# tree without using its toolchain — which is exactly what tests/install_test
+# does — gets a target with no IMPORTED_LOCATION and a configure-time failure
+# that names neither libsodium nor the reason. So: try the config, and if what
+# comes back is unusable, find the library the ordinary way.
+find_package(unofficial-sodium CONFIG QUIET)
+if(TARGET unofficial-sodium::sodium)
+    get_target_property(_vgi_rpc_sodium_loc unofficial-sodium::sodium IMPORTED_LOCATION)
+    get_target_property(_vgi_rpc_sodium_cfgs unofficial-sodium::sodium IMPORTED_CONFIGURATIONS)
+    if(NOT _vgi_rpc_sodium_loc AND NOT _vgi_rpc_sodium_cfgs)
+        # Present but unusable. Point it at a real file.
+        find_library(VGI_RPC_SODIUM_LIBRARY NAMES sodium libsodium REQUIRED)
+        set_target_properties(unofficial-sodium::sodium PROPERTIES
+            IMPORTED_LOCATION "${VGI_RPC_SODIUM_LIBRARY}")
+    endif()
+    unset(_vgi_rpc_sodium_loc)
+    unset(_vgi_rpc_sodium_cfgs)
+else()
+    find_library(VGI_RPC_SODIUM_LIBRARY NAMES sodium libsodium REQUIRED)
+    add_library(unofficial-sodium::sodium UNKNOWN IMPORTED)
+    set_target_properties(unofficial-sodium::sodium PROPERTIES
+        IMPORTED_LOCATION "${VGI_RPC_SODIUM_LIBRARY}")
+endif()
 
 include("${CMAKE_CURRENT_LIST_DIR}/vgi_rpc-targets.cmake")
 

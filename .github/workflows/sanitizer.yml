@@ -35,6 +35,11 @@ jobs:
           git -C vcpkg checkout 05442024c3fda64320bd25d2251cc9807b84fb6f
           ./vcpkg/bootstrap-vcpkg.sh -disableMetrics
 
+      # vcpkg builds libsodium through its autotools script; the runners ship
+      # libtool but not autoconf/automake, and the port fails at configure time.
+      - name: Install autotools (libsodium)
+        run: sudo apt-get update && sudo apt-get install -y autoconf automake libtool
+
       # Instrumented builds are the slowest of the three workflows, so this is
       # where a warm compiler cache pays back most.
       - name: ccache
