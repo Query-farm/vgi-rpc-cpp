@@ -372,7 +372,8 @@ private:
                             AuthReason reason) const;
 
     void handle_health(const httplib::Request& req, httplib::Response& res) const;
-    void handle_introspect(const httplib::Request& req, httplib::Response& res);
+    void handle_introspect(const httplib::Request& req, httplib::Response& res,
+                           const std::string& request_body);
     void handle_session_delete(const httplib::Request& req, httplib::Response& res);
     void handle_rpc(const httplib::Request& req, httplib::Response& res,
                     const std::string& request_body);
@@ -765,7 +766,8 @@ void HttpServer::handle_health(const httplib::Request& req, httplib::Response& r
     }
 }
 
-void HttpServer::handle_introspect(const httplib::Request& req, httplib::Response& res) {
+void HttpServer::handle_introspect(const httplib::Request& req, httplib::Response& res,
+                                   const std::string& request_body) {
     stamp_common(req, res, random_hex(16));
 
     if (!cfg_.token_introspection) {
@@ -789,7 +791,7 @@ void HttpServer::handle_introspect(const httplib::Request& req, httplib::Respons
 
     std::string token;
     try {
-        auto body = nlohmann::json::parse(req.body);
+        auto body = nlohmann::json::parse(request_body);
         token = body.value("token", "");
     } catch (const std::exception&) {
         res.status = 404;
@@ -1447,8 +1449,44 @@ void HttpServer::run() {
 
     // Always routed, even when disabled: a caller must get a definitive answer
     // rather than whatever a generic route happens to produce.
-    auto introspect = [this](const httplib::Request& req, httplib::Response& res) {
-        handle_introspect(req, res);
+    // cpp-httplib keeps ordinary POST handlers and ContentReader POST handlers
+    // in separate tables, and consults the latter first.  Register framework
+    // POST endpoints as ContentReader handlers too, otherwise the catch-all RPC
+    // route below wins and rejects their JSON/empty bodies as non-Arrow media.
+    auto introspect = [this](const httplib::Request& req, httplib::Response& res,
+                             const httplib::ContentReader& reader) {
+        std::exception_ptr serve_start_error;
+        try {
+            rpc_.notify_serve_start(TransportKind::HTTP);
+        } catch (...) {
+            serve_start_error = std::current_exception();
+        }
+
+        const int64_t cap = cfg_.max_request_bytes;
+        std::string body;
+        bool decoded_too_large = false;
+        const bool read = reader([&](const char* data, size_t size) {
+            if (cap >= 0 && (size > static_cast<size_t>(cap) ||
+                             body.size() > static_cast<size_t>(cap) - size)) {
+                decoded_too_large = true;
+                return false;
+            }
+            body.append(data, size);
+            return true;
+        });
+        if (serve_start_error) std::rethrow_exception(serve_start_error);
+        if (!read) {
+            stamp_common(req, res, random_hex(16));
+            if (decoded_too_large || res.status == 413) {
+                res.status = 413;
+                res.set_content("Request body exceeds VGI-Max-Request-Bytes", "text/plain");
+            } else if (res.status < 400) {
+                res.status = 400;
+                res.set_content("Invalid compressed request body", "text/plain");
+            }
+            return;
+        }
+        handle_introspect(req, res, body);
     };
     for (const std::string& p :
          {std::string("/__introspect_token__"), cfg_.prefix + "/__introspect_token__"}) {
@@ -1458,7 +1496,20 @@ void HttpServer::run() {
     if (cfg_.test_drain_endpoint) {
         // Conformance affordance: flip the drain flag over the wire, because
         // the alternative — SIGTERM — kills the worker the test is driving.
-        svr.Post("/__test_drain__", [this](const httplib::Request&, httplib::Response& res) {
+        svr.Post("/__test_drain__", [this](const httplib::Request&, httplib::Response& res,
+                                           const httplib::ContentReader& reader) {
+            std::exception_ptr serve_start_error;
+            try {
+                rpc_.notify_serve_start(TransportKind::HTTP);
+            } catch (...) {
+                serve_start_error = std::current_exception();
+            }
+            const bool read = reader([](const char*, size_t) { return true; });
+            if (serve_start_error) std::rethrow_exception(serve_start_error);
+            if (!read) {
+                if (res.status < 400) res.status = 400;
+                return;
+            }
             sessions_.drain();
             res.status = 204;
         });
