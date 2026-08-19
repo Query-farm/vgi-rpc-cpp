@@ -178,6 +178,7 @@ private:
 };
 
 class HttpExchangeSession;
+class HttpStreamSession;
 class HttpClientState;
 class HttpClient;
 
@@ -217,8 +218,8 @@ public:
 
     // Compatibility adapter. New code should use builder(), which exposes TLS,
     // retry, authentication and per-call controls without growing this ABI.
-    [[deprecated("use HttpClient::builder(base_url).config(config).build()")]]
-    explicit HttpClient(std::string base_url, HttpClientConfig config = {});
+    [[deprecated("use HttpClient::builder(base_url).config(config).build()")]] explicit HttpClient(
+        std::string base_url, HttpClientConfig config = {});
     ~HttpClient();
 
     HttpClient(const HttpClient&) = delete;
@@ -246,6 +247,25 @@ public:
                                       std::shared_ptr<arrow::Schema> output_schema,
                                       const CallOptions& options = {}) const;
 
+    // Initialize a producer stream. Application batches emitted during init
+    // are queued and returned before the first continuation request.
+    HttpStreamSession open_producer(const std::string& method, const AnnotatedBatch& request,
+                                    std::shared_ptr<arrow::Schema> output_schema,
+                                    bool has_header = false, const CallOptions& options = {}) const;
+
+    // General stream API for exchanges that may terminate without a final
+    // data batch. Existing open_exchange remains the strict compatibility API.
+    HttpStreamSession open_stream_exchange(const std::string& method, const AnnotatedBatch& request,
+                                           std::shared_ptr<arrow::Schema> input_schema,
+                                           std::shared_ptr<arrow::Schema> output_schema,
+                                           bool has_header = false,
+                                           const CallOptions& options = {}) const;
+
+    // Resume a token-addressed HTTP producer without replaying /init.
+    HttpStreamSession resume_stream(const std::string& method,
+                                    const std::vector<uint8_t>& resume_token,
+                                    std::shared_ptr<arrow::Schema> output_schema) const;
+
 private:
     friend class HttpClientBuilder;
     explicit HttpClient(std::shared_ptr<HttpClientState> state);
@@ -271,6 +291,47 @@ private:
     friend class HttpClient;
     class Impl;
     explicit HttpExchangeSession(std::unique_ptr<Impl> impl);
+    std::unique_ptr<Impl> impl_;
+};
+
+enum class HttpStreamKind {
+    PRODUCER,
+    EXCHANGE,
+};
+
+struct HttpStreamBatch {
+    AnnotatedBatch value;
+    // Opaque portable blob containing the cursor and optional call-state.
+    // It may be persisted and supplied to resume_stream on another client.
+    std::vector<uint8_t> resume_token;
+};
+
+class VGI_RPC_EXPORT HttpStreamSession {
+public:
+    class Impl;
+    ~HttpStreamSession();
+    HttpStreamSession(HttpStreamSession&&) noexcept;
+    HttpStreamSession& operator=(HttpStreamSession&&) noexcept;
+    HttpStreamSession(const HttpStreamSession&) = delete;
+    HttpStreamSession& operator=(const HttpStreamSession&) = delete;
+
+    HttpStreamKind kind() const noexcept;
+    const std::optional<AnnotatedBatch>& header() const noexcept;
+    bool finished() const noexcept;
+
+    std::optional<AnnotatedBatch> tick(const CallOptions& options = {});
+    std::optional<HttpStreamBatch> next_with_token(const CallOptions& options = {});
+    std::optional<AnnotatedBatch> exchange(const AnnotatedBatch& input,
+                                           const CallOptions& options = {});
+    void seek_to_token(const std::vector<uint8_t>& resume_token);
+
+    // Local-only close. cancel() makes one best-effort cancellation request.
+    void close() noexcept;
+    void cancel() noexcept;
+
+private:
+    friend class HttpClient;
+    explicit HttpStreamSession(std::unique_ptr<Impl> impl);
     std::unique_ptr<Impl> impl_;
 };
 

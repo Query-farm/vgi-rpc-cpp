@@ -20,6 +20,8 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <cstring>
+#include <deque>
 #include <limits>
 #include <mutex>
 #include <sstream>
@@ -177,6 +179,7 @@ std::string safe_error_detail(std::string value, size_t limit) {
 
 struct DecodedResponse {
     std::shared_ptr<arrow::Schema> schema;
+    std::optional<AnnotatedBatch> header;
     std::vector<AnnotatedBatch> data;
     std::vector<AnnotatedBatch> control;
 };
@@ -185,6 +188,8 @@ enum class ResponseShape {
     UNARY,
     EXCHANGE_INIT,
     EXCHANGE_TURN,
+    STREAM_INIT,
+    PRODUCER_TURN,
 };
 
 RpcRemoteError remote_error(const AnnotatedBatch& batch, int status) {
@@ -207,72 +212,112 @@ RpcRemoteError remote_error(const AnnotatedBatch& batch, int status) {
 }
 
 DecodedResponse decode_response(const BoundedHttpResponse& response, const HttpClientConfig& config,
-                                ResponseShape shape) {
+                                ResponseShape shape, bool has_header = false) {
     // IPC arrays may retain slices of their source buffer.  FromString owns a
     // copy whose shared lifetime follows those slices; wrapping response.body
     // would leave returned batches pointing at a destroyed std::string.
     auto buffer = arrow::Buffer::FromString(response.body);
     auto input = std::make_shared<arrow::io::BufferReader>(buffer);
-    std::optional<IpcStreamContents> contents;
-    try {
-        contents = read_ipc_stream(input);
-    } catch (const std::exception& error) {
-        throw HttpClientError(std::string("invalid Arrow IPC response: ") + error.what(),
-                              response.status);
-    }
-    if (!contents) {
-        throw HttpClientError("HTTP RPC response contained no Arrow IPC stream", response.status);
-    }
-
     DecodedResponse decoded;
-    decoded.schema = contents->schema;
-    for (auto& batch : contents->batches) {
-        const auto& metadata = batch.custom_metadata;
-        const auto has = [&](const char* key) { return metadata && metadata->FindKey(key) >= 0; };
-
-        // Protocol controls take precedence over row count.  In particular,
-        // a malformed non-empty pointer must not become application data just
-        // because classify_batch's general-purpose heuristic sees rows first.
-        if (batch.batch && batch.batch->num_rows() == 0 && has(keys::LOG_LEVEL) &&
-            has(keys::LOG_MESSAGE)) {
-            if (get_metadata_value(metadata, keys::LOG_LEVEL) == "EXCEPTION") {
-                throw remote_error(batch, response.status);
-            }
-            if (config.on_log) config.on_log(batch);
-            continue;
-        }
-        if (has(keys::LOCATION)) {
-            throw HttpClientError(
-                "external-location response batches are not supported by HttpClient",
-                response.status);
-        }
-        if (has(keys::SHM_OFFSET)) {
-            throw HttpClientError("shared-memory response batches are invalid over HTTP",
-                                  response.status);
-        }
-        if (has(keys::STREAM_STATE)) {
-            throw HttpClientError("legacy stream-state control batch is unsupported",
-                                  response.status);
-        }
-
-        const bool has_cursor = has(keys::STATE_B64);
-        if (has_cursor && shape == ResponseShape::EXCHANGE_INIT) {
-            if (!batch.batch || batch.batch->num_rows() != 0) {
-                throw HttpClientError("exchange init returned a non-empty state control batch",
+    auto read_stream = [&]() -> IpcStreamContents {
+        try {
+            auto contents = read_ipc_stream(input);
+            if (!contents) {
+                throw HttpClientError("HTTP RPC response contained no Arrow IPC stream",
                                       response.status);
             }
-            decoded.control.push_back(std::move(batch));
-            continue;
-        }
-        if (has_cursor && shape == ResponseShape::UNARY) {
-            throw HttpClientError("unexpected stream control metadata in unary response",
+            return std::move(*contents);
+        } catch (const HttpClientError&) {
+            throw;
+        } catch (const std::exception& error) {
+            throw HttpClientError(std::string("invalid Arrow IPC response: ") + error.what(),
                                   response.status);
         }
+    };
 
-        // During an exchange turn the cursor is attached to the application
-        // batch.  It remains data even when it contains zero rows; zero rows
-        // are not an end-of-stream marker in the HTTP exchange protocol.
-        decoded.data.push_back(std::move(batch));
+    auto process_batches = [&](IpcStreamContents contents, ResponseShape stream_shape,
+                               bool header_stream) {
+        if (header_stream) {
+            std::vector<AnnotatedBatch> header_data;
+            for (auto& batch : contents.batches) {
+                const auto level = get_metadata_value(batch.custom_metadata, keys::LOG_LEVEL);
+                if (batch.batch && batch.batch->num_rows() == 0 && !level.empty()) {
+                    if (level == "EXCEPTION") throw remote_error(batch, response.status);
+                    if (config.on_log) config.on_log(batch);
+                    continue;
+                }
+                header_data.push_back(std::move(batch));
+            }
+            if (header_data.size() != 1) {
+                throw HttpClientError("stream header response must contain exactly one data batch",
+                                      response.status);
+            }
+            decoded.header = std::move(header_data.front());
+            return;
+        }
+
+        decoded.schema = contents.schema;
+        for (auto& batch : contents.batches) {
+            const auto& metadata = batch.custom_metadata;
+            const auto has = [&](const char* key) {
+                return metadata && metadata->FindKey(key) >= 0;
+            };
+
+            // Protocol controls take precedence over row count.  In particular,
+            // a malformed non-empty pointer must not become application data just
+            // because classify_batch's general-purpose heuristic sees rows first.
+            if (batch.batch && batch.batch->num_rows() == 0 && has(keys::LOG_LEVEL) &&
+                has(keys::LOG_MESSAGE)) {
+                if (get_metadata_value(metadata, keys::LOG_LEVEL) == "EXCEPTION") {
+                    throw remote_error(batch, response.status);
+                }
+                if (config.on_log) config.on_log(batch);
+                continue;
+            }
+            if (has(keys::LOCATION)) {
+                throw HttpClientError(
+                    "external-location response batches are not supported by HttpClient",
+                    response.status);
+            }
+            if (has(keys::SHM_OFFSET)) {
+                throw HttpClientError("shared-memory response batches are invalid over HTTP",
+                                      response.status);
+            }
+            if (has(keys::STREAM_STATE)) {
+                throw HttpClientError("legacy stream-state control batch is unsupported",
+                                      response.status);
+            }
+
+            const bool has_cursor = has(keys::STATE_B64);
+            if (has_cursor && (stream_shape == ResponseShape::EXCHANGE_INIT ||
+                               stream_shape == ResponseShape::STREAM_INIT ||
+                               stream_shape == ResponseShape::PRODUCER_TURN)) {
+                if (!batch.batch || batch.batch->num_rows() != 0) {
+                    throw HttpClientError("exchange init returned a non-empty state control batch",
+                                          response.status);
+                }
+                decoded.control.push_back(std::move(batch));
+                continue;
+            }
+            if (has_cursor && stream_shape == ResponseShape::UNARY) {
+                throw HttpClientError("unexpected stream control metadata in unary response",
+                                      response.status);
+            }
+
+            // During an exchange turn the cursor is attached to the application
+            // batch.  It remains data even when it contains zero rows; zero rows
+            // are not an end-of-stream marker in the HTTP exchange protocol.
+            decoded.data.push_back(std::move(batch));
+        }
+    };
+
+    if (has_header) process_batches(read_stream(), shape, true);
+    process_batches(read_stream(), shape, false);
+
+    const int64_t consumed = unwrap(input->Tell(), "cannot inspect HTTP RPC response position");
+    if (consumed != buffer->size()) {
+        throw HttpClientError("HTTP RPC response contains an unexpected trailing IPC stream",
+                              response.status);
     }
     if (response.rpc_error) {
         throw HttpClientError("worker set X-VGI-RPC-Error without an exception batch",
@@ -603,6 +648,34 @@ std::string logical_request_id(const CallOptions& options) {
             "CallOptions request_id must be 1-256 characters without CR/LF");
     }
     return *options.request_id;
+}
+
+std::vector<uint8_t> pack_resume_token(const std::string& cursor, const std::string& call_state) {
+    if (cursor.size() > std::numeric_limits<uint32_t>::max()) {
+        throw HttpClientError("stream cursor is too large to export");
+    }
+    const uint32_t size = static_cast<uint32_t>(cursor.size());
+    std::vector<uint8_t> token(4 + cursor.size() + call_state.size());
+    token[0] = static_cast<uint8_t>(size);
+    token[1] = static_cast<uint8_t>(size >> 8);
+    token[2] = static_cast<uint8_t>(size >> 16);
+    token[3] = static_cast<uint8_t>(size >> 24);
+    std::memcpy(token.data() + 4, cursor.data(), cursor.size());
+    std::memcpy(token.data() + 4 + cursor.size(), call_state.data(), call_state.size());
+    return token;
+}
+
+std::pair<std::string, std::string> unpack_resume_token(const std::vector<uint8_t>& token) {
+    if (token.size() < 4) throw std::invalid_argument("resume token is too short");
+    const uint32_t cursor_size =
+        static_cast<uint32_t>(token[0]) | (static_cast<uint32_t>(token[1]) << 8) |
+        (static_cast<uint32_t>(token[2]) << 16) | (static_cast<uint32_t>(token[3]) << 24);
+    if (static_cast<uint64_t>(cursor_size) + 4 > token.size()) {
+        throw std::invalid_argument("resume token cursor length exceeds the token size");
+    }
+    const auto* bytes = reinterpret_cast<const char*>(token.data());
+    return {std::string(bytes + 4, cursor_size),
+            std::string(bytes + 4 + cursor_size, token.size() - 4 - cursor_size)};
 }
 
 void validate_retry_policy(const RetryPolicy& policy) {
@@ -1406,6 +1479,305 @@ void HttpExchangeSession::cancel() noexcept {
 
 bool HttpExchangeSession::active() const noexcept {
     return impl_ && impl_->is_active;
+}
+
+class HttpStreamSession::Impl {
+public:
+    std::shared_ptr<HttpClientState> state;
+    std::string method;
+    HttpStreamKind stream_kind = HttpStreamKind::PRODUCER;
+    std::shared_ptr<arrow::Schema> input_schema;
+    std::shared_ptr<arrow::Schema> output_schema;
+    std::optional<AnnotatedBatch> stream_header;
+    std::deque<AnnotatedBatch> pending;
+    std::string cursor;
+    std::string call_state;
+    bool is_finished = false;
+    bool is_closed = false;
+
+    void update_controls(const DecodedResponse& decoded) {
+        cursor.clear();
+        for (const auto& batch : decoded.control) {
+            const std::string next = get_metadata_value(batch.custom_metadata, keys::STATE_B64);
+            if (!next.empty()) cursor = next;
+            const std::string call =
+                get_metadata_value(batch.custom_metadata, keys::CALL_STATE_B64);
+            if (!call.empty()) call_state = call;
+        }
+        if (cursor.empty()) is_finished = true;
+    }
+
+    std::shared_ptr<arrow::KeyValueMetadata> continuation_metadata(const std::string& request_id,
+                                                                   bool cancel = false) const {
+        auto metadata = std::make_shared<arrow::KeyValueMetadata>();
+        replace_metadata(metadata, keys::REQUEST_ID, request_id);
+        replace_metadata(metadata, keys::STATE_B64, cursor);
+        if (!call_state.empty()) replace_metadata(metadata, keys::CALL_STATE_B64, call_state);
+        if (cancel) replace_metadata(metadata, keys::CANCEL, "1");
+        return metadata;
+    }
+};
+
+namespace {
+
+std::unique_ptr<HttpStreamSession::Impl> make_http_stream_impl(
+    const std::shared_ptr<HttpClientState>& state, std::string method, HttpStreamKind kind,
+    std::shared_ptr<arrow::Schema> input_schema, std::shared_ptr<arrow::Schema> output_schema,
+    DecodedResponse decoded) {
+    if (!schema_equals(decoded.schema, output_schema)) {
+        throw HttpClientError(
+            schema_mismatch("stream init response", output_schema, decoded.schema));
+    }
+    auto impl = std::make_unique<HttpStreamSession::Impl>();
+    impl->state = state;
+    impl->method = std::move(method);
+    impl->stream_kind = kind;
+    impl->input_schema = std::move(input_schema);
+    impl->output_schema = std::move(output_schema);
+    impl->stream_header = std::move(decoded.header);
+    if (impl->stream_header) {
+        impl->stream_header->custom_metadata =
+            strip_transport_metadata(impl->stream_header->custom_metadata);
+    }
+    for (auto& batch : decoded.data) {
+        batch.custom_metadata = strip_transport_metadata(batch.custom_metadata);
+        impl->pending.push_back(std::move(batch));
+    }
+    impl->update_controls(decoded);
+    return impl;
+}
+
+}  // namespace
+
+HttpStreamSession HttpClient::open_producer(const std::string& method,
+                                            const AnnotatedBatch& request,
+                                            std::shared_ptr<arrow::Schema> output_schema,
+                                            bool has_header, const CallOptions& options) const {
+    validate_method(method);
+    if (!state_) throw HttpClientError("HttpClient is moved from");
+    if (!output_schema) throw std::invalid_argument("producer output schema must not be null");
+    const std::string request_id = logical_request_id(options);
+    const auto metadata = request_metadata(request.custom_metadata, method,
+                                           state_->config.protocol_version, request_id);
+    const auto response = state_->post(method, state_->path(method, "/init"),
+                                       encode_ipc(request, metadata, state_->request_cap()),
+                                       request_id, options, true);
+    auto decoded =
+        decode_response(response, state_->config, ResponseShape::STREAM_INIT, has_header);
+    return HttpStreamSession(make_http_stream_impl(state_, method, HttpStreamKind::PRODUCER,
+                                                   empty_schema(), std::move(output_schema),
+                                                   std::move(decoded)));
+}
+
+HttpStreamSession HttpClient::open_stream_exchange(const std::string& method,
+                                                   const AnnotatedBatch& request,
+                                                   std::shared_ptr<arrow::Schema> input_schema,
+                                                   std::shared_ptr<arrow::Schema> output_schema,
+                                                   bool has_header,
+                                                   const CallOptions& options) const {
+    validate_method(method);
+    if (!state_) throw HttpClientError("HttpClient is moved from");
+    if (!input_schema || !output_schema) {
+        throw std::invalid_argument("exchange input and output schemas must not be null");
+    }
+    const std::string request_id = logical_request_id(options);
+    const auto metadata = request_metadata(request.custom_metadata, method,
+                                           state_->config.protocol_version, request_id);
+    const auto response = state_->post(method, state_->path(method, "/init"),
+                                       encode_ipc(request, metadata, state_->request_cap()),
+                                       request_id, options, true);
+    auto decoded =
+        decode_response(response, state_->config, ResponseShape::STREAM_INIT, has_header);
+    if (!decoded.data.empty()) {
+        throw HttpClientError("exchange init unexpectedly returned application data");
+    }
+    auto impl =
+        make_http_stream_impl(state_, method, HttpStreamKind::EXCHANGE, std::move(input_schema),
+                              std::move(output_schema), std::move(decoded));
+    if (impl->cursor.empty()) {
+        throw HttpClientError("exchange init response did not contain a continuation token");
+    }
+    impl->is_finished = false;
+    return HttpStreamSession(std::move(impl));
+}
+
+HttpStreamSession HttpClient::resume_stream(const std::string& method,
+                                            const std::vector<uint8_t>& resume_token,
+                                            std::shared_ptr<arrow::Schema> output_schema) const {
+    validate_method(method);
+    if (!state_) throw HttpClientError("HttpClient is moved from");
+    if (!output_schema) throw std::invalid_argument("producer output schema must not be null");
+    auto [cursor, call_state] = unpack_resume_token(resume_token);
+    if (cursor.empty()) throw std::invalid_argument("resume token contains an empty cursor");
+    auto impl = std::make_unique<HttpStreamSession::Impl>();
+    impl->state = state_;
+    impl->method = method;
+    impl->stream_kind = HttpStreamKind::PRODUCER;
+    impl->input_schema = empty_schema();
+    impl->output_schema = std::move(output_schema);
+    impl->cursor = std::move(cursor);
+    impl->call_state = std::move(call_state);
+    return HttpStreamSession(std::move(impl));
+}
+
+HttpStreamSession::HttpStreamSession(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
+HttpStreamSession::~HttpStreamSession() {
+    close();
+}
+HttpStreamSession::HttpStreamSession(HttpStreamSession&&) noexcept = default;
+HttpStreamSession& HttpStreamSession::operator=(HttpStreamSession&& other) noexcept {
+    if (this != &other) {
+        close();
+        impl_ = std::move(other.impl_);
+    }
+    return *this;
+}
+
+HttpStreamKind HttpStreamSession::kind() const noexcept {
+    return impl_ ? impl_->stream_kind : HttpStreamKind::PRODUCER;
+}
+
+const std::optional<AnnotatedBatch>& HttpStreamSession::header() const noexcept {
+    static const std::optional<AnnotatedBatch> empty;
+    return impl_ ? impl_->stream_header : empty;
+}
+
+bool HttpStreamSession::finished() const noexcept {
+    return !impl_ || impl_->is_finished || impl_->is_closed;
+}
+
+std::optional<AnnotatedBatch> HttpStreamSession::tick(const CallOptions& options) {
+    if (!impl_ || impl_->is_closed) throw HttpClientError("stream session is closed");
+    if (impl_->stream_kind != HttpStreamKind::PRODUCER) {
+        throw std::logic_error("tick is only valid for producer streams");
+    }
+    while (true) {
+        if (!impl_->pending.empty()) {
+            auto value = std::move(impl_->pending.front());
+            impl_->pending.pop_front();
+            return value;
+        }
+        if (impl_->is_finished || impl_->cursor.empty()) {
+            impl_->is_finished = true;
+            return std::nullopt;
+        }
+        const std::string request_id = logical_request_id(options);
+        auto metadata = impl_->continuation_metadata(request_id);
+        const AnnotatedBatch request = AnnotatedBatch::data(make_empty_batch(empty_schema()));
+        const auto response = impl_->state->post(
+            impl_->method, impl_->state->path(impl_->method, "/exchange"),
+            encode_ipc(request, metadata, impl_->state->request_cap()), request_id, options, true);
+        auto decoded =
+            decode_response(response, impl_->state->config, ResponseShape::PRODUCER_TURN);
+        if (!schema_equals(decoded.schema, impl_->output_schema)) {
+            throw HttpClientError(
+                schema_mismatch("producer response", impl_->output_schema, decoded.schema));
+        }
+        for (auto& batch : decoded.data) {
+            batch.custom_metadata = strip_transport_metadata(batch.custom_metadata);
+            impl_->pending.push_back(std::move(batch));
+        }
+        impl_->update_controls(decoded);
+    }
+}
+
+std::optional<HttpStreamBatch> HttpStreamSession::next_with_token(const CallOptions& options) {
+    if (impl_ && impl_->pending.size() > 1) {
+        throw HttpClientError(
+            "next_with_token requires at most one application batch per response");
+    }
+    auto value = tick(options);
+    if (!value) return std::nullopt;
+    if (impl_->pending.size() > 0) {
+        throw HttpClientError(
+            "next_with_token requires at most one application batch per response");
+    }
+    HttpStreamBatch result;
+    result.value = std::move(*value);
+    if (!impl_->cursor.empty()) {
+        result.resume_token = pack_resume_token(impl_->cursor, impl_->call_state);
+    }
+    return result;
+}
+
+std::optional<AnnotatedBatch> HttpStreamSession::exchange(const AnnotatedBatch& input,
+                                                          const CallOptions& options) {
+    if (!impl_ || impl_->is_closed || impl_->is_finished) {
+        throw HttpClientError("exchange stream session is closed");
+    }
+    if (impl_->stream_kind != HttpStreamKind::EXCHANGE) {
+        throw std::logic_error("exchange is only valid for exchange streams");
+    }
+    if (!input.batch) throw std::invalid_argument("exchange input batch must not be null");
+    if (!schema_equals(input.batch->schema(), impl_->input_schema)) {
+        throw std::invalid_argument(
+            schema_mismatch("exchange input", impl_->input_schema, input.batch->schema()));
+    }
+    const std::string request_id = logical_request_id(options);
+    auto metadata = sanitized_metadata(input.custom_metadata);
+    replace_metadata(metadata, keys::REQUEST_ID, request_id);
+    replace_metadata(metadata, keys::STATE_B64, impl_->cursor);
+    if (!impl_->call_state.empty()) {
+        replace_metadata(metadata, keys::CALL_STATE_B64, impl_->call_state);
+    }
+    impl_->is_closed = true;
+    const auto response = impl_->state->post(
+        impl_->method, impl_->state->path(impl_->method, "/exchange"),
+        encode_ipc(input, metadata, impl_->state->request_cap()), request_id, options, false);
+    auto decoded = decode_response(response, impl_->state->config, ResponseShape::EXCHANGE_TURN);
+    if (!schema_equals(decoded.schema, impl_->output_schema)) {
+        throw HttpClientError(
+            schema_mismatch("exchange response", impl_->output_schema, decoded.schema));
+    }
+    if (decoded.data.empty()) {
+        impl_->is_finished = true;
+        return std::nullopt;
+    }
+    if (decoded.data.size() != 1) {
+        throw HttpClientError("exchange response must contain at most one data batch");
+    }
+    auto output = std::move(decoded.data.front());
+    impl_->cursor = get_metadata_value(output.custom_metadata, keys::STATE_B64);
+    impl_->is_finished = impl_->cursor.empty();
+    impl_->is_closed = false;
+    output.custom_metadata = strip_transport_metadata(output.custom_metadata);
+    return output;
+}
+
+void HttpStreamSession::seek_to_token(const std::vector<uint8_t>& resume_token) {
+    if (!impl_ || impl_->is_closed) throw HttpClientError("stream session is closed");
+    if (impl_->stream_kind != HttpStreamKind::PRODUCER) {
+        throw std::logic_error("seek_to_token is only valid for producer streams");
+    }
+    auto [cursor, call_state] = unpack_resume_token(resume_token);
+    if (cursor.empty()) throw std::invalid_argument("resume token contains an empty cursor");
+    impl_->pending.clear();
+    impl_->cursor = std::move(cursor);
+    impl_->call_state = std::move(call_state);
+    impl_->is_finished = false;
+}
+
+void HttpStreamSession::close() noexcept {
+    if (!impl_) return;
+    impl_->is_closed = true;
+    impl_->pending.clear();
+}
+
+void HttpStreamSession::cancel() noexcept {
+    if (!impl_ || impl_->is_closed || impl_->is_finished || impl_->cursor.empty()) {
+        close();
+        return;
+    }
+    try {
+        const std::string request_id = random_hex(16);
+        auto metadata = impl_->continuation_metadata(request_id, true);
+        const AnnotatedBatch request = AnnotatedBatch::data(make_empty_batch(empty_schema()));
+        (void)impl_->state->post(impl_->method, impl_->state->path(impl_->method, "/exchange"),
+                                 encode_ipc(request, metadata, impl_->state->request_cap()),
+                                 request_id, CallOptions{}, false);
+    } catch (const std::exception&) {
+    }
+    close();
 }
 
 }  // namespace vgi_rpc

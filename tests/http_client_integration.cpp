@@ -55,6 +55,26 @@ std::shared_ptr<arrow::Schema> typed_schema() {
     });
 }
 
+std::shared_ptr<arrow::Schema> producer_schema() {
+    return arrow::schema({arrow::field("index", arrow::int64(), false),
+                          arrow::field("payload", arrow::binary(), false)});
+}
+
+AnnotatedBatch producer_request(int64_t count, int64_t payload_bytes) {
+    arrow::Int64Builder count_builder;
+    arrow::Int64Builder payload_builder;
+    VGI_RPC_THROW_NOT_OK(count_builder.Append(count));
+    VGI_RPC_THROW_NOT_OK(payload_builder.Append(payload_bytes));
+    auto schema = arrow::schema({arrow::field("count", arrow::int64(), false),
+                                 arrow::field("payload_bytes", arrow::int64(), false)});
+    return AnnotatedBatch::data(arrow::RecordBatch::Make(
+        schema, 1, {unwrap(count_builder.Finish()), unwrap(payload_builder.Finish())}));
+}
+
+int64_t producer_index(const AnnotatedBatch& value) {
+    return std::static_pointer_cast<arrow::Int64Array>(value.batch->column(0))->Value(0);
+}
+
 std::shared_ptr<arrow::RecordBatch> null_batch(const std::shared_ptr<arrow::Schema>& schema,
                                                int64_t rows) {
     std::vector<std::shared_ptr<arrow::Array>> arrays;
@@ -141,7 +161,7 @@ AnnotatedBatch exchange_and_require_equal(HttpExchangeSession& session,
 #ifndef _WIN32
 class PythonWorker {
 public:
-    PythonWorker() {
+    explicit PythonWorker(std::optional<int> producer_turn_bytes = std::nullopt) {
         int output[2];
         if (::pipe(output) != 0) throw std::runtime_error("cannot create worker discovery pipe");
         pid_ = ::fork();
@@ -152,8 +172,14 @@ public:
             ::close(output[1]);
             const char* python = std::getenv("VGI_RPC_PYTHON");
             if (!python || !*python) python = "python3";
-            ::execlp(python, python, "-m", "vgi_rpc.conformance.client_worker", "--http", "0",
-                     static_cast<char*>(nullptr));
+            if (producer_turn_bytes) {
+                const std::string turn_bytes = std::to_string(*producer_turn_bytes);
+                ::execlp(python, python, "-m", "vgi_rpc.conformance.client_worker", "--http", "0",
+                         "--producer-turn-bytes", turn_bytes.c_str(), static_cast<char*>(nullptr));
+            } else {
+                ::execlp(python, python, "-m", "vgi_rpc.conformance.client_worker", "--http", "0",
+                         static_cast<char*>(nullptr));
+            }
             _exit(127);
         }
         ::close(output[1]);
@@ -248,6 +274,62 @@ int main() {
         const auto description = client.describe();
         require(description.method("typed_exchange") != nullptr,
                 "native HTTP describe did not parse the Python worker protocol");
+
+        const auto producer_output = producer_schema();
+        auto producer =
+            client.open_producer("producer_sequence", producer_request(3, 4), producer_output);
+        auto first = producer.next_with_token();
+        require(first && producer_index(first->value) == 0 && !first->resume_token.empty(),
+                "producer init batch or resume token was lost");
+        producer.close();
+        auto resumed =
+            client.resume_stream("producer_sequence", first->resume_token, producer_output);
+        auto second = resumed.tick();
+        require(second && producer_index(*second) == 1,
+                "producer did not resume at the exported token");
+        auto third = resumed.tick();
+        require(third && producer_index(*third) == 2,
+                "producer continuation did not rotate its cursor");
+        require(!resumed.tick() && resumed.finished(),
+                "producer did not terminate locally after its terminal response");
+
+        auto zero =
+            client.open_producer("producer_zero_row_then_value", init_request(), producer_output);
+        auto zero_batch = zero.tick();
+        require(zero_batch && zero_batch->batch->num_rows() == 0,
+                "metadata-free zero-row producer data was swallowed as control");
+        auto after_zero = zero.tick();
+        require(after_zero && producer_index(*after_zero) == 7,
+                "producer did not continue after zero-row application data");
+        require(!zero.tick(), "zero-row producer did not terminate");
+
+        auto emitted =
+            client.open_producer("producer_emit_and_finish", init_request(), producer_output);
+        auto terminal_value = emitted.tick();
+        require(terminal_value && producer_index(*terminal_value) == 99 && !emitted.tick(),
+                "emit-and-finish producer lost its terminal value");
+        auto empty = client.open_producer("producer_empty", init_request(), producer_output);
+        require(!empty.tick() && empty.finished(),
+                "empty producer did not terminate during initialization");
+
+        {
+            PythonWorker buffered_worker(16384);
+            require(buffered_worker.port() != 0,
+                    "buffered producer conformance worker is unavailable");
+            auto buffered_client =
+                HttpClient::builder("http://127.0.0.1:" + std::to_string(buffered_worker.port()))
+                    .config(config)
+                    .build();
+            auto buffered = buffered_client.open_producer(
+                "producer_sequence", producer_request(100, 1024), producer_output);
+            for (int64_t expected = 0; expected < 100; ++expected) {
+                auto value = buffered.tick();
+                require(value && producer_index(*value) == expected,
+                        "buffered producer dropped or reordered an init batch");
+            }
+            require(!buffered.tick() && buffered.finished(),
+                    "buffered producer did not reach its terminal response");
+        }
 
         auto session = client.open_exchange("typed_exchange", init_request(), schema, schema);
         // Caller-supplied protocol metadata cannot override the client's
