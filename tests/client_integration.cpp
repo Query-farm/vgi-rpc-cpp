@@ -227,11 +227,36 @@ void exercise_client(RpcClient& client, const std::string& transport, bool expec
             transport + ": client leaked a shared-memory allocation");
 }
 
-#ifndef _WIN32
 const char* python_executable() {
     const char* python = std::getenv("VGI_RPC_PYTHON");
     return python && *python ? python : "python3";
 }
+
+RpcClientOptions client_options() {
+    RpcClientOptions options;
+#ifndef _WIN32
+    options.shared_memory_bytes = 4 * 1024 * 1024;
+#endif
+    return options;
+}
+
+void test_stdio() {
+    SubprocessTransportOptions transport;
+    transport.stderr_mode = ClientStderrMode::DISCARD;
+    transport.close_grace = std::chrono::seconds(2);
+    transport.terminate_grace = std::chrono::seconds(2);
+    auto client = RpcClient::spawn(
+        {python_executable(), "-m", "vgi_rpc.conformance.client_worker", "--stdio"},
+        client_options(), transport);
+#ifdef _WIN32
+    exercise_client(client, "stdio", /*expect_shm=*/false);
+#else
+    exercise_client(client, "stdio", /*expect_shm=*/true);
+#endif
+    client.close();
+}
+
+#ifndef _WIN32
 
 class SocketWorker {
 public:
@@ -342,12 +367,6 @@ SocketTransportOptions socket_options() {
     return options;
 }
 
-RpcClientOptions client_options() {
-    RpcClientOptions options;
-    options.shared_memory_bytes = 4 * 1024 * 1024;
-    return options;
-}
-
 bool python_worker_available() {
     const pid_t pid = ::fork();
     if (pid < 0) return false;
@@ -375,18 +394,6 @@ bool python_worker_available() {
     while (::waitpid(pid, &status, 0) < 0 && errno == EINTR) {
     }
     return false;
-}
-
-void test_stdio() {
-    SubprocessTransportOptions transport;
-    transport.stderr_mode = ClientStderrMode::DISCARD;
-    transport.close_grace = std::chrono::seconds(2);
-    transport.terminate_grace = std::chrono::seconds(2);
-    auto client = RpcClient::spawn(
-        {python_executable(), "-m", "vgi_rpc.conformance.client_worker", "--stdio"},
-        client_options(), transport);
-    exercise_client(client, "stdio", /*expect_shm=*/true);
-    client.close();
 }
 
 void test_unix() {
@@ -438,8 +445,14 @@ void test_tcp() {
 
 int main() {
 #ifdef _WIN32
-    std::cerr << "raw Unix/TCP native-client conformance is POSIX-only\n";
-    return 77;
+    try {
+        test_stdio();
+        return 0;
+    } catch (const std::exception& error) {
+        std::cerr << "native Windows subprocess client integration failed: " << error.what()
+                  << '\n';
+        return 1;
+    }
 #else
     try {
         if (!python_worker_available()) {
