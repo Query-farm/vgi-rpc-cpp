@@ -22,6 +22,18 @@
 
 namespace vgi_rpc {
 
+// Coarse identity of the wire transport carrying a call.  Subprocess workers
+// use PIPE because they speak the same stdin/stdout framing as an in-process
+// pipe transport.
+enum class TransportKind {
+    PIPE,
+    HTTP,
+    UNIX,
+    TCP,
+};
+
+VGI_RPC_EXPORT const char* transport_kind_name(TransportKind kind) noexcept;
+
 // Sticky-session machinery for one request, installed by the HTTP transport
 // and absent everywhere else.  The other transports are single-process, so a
 // session that binds state to "this worker" would mean nothing there — the
@@ -45,12 +57,15 @@ struct StickySlot {
 class VGI_RPC_EXPORT CallContext {
 public:
     CallContext(std::shared_ptr<LogSink> sink, std::string server_id, std::string request_id);
+    CallContext(std::shared_ptr<LogSink> sink, std::string server_id, std::string request_id,
+                TransportKind transport_kind);
 
     void client_log(LogLevel level, std::string_view message, const nlohmann::json& extra = {});
     void client_log(const Message& msg);
 
     const std::string& server_id() const noexcept { return server_id_; }
     const std::string& request_id() const noexcept { return request_id_; }
+    TransportKind transport_kind() const noexcept { return transport_kind_; }
 
     std::shared_ptr<LogSink> log_sink() const noexcept { return sink_; }
 
@@ -79,6 +94,7 @@ private:
     std::shared_ptr<LogSink> sink_;
     std::string server_id_;
     std::string request_id_;
+    TransportKind transport_kind_ = TransportKind::PIPE;
     StickySlot* sticky_ = nullptr;
 };
 

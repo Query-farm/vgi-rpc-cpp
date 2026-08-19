@@ -5,6 +5,8 @@
 
 #include <functional>
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -105,6 +107,12 @@ public:
     // vgi_rpc.protocol_version so version-aware clients can discover it.
     ServerBuilder& protocol_version(std::string version);
 
+    // Install an optional process-local lifecycle hook.  It runs once, with
+    // the concrete transport kind, before that transport dispatches its first
+    // request.  A throwing hook leaves startup uncommitted so the next request
+    // retries it.
+    ServerBuilder& on_serve_start(std::function<void(TransportKind)> hook);
+
     // Enable the vgi_rpc.access JSONL access log, written to `path`.  One
     // record per completed call.  Empty path (the default) disables it.
     // `max_record_bytes` caps one emitted line; over-cap records shed fields
@@ -125,6 +133,7 @@ private:
     std::string protocol_version_;
     std::string access_log_path_;
     bool transport_options_enabled_ = false;
+    std::function<void(TransportKind)> on_serve_start_;
     int64_t access_log_max_record_bytes_ = kDefaultMaxRecordBytes;
 };
 
@@ -171,6 +180,16 @@ public:
     bool serve_one(const std::shared_ptr<arrow::io::InputStream>& input,
                    const std::shared_ptr<arrow::io::OutputStream>& output);
 
+    // Explicit-kind overload for raw-transport integrations.  The original
+    // overload remains source and binary compatible and means PIPE.
+    bool serve_one(const std::shared_ptr<arrow::io::InputStream>& input,
+                   const std::shared_ptr<arrow::io::OutputStream>& output,
+                   TransportKind transport_kind);
+
+    // Notify the lifecycle hook for a transport.  Public for custom transport
+    // adapters; normal users call one of the serve_* entry points instead.
+    void notify_serve_start(TransportKind transport_kind);
+
     // Unary dispatch driven by a caller-supplied context, so the HTTP
     // transport can install its per-request sticky machinery.  Returns true
     // when the method raised — the caller needs that to set X-VGI-RPC-Error,
@@ -183,17 +202,19 @@ public:
 private:
     Server(std::unordered_map<std::string, MethodInfo> methods, std::string server_id,
            std::string protocol_name, std::string protocol_hash, std::string protocol_version,
-           const std::string& access_log_path,
-           int64_t access_log_max_record_bytes = kDefaultMaxRecordBytes);
+           const std::string& access_log_path, int64_t access_log_max_record_bytes,
+           std::function<void(TransportKind)> on_serve_start);
 
     void serve_unary(const MethodInfo& method_info, const Request& request,
                      const std::string& request_id,
-                     const std::shared_ptr<arrow::io::OutputStream>& output);
+                     const std::shared_ptr<arrow::io::OutputStream>& output,
+                     TransportKind transport_kind);
 
     void serve_stream(const MethodInfo& method_info, const Request& request,
                       const std::string& request_id,
                       const std::shared_ptr<arrow::io::InputStream>& input,
-                      const std::shared_ptr<arrow::io::OutputStream>& output);
+                      const std::shared_ptr<arrow::io::OutputStream>& output,
+                      TransportKind transport_kind);
 
     // Attach (or reuse) the peer-owned segment this request advertises.
     // Cached per connection because a segment is process-level, not per-call.
@@ -205,6 +226,9 @@ private:
     std::string protocol_hash_;
     std::string protocol_version_;
     std::unique_ptr<AccessLogWriter> access_log_;
+    std::function<void(TransportKind)> on_serve_start_;
+    std::once_flag serve_start_once_;
+    std::optional<TransportKind> transport_kind_;
 
     // Segment the peer advertised, and the segment for the call in flight.
     // The second is set only when the client signalled SHM for *this* call, so

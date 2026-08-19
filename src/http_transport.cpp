@@ -1016,7 +1016,7 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
     Request request(batch, custom_metadata);
 
     auto log_sink = std::make_shared<LogSink>(rpc_.server_id(), request_id);
-    CallContext ctx(log_sink, rpc_.server_id(), request_id);
+    CallContext ctx(log_sink, rpc_.server_id(), request_id, TransportKind::HTTP);
 
     // Sticky machinery for this request, installed only on HTTP.
     StickySlot sticky;
@@ -1414,6 +1414,15 @@ void HttpServer::run() {
                             "application/json");
         });
 
+    // Regular handlers have already consumed their request body by the time
+    // this hook runs.  The RPC content-reader route below performs the same
+    // notification explicitly because cpp-httplib bypasses pre_request for
+    // content-reader handlers.
+    svr.set_pre_request_handler([this](const httplib::Request&, httplib::Response&) {
+        rpc_.notify_serve_start(TransportKind::HTTP);
+        return httplib::Server::HandlerResponse::Unhandled;
+    });
+
     auto health = [this](const httplib::Request& req, httplib::Response& res) {
         handle_health(req, res);
     };
@@ -1464,6 +1473,15 @@ void HttpServer::run() {
 
     svr.Post(R"(/(.+))", [this](const httplib::Request& req, httplib::Response& res,
                                 const httplib::ContentReader& reader) {
+        // Keep reading the body even when the startup hook fails.  Otherwise
+        // unread bytes poison this keep-alive connection and the retry cannot
+        // prove that the listener remains reusable.
+        std::exception_ptr serve_start_error;
+        try {
+            rpc_.notify_serve_start(TransportKind::HTTP);
+        } catch (...) {
+            serve_start_error = std::current_exception();
+        }
         const int64_t cap = cfg_.max_request_bytes >= 0
                                 ? cfg_.max_request_bytes
                                 : (storage_ ? cfg_.externalize_threshold : -1);
@@ -1478,6 +1496,7 @@ void HttpServer::run() {
             body.append(data, size);
             return true;
         });
+        if (serve_start_error) std::rethrow_exception(serve_start_error);
         if (!read) {
             stamp_common(req, res, random_hex(16));
             if (decoded_too_large || res.status == 413) {

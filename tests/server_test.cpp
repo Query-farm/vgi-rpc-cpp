@@ -17,6 +17,11 @@
 #include <arrow/type.h>
 #include <arrow/util/key_value_metadata.h>
 
+#include <atomic>
+#include <future>
+#include <thread>
+#include <vector>
+
 using namespace vgi_rpc;
 
 // ── Helpers ──────────────────────────────────────────────────────────
@@ -233,6 +238,69 @@ TEST_CASE("serve_one: successful unary echo round-trip", "[server]") {
         }
     }
     REQUIRE(found_data);
+}
+
+TEST_CASE("serve_one: CallContext reports the explicit transport kind", "[server]") {
+    TransportKind observed = TransportKind::PIPE;
+    ServerBuilder builder;
+    builder.add_void("observe", empty_schema(),
+                     [&](const Request&, CallContext& ctx) { observed = ctx.transport_kind(); });
+    auto server = builder.build();
+    auto request_buf =
+        make_valid_request("observe", empty_schema(), make_empty_batch(empty_schema()));
+    auto input = std::make_shared<arrow::io::BufferReader>(request_buf);
+    auto output = arrow::io::BufferOutputStream::Create().ValueUnsafe();
+
+    REQUIRE(server->serve_one(input, output, TransportKind::TCP));
+    REQUIRE(observed == TransportKind::TCP);
+}
+
+TEST_CASE("on_serve_start serializes concurrent callers and fires once after success",
+          "[server][lifecycle]") {
+    std::atomic<int> attempts = 0;
+    std::atomic<TransportKind> observed_kind = TransportKind::PIPE;
+    std::promise<void> entered_promise;
+    auto entered = entered_promise.get_future();
+    std::promise<void> release_promise;
+    auto release = release_promise.get_future().share();
+
+    ServerBuilder builder;
+    builder.on_serve_start([&](TransportKind kind) {
+        observed_kind = kind;
+        ++attempts;
+        entered_promise.set_value();
+        release.wait();
+    });
+    auto server = builder.build();
+
+    std::vector<std::future<void>> notifications;
+    for (int i = 0; i < 8; ++i) {
+        notifications.push_back(std::async(
+            std::launch::async, [&]() { server->notify_serve_start(TransportKind::HTTP); }));
+    }
+
+    REQUIRE(entered.wait_for(std::chrono::seconds(2)) == std::future_status::ready);
+    REQUIRE(attempts == 1);
+    release_promise.set_value();
+    for (auto& notification : notifications) notification.get();
+
+    server->notify_serve_start(TransportKind::HTTP);
+    REQUIRE(attempts == 1);
+    REQUIRE(observed_kind == TransportKind::HTTP);
+}
+
+TEST_CASE("on_serve_start retries after a synchronous failure", "[server][lifecycle]") {
+    int attempts = 0;
+    ServerBuilder builder;
+    builder.on_serve_start([&](TransportKind) {
+        if (attempts++ == 0) throw std::runtime_error("transient startup failure");
+    });
+    auto server = builder.build();
+
+    REQUIRE_THROWS_AS(server->notify_serve_start(TransportKind::HTTP), std::runtime_error);
+    REQUIRE_NOTHROW(server->notify_serve_start(TransportKind::HTTP));
+    REQUIRE_NOTHROW(server->notify_serve_start(TransportKind::HTTP));
+    REQUIRE(attempts == 2);
 }
 
 TEST_CASE("serve_one: void handler round-trip", "[server]") {

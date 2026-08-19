@@ -133,6 +133,7 @@ void Server::run() {
     _setmode(_fileno(stdin), _O_BINARY);
     _setmode(_fileno(stdout), _O_BINARY);
 #endif
+    notify_serve_start(TransportKind::PIPE);
     // Our own fd stream rather than arrow::io::StdinStream: a message body can
     // exceed INT_MAX, and the read side needs the same clamp-and-loop treatment
     // as the write side (see kMaxIoChunk in wire.h).
@@ -154,6 +155,13 @@ void Server::run() {
 
 bool Server::serve_one(const std::shared_ptr<arrow::io::InputStream>& input,
                        const std::shared_ptr<arrow::io::OutputStream>& output) {
+    return serve_one(input, output, TransportKind::PIPE);
+}
+
+bool Server::serve_one(const std::shared_ptr<arrow::io::InputStream>& input,
+                       const std::shared_ptr<arrow::io::OutputStream>& output,
+                       TransportKind transport_kind) {
+    notify_serve_start(transport_kind);
     // 1. Read request IPC stream
     auto contents_opt = read_ipc_stream(input);
     if (!contents_opt || contents_opt->batches.empty()) {
@@ -285,9 +293,9 @@ bool Server::serve_one(const std::shared_ptr<arrow::io::InputStream>& input,
     Request request(batch, custom_metadata);
 
     if (method_info.method_type == MethodType::UNARY) {
-        serve_unary(method_info, request, request_id, output);
+        serve_unary(method_info, request, request_id, output, transport_kind);
     } else {
-        serve_stream(method_info, request, request_id, input, output);
+        serve_stream(method_info, request, request_id, input, output, transport_kind);
     }
 
     // The region is dead once the handler has read its columns out.
@@ -367,19 +375,21 @@ bool Server::serve_unary_http(const MethodInfo& method_info, const Request& requ
 
 void Server::serve_unary(const MethodInfo& method_info, const Request& request,
                          const std::string& request_id,
-                         const std::shared_ptr<arrow::io::OutputStream>& output) {
+                         const std::shared_ptr<arrow::io::OutputStream>& output,
+                         TransportKind transport_kind) {
     auto log_sink = std::make_shared<LogSink>(server_id_, request_id);
-    CallContext ctx(log_sink, server_id_, request_id);
+    CallContext ctx(log_sink, server_id_, request_id, transport_kind);
     serve_unary_http(method_info, request, request_id, output, ctx);
 }
 
 void Server::serve_stream(const MethodInfo& method_info, const Request& request,
                           const std::string& request_id,
                           const std::shared_ptr<arrow::io::InputStream>& input,
-                          const std::shared_ptr<arrow::io::OutputStream>& output) {
+                          const std::shared_ptr<arrow::io::OutputStream>& output,
+                          TransportKind transport_kind) {
     auto t0 = std::chrono::steady_clock::now();
     auto log_sink = std::make_shared<LogSink>(server_id_, request_id);
-    CallContext ctx(log_sink, server_id_, request_id);
+    CallContext ctx(log_sink, server_id_, request_id, transport_kind);
 
     // Access-log state for the (single) record emitted at the normal end of the
     // stream.  Factory-init failures return early and are not logged.
@@ -502,7 +512,7 @@ void Server::serve_stream(const MethodInfo& method_info, const Request& request,
             if (batch_with_md.custom_metadata &&
                 batch_with_md.custom_metadata->FindKey(keys::CANCEL) >= 0) {
                 cancelled_flag = true;
-                CallContext cancel_ctx(log_sink, server_id_, request_id);
+                CallContext cancel_ctx(log_sink, server_id_, request_id, transport_kind);
                 try {
                     state->on_cancel(cancel_ctx);
                 } catch (const std::exception& e) {
@@ -537,7 +547,7 @@ void Server::serve_stream(const MethodInfo& method_info, const Request& request,
             input_ab.batch = is_producer ? raw_input : coerce_input_batch(raw_input, input_schema);
 
             OutputCollector out(output_schema, is_producer, server_id_, request_id);
-            CallContext stream_ctx(log_sink, server_id_, request_id);
+            CallContext stream_ctx(log_sink, server_id_, request_id, transport_kind);
 
             state->process(input_ab, out, stream_ctx);
 

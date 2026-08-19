@@ -5,11 +5,27 @@
 
 namespace vgi_rpc {
 
+const char* transport_kind_name(TransportKind kind) noexcept {
+    switch (kind) {
+        case TransportKind::PIPE: return "pipe";
+        case TransportKind::HTTP: return "http";
+        case TransportKind::UNIX: return "unix";
+        case TransportKind::TCP: return "tcp";
+    }
+    return "pipe";
+}
+
 CallContext::CallContext(std::shared_ptr<LogSink> sink, std::string server_id,
                          std::string request_id)
+    : CallContext(std::move(sink), std::move(server_id), std::move(request_id),
+                  TransportKind::PIPE) {}
+
+CallContext::CallContext(std::shared_ptr<LogSink> sink, std::string server_id,
+                         std::string request_id, TransportKind transport_kind)
     : sink_(std::move(sink)),
       server_id_(std::move(server_id)),
-      request_id_(std::move(request_id)) {}
+      request_id_(std::move(request_id)),
+      transport_kind_(transport_kind) {}
 
 void CallContext::client_log(LogLevel level, std::string_view message,
                              const nlohmann::json& extra) {

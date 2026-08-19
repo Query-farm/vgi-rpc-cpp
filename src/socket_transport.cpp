@@ -37,12 +37,12 @@ namespace {
 // Serve one accepted connection to completion: request after request over the
 // same socket, exactly as the pipe transport does over stdin/stdout, until the
 // peer closes or the framing breaks.
-void serve_connection(Server& server, int fd) {
+void serve_connection(Server& server, int fd, TransportKind transport_kind) {
     auto input = std::make_shared<FdInputStream>(fd);
     auto output = std::make_shared<FdOutputStream>(fd);
     while (true) {
         try {
-            if (!server.serve_one(input, output)) break;
+            if (!server.serve_one(input, output, transport_kind)) break;
         } catch (const std::exception& e) {
             // One bad connection must not take the listener down; say what
             // happened and move on to the next peer.
@@ -75,7 +75,8 @@ void widen_socket_buffers(int fd) {
 
 // `is_tcp` picks the per-socket tuning: Nagle off for TCP, wider buffers for a
 // Unix socket.  Neither setting means anything on the other family.
-void accept_loop(Server& server, int listen_fd, bool is_tcp) {
+void accept_loop(Server& server, int listen_fd, TransportKind transport_kind) {
+    const bool is_tcp = transport_kind == TransportKind::TCP;
     while (true) {
         int fd = ::accept(listen_fd, nullptr, nullptr);
         if (fd < 0) {
@@ -101,7 +102,7 @@ void accept_loop(Server& server, int listen_fd, bool is_tcp) {
             int one = 1;
             ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
         }
-        serve_connection(server, fd);
+        serve_connection(server, fd, transport_kind);
         ::close(fd);
     }
     ::close(listen_fd);
@@ -136,10 +137,18 @@ void Server::serve_unix(const std::string& path) {
         throw std::runtime_error("cannot listen on " + path + ": " + std::strerror(errno));
     }
 
+    try {
+        notify_serve_start(TransportKind::UNIX);
+    } catch (...) {
+        ::close(listen_fd);
+        ::unlink(path.c_str());
+        throw;
+    }
+
     // Discovery line, then flush: a launcher blocks on this to learn the
     // socket is ready, so buffering it would look like a hung worker.
     std::cout << "UNIX:" << path << std::endl;
-    accept_loop(*this, listen_fd, /*is_tcp=*/false);
+    accept_loop(*this, listen_fd, TransportKind::UNIX);
     ::unlink(path.c_str());
 }
 
@@ -170,6 +179,13 @@ void Server::serve_tcp(const std::string& host, int port) {
         throw std::runtime_error(std::string("cannot listen: ") + std::strerror(errno));
     }
 
+    try {
+        notify_serve_start(TransportKind::TCP);
+    } catch (...) {
+        ::close(listen_fd);
+        throw;
+    }
+
     // Report the port actually bound, so a caller that asked for 0 learns it.
     sockaddr_in bound{};
     socklen_t bound_len = sizeof(bound);
@@ -179,7 +195,7 @@ void Server::serve_tcp(const std::string& host, int port) {
     }
 
     std::cout << "TCP:" << bind_host << ":" << bound_port << std::endl;
-    accept_loop(*this, listen_fd, /*is_tcp=*/true);
+    accept_loop(*this, listen_fd, TransportKind::TCP);
 }
 
 #else  // _WIN32

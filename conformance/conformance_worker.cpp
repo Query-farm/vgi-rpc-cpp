@@ -619,6 +619,12 @@ static Result add_floats_handler(const Request& req, CallContext&) {
     return Result::value(float_result_schema(), {unwrap(builder.Finish())});
 }
 
+static Result report_transport_kind_handler(const Request&, CallContext& ctx) {
+    arrow::StringBuilder builder;
+    VGI_RPC_THROW_NOT_OK(builder.Append(transport_kind_name(ctx.transport_kind())));
+    return Result::value(str_result_schema(), {unwrap(builder.Finish())});
+}
+
 static Result concatenate_handler(const Request& req, CallContext&) {
     auto prefix = req.get<std::string>("prefix");
     auto suffix = req.get<std::string>("suffix");
@@ -1257,6 +1263,8 @@ int main(int argc, char** argv) {
     bool unix_mode = false;
     std::string unix_path;
     bool tcp_mode = false;
+    bool fail_serve_start_once = false;
+    bool transport_kind_probe = false;
     std::string server_id;
     vgi_rpc::HttpConfig http_cfg;
     // Sticky is on by default here, matching the reference conformance worker,
@@ -1299,6 +1307,10 @@ int main(int argc, char** argv) {
                 http_cfg.host = spec.substr(0, colon);
                 http_cfg.port = std::stoi(spec.substr(colon + 1));
             }
+        } else if (arg == "--fail-serve-start-once") {
+            fail_serve_start_once = true;
+        } else if (arg == "--transport-kind-probe") {
+            transport_kind_probe = true;
         } else if (arg == "--host") {
             http_cfg.host = take_value(i);
         } else if (arg == "--port") {
@@ -1407,6 +1419,22 @@ int main(int argc, char** argv) {
     }
 
     auto builder = ServerBuilder();
+
+    int serve_start_attempts = 0;
+    if (fail_serve_start_once) {
+        builder.on_serve_start([&](TransportKind) {
+            if (serve_start_attempts++ == 0) {
+                throw std::runtime_error("injected on_serve_start failure");
+            }
+        });
+    }
+
+    // Test-only, versionless probe used by the optional shared transport-kind
+    // contract.  It deliberately stays out of ConformanceService.
+    if (transport_kind_probe) {
+        builder.add_unary("report_transport_kind", empty_schema(), str_result_schema(),
+                          report_transport_kind_handler);
+    }
 
     // --- Scalar Echo ---
     builder
@@ -1723,7 +1751,7 @@ int main(int argc, char** argv) {
         http_cfg.sticky_echo_headers["x-vgi-conformance-echo"] = "conformance-fixed-marker";
     }
 
-    builder.protocol_version("1.0.0");
+    if (!transport_kind_probe) builder.protocol_version("1.0.0");
     builder.enable_describe("ConformanceService");
     // We implement SHM, so we must answer the handshake: a worker that stays
     // silent is treated as "no SHM" and clients never negotiate it.

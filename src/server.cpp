@@ -136,6 +136,11 @@ ServerBuilder& ServerBuilder::protocol_version(std::string version) {
     return *this;
 }
 
+ServerBuilder& ServerBuilder::on_serve_start(std::function<void(TransportKind)> hook) {
+    on_serve_start_ = std::move(hook);
+    return *this;
+}
+
 ServerBuilder& ServerBuilder::enable_transport_options(bool enabled) {
     transport_options_enabled_ = enabled;
     return *this;
@@ -174,9 +179,10 @@ std::unique_ptr<Server> ServerBuilder::build() {
         register_transport_options(method_map, server_id);
     }
 
-    return std::unique_ptr<Server>(new Server(
-        std::move(method_map), std::move(server_id), protocol_name_, std::move(protocol_hash),
-        protocol_version_, access_log_path_, access_log_max_record_bytes_));
+    return std::unique_ptr<Server>(
+        new Server(std::move(method_map), std::move(server_id), protocol_name_,
+                   std::move(protocol_hash), protocol_version_, access_log_path_,
+                   access_log_max_record_bytes_, std::move(on_serve_start_)));
 }
 
 // Server
@@ -255,12 +261,14 @@ std::string Server::protocol_version_error(
 
 Server::Server(std::unordered_map<std::string, MethodInfo> methods, std::string server_id,
                std::string protocol_name, std::string protocol_hash, std::string protocol_version,
-               const std::string& access_log_path, int64_t access_log_max_record_bytes)
+               const std::string& access_log_path, int64_t access_log_max_record_bytes,
+               std::function<void(TransportKind)> on_serve_start)
     : methods_(std::move(methods)),
       server_id_(std::move(server_id)),
       protocol_name_(std::move(protocol_name)),
       protocol_hash_(std::move(protocol_hash)),
-      protocol_version_(std::move(protocol_version)) {
+      protocol_version_(std::move(protocol_version)),
+      on_serve_start_(std::move(on_serve_start)) {
     // A worker that declares a version it cannot parse would silently enforce
     // nothing, which is worse than not declaring one: the operator believes
     // there is a gate. Refuse to build such a server at all.
@@ -274,6 +282,20 @@ Server::Server(std::unordered_map<std::string, MethodInfo> methods, std::string 
         access_log_ =
             std::make_unique<AccessLogWriter>(access_log_path, server_id_, protocol_name_,
                                               protocol_hash_, access_log_max_record_bytes);
+    }
+}
+
+void Server::notify_serve_start(TransportKind transport_kind) {
+    // std::call_once commits only when the callable returns.  If the user hook
+    // throws, the flag remains unset and a later request retries; concurrent
+    // callers serialize behind whichever attempt is currently running.
+    std::call_once(serve_start_once_, [this, transport_kind]() {
+        if (on_serve_start_) on_serve_start_(transport_kind);
+        transport_kind_ = transport_kind;
+    });
+    if (transport_kind_ != transport_kind) {
+        throw std::logic_error("server is already bound to transport '" +
+                               std::string(transport_kind_name(*transport_kind_)) + "'");
     }
 }
 

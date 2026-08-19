@@ -23,7 +23,7 @@ import sys
 import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 import pytest
 
@@ -79,8 +79,22 @@ def _wait_for_http(port: int, timeout: float = 30.0) -> None:
     raise RuntimeError(f"HTTP server on port {port} never became ready: {last}")
 
 
+def _wait_for_tcp(host: str, port: int, timeout: float = 30.0) -> None:
+    """Wait for a listener without issuing an HTTP lifecycle notification."""
+    deadline = time.monotonic() + timeout
+    last: OSError | None = None
+    while time.monotonic() < deadline:
+        try:
+            with socket.create_connection((host, port), timeout=0.5):
+                return
+        except OSError as exc:  # noqa: PERF203
+            last = exc
+            time.sleep(0.05)
+    raise RuntimeError(f"TCP server on {host}:{port} never became ready: {last}")
+
+
 @contextlib.contextmanager
-def spawn_http(*extra_args: str) -> Iterator[int]:
+def spawn_http(*extra_args: str, tcp_readiness_only: bool = False) -> Iterator[int]:
     """Spawn the C++ worker in HTTP mode with *extra_args*, yielding its port."""
     proc = subprocess.Popen(
         [worker_path(), "--http", *extra_args],
@@ -93,7 +107,10 @@ def spawn_http(*extra_args: str) -> Iterator[int]:
         if not line.startswith("PORT:"):
             raise RuntimeError(f"expected PORT:<n> on stdout, got {line!r}")
         port = int(line.split(":", 1)[1])
-        _wait_for_http(port)
+        if tcp_readiness_only:
+            _wait_for_tcp("127.0.0.1", port)
+        else:
+            _wait_for_http(port)
         yield port
     finally:
         proc.terminate()
@@ -124,10 +141,10 @@ def conformance_http_small_request_cap_port() -> Iterator[int]:
 
 
 @contextlib.contextmanager
-def _spawn_listener(flag: str, value: str, prefix: str) -> Iterator[str]:
+def _spawn_listener(flag: str, value: str, prefix: str, *extra_args: str) -> Iterator[str]:
     """Spawn the worker on a socket transport, yielding its discovery line's payload."""
     proc = subprocess.Popen(
-        [worker_path(), flag, value], stdout=subprocess.PIPE, stderr=sys.stderr
+        [worker_path(), flag, value, *extra_args], stdout=subprocess.PIPE, stderr=sys.stderr
     )
     try:
         assert proc.stdout is not None
@@ -169,6 +186,89 @@ def conformance_tcp_addr() -> Iterator[tuple[str, int]]:
     with _spawn_listener("--tcp", "127.0.0.1:0", "TCP:") as addr:
         host, _, port = addr.rpartition(":")
         yield host, int(port)
+
+
+@pytest.fixture(scope="class")
+def conformance_http_serve_start_fail_once_port() -> Iterator[int]:
+    """HTTP worker whose first startup hook fails and is retried.
+
+    Readiness must stay at the TCP layer: an HTTP health probe would consume
+    the deliberately failing first lifecycle notification.
+    """
+    with spawn_http("--fail-serve-start-once", tcp_readiness_only=True) as port:
+        yield port
+
+
+@pytest.fixture(scope="session")
+def conformance_transport_kind_probes() -> Iterator[
+    tuple[tuple[str, Callable[[], str]], ...]
+]:
+    """Expose real wire probes for every C++ server transport."""
+
+    class _KindProbe(Protocol):
+        def report_transport_kind(self) -> str: ...
+
+    import shutil
+    import tempfile
+
+    from vgi_rpc.http import http_connect
+    from vgi_rpc.rpc import SubprocessTransport, _RpcProxy, tcp_connect, unix_connect
+
+    pipe_transport = SubprocessTransport([worker_path(), "--transport-kind-probe"])
+    tmpdir = tempfile.mkdtemp(prefix="vgi-cpp-kind-", dir=tempfile.gettempdir())
+    unix_path = os.path.join(tmpdir, "kind.sock")
+    try:
+        with contextlib.ExitStack() as stack:
+            http_port = stack.enter_context(spawn_http("--transport-kind-probe"))
+            tcp_addr = stack.enter_context(
+                _spawn_listener(
+                    "--tcp", "127.0.0.1:0", "TCP:", "--transport-kind-probe"
+                )
+            )
+            tcp_host, _, tcp_port_raw = tcp_addr.rpartition(":")
+            tcp_port = int(tcp_port_raw)
+
+            unix_server_path: str | None = None
+            if sys.platform != "win32":
+                unix_server_path = stack.enter_context(
+                    _spawn_listener(
+                        "--unix", unix_path, "UNIX:", "--transport-kind-probe"
+                    )
+                )
+
+            def pipe_probe() -> str:
+                return str(
+                    _RpcProxy(_KindProbe, pipe_transport, None).report_transport_kind()
+                )
+
+            def http_probe() -> str:
+                with http_connect(
+                    _KindProbe, f"http://127.0.0.1:{http_port}"
+                ) as proxy:
+                    return str(proxy.report_transport_kind())
+
+            def tcp_probe() -> str:
+                with tcp_connect(_KindProbe, tcp_host, tcp_port) as proxy:
+                    return str(proxy.report_transport_kind())
+
+            probes: list[tuple[str, Callable[[], str]]] = [
+                ("pipe", pipe_probe),
+                ("http", http_probe),
+                ("tcp", tcp_probe),
+            ]
+            if unix_server_path is not None:
+
+                def unix_probe() -> str:
+                    assert unix_server_path is not None
+                    with unix_connect(_KindProbe, unix_server_path) as proxy:
+                        return str(proxy.report_transport_kind())
+
+                probes.append(("unix", unix_probe))
+
+            yield tuple(probes)
+    finally:
+        pipe_transport.close()
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 @pytest.fixture(
