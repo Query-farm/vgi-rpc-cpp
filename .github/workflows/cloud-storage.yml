@@ -17,14 +17,18 @@ on:
       - "src/external.cpp"
       - "include/vgi_rpc/external.h"
       - "tests/conformance/test_cloud_storage.py"
+      - "CMakePresets.json"
       - "vcpkg.json"
+      - "vcpkg-overlays/**"
       - ".github/workflows/cloud-storage.yml"
   pull_request:
     paths:
       - "src/external.cpp"
       - "include/vgi_rpc/external.h"
       - "tests/conformance/test_cloud_storage.py"
+      - "CMakePresets.json"
       - "vcpkg.json"
+      - "vcpkg-overlays/**"
       - ".github/workflows/cloud-storage.yml"
   workflow_dispatch:
 
