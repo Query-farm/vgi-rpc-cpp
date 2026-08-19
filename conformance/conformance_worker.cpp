@@ -1015,6 +1015,16 @@ private:
     double factor_;
 };
 
+class PolymorphicProducerState : public ProducerState {
+public:
+    void produce(OutputCollector& out, CallContext&) override {
+        arrow::DoubleBuilder builder;
+        VGI_RPC_THROW_NOT_OK(builder.Append(42.0));
+        out.emit_arrays({unwrap(builder.Finish())});
+        out.finish();
+    }
+};
+
 class AccumulatingExchangeState : public ExchangeState {
 public:
     void exchange(const AnnotatedBatch& input, OutputCollector& out, CallContext&) override {
@@ -1195,6 +1205,15 @@ static Stream make_exchange_scale(const Request& req, CallContext&) {
     return {scale_output_schema(), scale_input_schema(),
             std::make_shared<ScaleExchangeState>(req.get<double>("factor")), nullptr};
 }
+
+static Stream make_polymorphic_stream(const Request& req, CallContext&) {
+    if (req.get<bool>("as_producer")) {
+        return {scale_output_schema(), empty_schema(), std::make_shared<PolymorphicProducerState>(),
+                nullptr};
+    }
+    return {scale_output_schema(), scale_input_schema(), std::make_shared<ScaleExchangeState>(2.0),
+            nullptr};
+}
 static Stream make_exchange_accumulate(const Request&, CallContext&) {
     return {accum_output_schema(), accum_input_schema(),
             std::make_shared<AccumulatingExchangeState>(), nullptr};
@@ -1265,6 +1284,7 @@ int main(int argc, char** argv) {
     bool tcp_mode = false;
     bool fail_serve_start_once = false;
     bool transport_kind_probe = false;
+    bool polymorphic_stream_probe = false;
     std::string server_id;
     vgi_rpc::HttpConfig http_cfg;
     // Sticky is on by default here, matching the reference conformance worker,
@@ -1311,6 +1331,8 @@ int main(int argc, char** argv) {
             fail_serve_start_once = true;
         } else if (arg == "--transport-kind-probe") {
             transport_kind_probe = true;
+        } else if (arg == "--polymorphic-stream-probe") {
+            polymorphic_stream_probe = true;
         } else if (arg == "--host") {
             http_cfg.host = take_value(i);
         } else if (arg == "--port") {
@@ -1434,6 +1456,13 @@ int main(int argc, char** argv) {
     if (transport_kind_probe) {
         builder.add_unary("report_transport_kind", empty_schema(), str_result_schema(),
                           report_transport_kind_handler);
+    }
+    if (polymorphic_stream_probe) {
+        // Deliberately registered as exchange while the factory may return a
+        // ProducerState.  This pins dynamic dispatch parity across transports.
+        builder.add_exchange("polymorphic_stream",
+                             params({arrow::field("as_producer", arrow::boolean())}),
+                             scale_input_schema(), scale_output_schema(), make_polymorphic_stream);
     }
 
     // --- Scalar Echo ---
@@ -1751,7 +1780,7 @@ int main(int argc, char** argv) {
         http_cfg.sticky_echo_headers["x-vgi-conformance-echo"] = "conformance-fixed-marker";
     }
 
-    if (!transport_kind_probe) builder.protocol_version("1.0.0");
+    if (!transport_kind_probe && !polymorphic_stream_probe) builder.protocol_version("1.0.0");
     builder.enable_describe("ConformanceService");
     // We implement SHM, so we must answer the handshake: a worker that stays
     // silent is treated as "no SHM" and clients never negotiate it.

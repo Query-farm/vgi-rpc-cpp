@@ -1155,7 +1155,21 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
             crypto::aead_seal(cfg_.token_key, method_name + std::string(1, '\0') + cursor, aad));
         auto output_schema = stream.output_schema;
         auto input_schema = stream.input_schema;
-        const bool is_exchange = method_info.is_exchange;
+        // Asked of the state the factory built, not of how the method was
+        // registered. One method can be both: `init` is declared an exchange
+        // because a scalar or table-in-out call pushes batches into it, but a
+        // table scan's init returns a producer that runs to exhaustion and
+        // finishes.
+        //
+        // Taking the static flag made every table scan an exchange over HTTP,
+        // and the first `finish()` was refused with "finish() is not allowed on
+        // exchange streams" — a scan working on three transports and failing on
+        // the fourth. Deciding on the input schema instead is just as wrong the
+        // other way: a scalar whose arguments are all constants also has an
+        // empty input schema, and routing *that* as a producer skips the turn
+        // semantics and returns no rows.
+        const bool is_exchange = method_info.is_exchange &&
+                                 dynamic_cast<const ProducerState*>(stream.state.get()) == nullptr;
         bool errored = false;
         int64_t externalized = 0;
         auto externalize = [&](const std::vector<AnnotatedBatch>& batches,
