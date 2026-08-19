@@ -66,6 +66,9 @@ add_library(vgi_rpc
     src/access_log.cpp
     src/http_transport.cpp
     src/http_client.cpp
+    src/client.cpp
+    src/client_description.cpp
+    src/client_transport.cpp
     src/output_collector.cpp
 )
 
