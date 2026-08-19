@@ -64,6 +64,7 @@ add_library(vgi_rpc
     src/describe.cpp
     src/access_log.cpp
     src/http_transport.cpp
+    src/http_client.cpp
     src/output_collector.cpp
 )
 
@@ -193,10 +194,10 @@ option(VGI_RPC_BUILD_BENCHMARKS "Build vgi_rpc benchmarks" OFF)
 option(VGI_RPC_BUILD_TESTS "Build vgi_rpc unit tests" OFF)
 if(VGI_RPC_BUILD_TESTS)
     enable_testing()
+    find_package(Python3 COMPONENTS Interpreter QUIET)
     add_subdirectory(tests)
     add_subdirectory(conformance)
 
-    find_package(Python3 COMPONENTS Interpreter QUIET)
     if(Python3_FOUND)
         add_test(
             NAME conformance

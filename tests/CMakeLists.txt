@@ -21,6 +21,24 @@ vgi_rpc_add_test(output_collector_test)
 vgi_rpc_add_test(server_test)
 vgi_rpc_add_test(shm_test)
 
+add_executable(http_client_integration http_client_integration.cpp)
+target_link_libraries(http_client_integration PRIVATE vgi_rpc)
+add_test(NAME http_client_integration COMMAND http_client_integration)
+set_tests_properties(http_client_integration PROPERTIES
+    TIMEOUT 60
+    SKIP_RETURN_CODE 77
+)
+if(Python3_FOUND)
+    set_tests_properties(http_client_integration PROPERTIES
+        ENVIRONMENT "VGI_RPC_PYTHON=${Python3_EXECUTABLE}"
+    )
+endif()
+
+add_executable(http_client_fault_test http_client_fault_test.cpp)
+target_link_libraries(http_client_fault_test PRIVATE vgi_rpc)
+add_test(NAME http_client_fault_test COMMAND http_client_fault_test)
+set_tests_properties(http_client_fault_test PROPERTIES TIMEOUT 60)
+
 if(VGI_RPC_BUILD_BENCHMARKS)
     add_executable(vgi_rpc_benchmark benchmark.cpp)
     target_link_libraries(vgi_rpc_benchmark PRIVATE vgi_rpc Catch2::Catch2WithMain)
