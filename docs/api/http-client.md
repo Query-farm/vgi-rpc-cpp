@@ -68,12 +68,15 @@ Arrow `vgi_rpc.request_id` and HTTP `X-Request-ID`; it remains unchanged across
 connection retries and the safe 415 codec fallback.
 
 `RetryPolicy` defaults match Rust: three attempts, 100 ms initial backoff,
-10 second maximum backoff, multiplier 2, and 20% jitter. Automatic retries are
-limited to operations whose protocol phase is safe to repeat. Exchange turns
-are never retried after an ambiguous transport failure and their session is
-poisoned. HTTP status retry is off by default; populate
-`retryable_status_codes` only when the application has made the corresponding
-idempotency decision. `RetryPolicy::disabled()` makes exactly one attempt.
+10 second maximum backoff, multiplier 2, and 20% jitter. RPC POSTs still make
+one attempt by default because a transport failure after dispatch is
+ambiguous. Set `CallOptions::idempotent = true` only after the application has
+made the logical operation safe to replay; its transport and configured status
+retries then use the policy. Producer continuation tokens are immutable
+prior-state cursors and remain automatically retryable by the protocol.
+Exchange turns are never retried and their session is poisoned on ambiguous
+failure. HTTP status retry is off until `retryable_status_codes` is populated.
+`RetryPolicy::disabled()` makes exactly one attempt in every case.
 
 ## Exchange contract
 
@@ -94,6 +97,82 @@ failure.
 `close()` and the destructor only release local state and perform no network
 I/O. `cancel()` performs one best-effort cancellation request and then closes
 the local session. All three operations are idempotent.
+
+## Producers and resumable streams
+
+`open_producer()` returns a move-only `HttpStreamSession`. `tick()` drains every
+application batch emitted during init before it sends a continuation request;
+a metadata-free zero-row batch is application data, not end-of-stream.
+`open_stream_exchange()` provides the same generalized lifecycle for an
+exchange that may terminate without a final batch, while `open_exchange()`
+remains the strict one-input/one-output compatibility API.
+
+`next_with_token()` pairs a producer batch with the opaque cursor/call-state
+blob that resumes *after* that batch. `resume_stream()` starts directly from a
+persisted token without replaying `/init`, and `seek_to_token()` repositions a
+fresh producer session. Responses that buffer more than one batch cannot expose
+a truthful per-batch resume point, so `next_with_token()` rejects them; consume
+such responses with `tick()` instead. Producer continuations are token-addressed
+and retryable. Exchange turns are never retried after dispatch ambiguity.
+
+Optional stream headers are parsed as their own IPC substream and returned by
+`header()`. Externalized headers and data are resolved before cursor metadata is
+interpreted. Local `close()` is non-networking; explicit `cancel()` sends one
+best-effort cancellation request.
+
+## External locations
+
+Secure external-location resolution is enabled by default. The production
+policy accepts HTTPS only, rejects URL credentials/fragments and non-public DNS
+answers, validates every address, pins a validated address while retaining the
+original TLS hostname, and manually revalidates every redirect. Encoded,
+decoded, upload, and upload-response bytes have independent hard caps; zstd
+decoding also has a bounded history window. SHA-256 covers the decoded Arrow IPC
+payload, nested pointers are rejected, and signed URL query strings are removed
+from diagnostics.
+
+Use `external_http_options()` to lower limits. The
+`LOOPBACK_HTTP_TEST` policy is an explicit local-test escape hatch and accepts
+only loopback HTTP targets. `disable_external_locations()` restores fail-closed
+pointer rejection without fetching.
+
+Oversized requests use the server's `VGI-Max-Request-Bytes` and upload-URL
+capabilities. A known-oversized request is externalized proactively; an initial
+pre-dispatch 413 warms capabilities and is retried once as a pointer. The client
+requests a method-bound PUT/GET pair, validates both URLs, uploads the complete
+original IPC body without RPC credentials or redirects, and sends a pointer
+whose SHA-256 covers that body. The external upload cap, rather than the smaller
+inline cap, bounds the one required serialization allocation.
+
+## Sticky sessions
+
+`with_session_token()` creates an independent, move-only `HttpSessionView`
+over the client's shared transport. Calls through the view send
+`VGI-Session-Accept: true`, capture `VGI-Session` plus every `VGI-Echo-*`
+response header, and replay the stripped routing headers on subsequent unary,
+producer, exchange, capability, and upload-URL control requests. Session
+routing headers override per-call values so a caller cannot accidentally route
+a live token to a different worker. Separate views do not share token state.
+
+`current_session_token()` and `current_echo_headers()` return snapshots for
+persistence. Pass both back to `with_session_token(token, echo_headers)` when
+resuming because some deployments require the echoed routing header to reach
+the worker that owns the token. `detach()` transfers the token without deleting
+it. `close()` and destruction are idempotent and attempt a bounded,
+best-effort `DELETE {prefix}/__session__` for a live token. Teardown never calls
+the potentially blocking authentication callback and gives up promptly if the
+session or shared transport lock is busy; static authentication headers still
+apply. Server TTL eviction is the fallback. A response carrying
+`VGI-Session-Close: true` clears
+the token and routing echoes without another teardown request.
+
+Captured tokens and echo headers are validated and bounded before being
+committed. Credential-bearing echo headers are always forbidden, including on
+HTTPS. Invalid, transport-reserved, or oversized echo metadata fails as a
+protocol error without partially replacing
+the last usable routing state. A malformed response body likewise cannot
+commit staged session headers. A valid Arrow exception envelope whose remote
+type is `SessionLostError` throws the dedicated C++ `HttpSessionLostError` class.
 
 ## Limits and transport scope
 
@@ -123,10 +202,17 @@ externalization, byte-limit, upload-URL, and supported-encoding advertisements.
 Capability headers on ordinary responses refine the same internal model and the
 server request limit is enforced on later calls.
 
-The client does not yet provide external-location fetching, shared-memory
-pointer resolution, producer iteration, sticky-session management, or code
-generation. Pointer metadata remains fail-closed rather than returning an
-unresolved pointer as application data.
+`request_upload_urls(count)` exposes the `__upload_url__` control method for
+counts from 1 through 100 and returns `HttpUploadUrl` values containing upload,
+download, and optional microsecond expiry fields. The response schema, row
+count, non-null URLs, and configured external URL policy are validated before
+anything is returned. The operation fails closed when external resolution and
+its URL policy are disabled. Automatic request externalization uses this same
+parser.
+
+Shared-memory pointer resolution and code generation are not provided.
+Disabled or policy-rejected external locations remain fail-closed rather than
+returning an unresolved pointer as application data.
 
 Header names and values containing CR/LF are rejected, and transport-reserved
 headers cannot be overridden. Application metadata using reserved method,

@@ -687,6 +687,13 @@ AnnotatedBatch ClientExternalHttp::resolve_pointer(const AnnotatedBatch& pointer
     auto input = std::make_shared<arrow::io::BufferReader>(arrow::Buffer::FromString(payload));
     const auto contents = read_ipc_stream(input);
     if (!contents) throw ExternalHttpError("external payload contains no Arrow IPC stream");
+    const auto position = input->Tell();
+    if (!position.ok()) {
+        throw ExternalHttpError("external payload position could not be inspected");
+    }
+    if (*position != static_cast<int64_t>(payload.size())) {
+        throw ExternalHttpError("external payload contains trailing data or another IPC stream");
+    }
 
     std::vector<AnnotatedBatch> data;
     for (const auto& batch : contents->batches) {

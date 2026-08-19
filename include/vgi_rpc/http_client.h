@@ -54,6 +54,9 @@ struct CallOptions {
     std::optional<std::chrono::steady_clock::time_point> deadline;
     std::optional<std::string> request_id;
     std::stop_token stop_token;
+    // POST transport failures are ambiguous and are not retried unless the
+    // caller explicitly declares the logical operation idempotent.
+    bool idempotent = false;
 
     static CallOptions with_timeout(std::chrono::milliseconds timeout);
 };
@@ -89,6 +92,12 @@ struct HttpServerCapabilities {
     // An absent advertisement is the legacy-server answer: zstd.  A
     // present-but-empty header replaces this with an empty vector.
     std::vector<std::string> supported_encodings = {"zstd"};
+};
+
+struct HttpUploadUrl {
+    std::string upload_url;
+    std::string download_url;
+    std::optional<int64_t> expires_at_us;
 };
 
 struct HttpClientConfig {
@@ -178,9 +187,17 @@ private:
     std::string request_id_;
 };
 
+class VGI_RPC_EXPORT HttpSessionLostError : public RpcRemoteError {
+public:
+    HttpSessionLostError(std::string message, std::string error_kind, std::string server_id,
+                         std::string request_id, int http_status = 200);
+};
+
 class HttpExchangeSession;
 class HttpStreamSession;
+class HttpSessionView;
 class HttpClientState;
+class HttpStickySessionState;
 class HttpClient;
 
 class VGI_RPC_EXPORT HttpClientBuilder {
@@ -245,6 +262,10 @@ public:
     // Fetch and validate the protocol's version-4 introspection document.
     ServiceDescription describe(const CallOptions& options = {}) const;
 
+    // Request one or more method-bound external upload/download URL pairs.
+    std::vector<HttpUploadUrl> request_upload_urls(int64_t count,
+                                                   const CallOptions& options = {}) const;
+
     // Initialize a bidirectional exchange.  Every input and output batch is
     // checked against the declared schemas before it crosses the API boundary.
     HttpExchangeSession open_exchange(const std::string& method, const AnnotatedBatch& request,
@@ -271,10 +292,66 @@ public:
                                     const std::vector<uint8_t>& resume_token,
                                     std::shared_ptr<arrow::Schema> output_schema) const;
 
+    // Create an independent sticky-session view over this transport. The view
+    // opts into session creation, tracks token rotation and routing echo
+    // headers, and tears down a still-live session on destruction.
+    HttpSessionView with_session_token(std::optional<std::string> token = std::nullopt,
+                                       std::map<std::string, std::string> echo_headers = {}) const;
+
 private:
     friend class HttpClientBuilder;
-    explicit HttpClient(std::shared_ptr<HttpClientState> state);
+    friend class HttpSessionView;
+    explicit HttpClient(std::shared_ptr<HttpClientState> state,
+                        std::shared_ptr<HttpStickySessionState> sticky_session = nullptr);
     std::shared_ptr<HttpClientState> state_;
+    std::shared_ptr<HttpStickySessionState> sticky_session_;
+};
+
+class VGI_RPC_EXPORT HttpSessionView {
+public:
+    ~HttpSessionView();
+    HttpSessionView(HttpSessionView&&) noexcept;
+    HttpSessionView& operator=(HttpSessionView&&) noexcept;
+    HttpSessionView(const HttpSessionView&) = delete;
+    HttpSessionView& operator=(const HttpSessionView&) = delete;
+
+    AnnotatedBatch call(const std::string& method, const AnnotatedBatch& request,
+                        std::shared_ptr<arrow::Schema> expected_output_schema = nullptr,
+                        const CallOptions& options = {}) const;
+    HttpServerCapabilities capabilities(const CallOptions& options = {}) const;
+    ServiceDescription describe(const CallOptions& options = {}) const;
+    std::vector<HttpUploadUrl> request_upload_urls(int64_t count,
+                                                   const CallOptions& options = {}) const;
+    HttpExchangeSession open_exchange(const std::string& method, const AnnotatedBatch& request,
+                                      std::shared_ptr<arrow::Schema> input_schema,
+                                      std::shared_ptr<arrow::Schema> output_schema,
+                                      const CallOptions& options = {}) const;
+    HttpStreamSession open_producer(const std::string& method, const AnnotatedBatch& request,
+                                    std::shared_ptr<arrow::Schema> output_schema,
+                                    bool has_header = false, const CallOptions& options = {}) const;
+    HttpStreamSession open_stream_exchange(const std::string& method, const AnnotatedBatch& request,
+                                           std::shared_ptr<arrow::Schema> input_schema,
+                                           std::shared_ptr<arrow::Schema> output_schema,
+                                           bool has_header = false,
+                                           const CallOptions& options = {}) const;
+    HttpStreamSession resume_stream(const std::string& method,
+                                    const std::vector<uint8_t>& resume_token,
+                                    std::shared_ptr<arrow::Schema> output_schema) const;
+
+    std::optional<std::string> current_session_token() const;
+    std::map<std::string, std::string> current_echo_headers() const;
+    // Forget and return the token without deleting it, for explicit handoff.
+    std::optional<std::string> detach();
+    // Idempotently release local state and best-effort DELETE a live token.
+    void close() noexcept;
+    bool active() const noexcept;
+
+private:
+    friend class HttpClient;
+    HttpSessionView(std::shared_ptr<HttpClientState> state, std::optional<std::string> token,
+                    std::map<std::string, std::string> echo_headers);
+    class Impl;
+    std::unique_ptr<Impl> impl_;
 };
 
 class VGI_RPC_EXPORT HttpExchangeSession {

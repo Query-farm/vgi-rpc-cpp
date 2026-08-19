@@ -21,6 +21,7 @@
 #include <zstd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cmath>
 #include <cstring>
@@ -28,6 +29,7 @@
 #include <limits>
 #include <mutex>
 #include <sstream>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -164,9 +166,9 @@ std::shared_ptr<arrow::Schema> upload_url_response_schema() {
          arrow::field("expires_at", arrow::timestamp(arrow::TimeUnit::MICRO, "UTC"), true)});
 }
 
-AnnotatedBatch upload_url_request() {
+AnnotatedBatch upload_url_request(int64_t count) {
     arrow::Int64Builder builder;
-    VGI_RPC_THROW_NOT_OK(builder.Append(1));
+    VGI_RPC_THROW_NOT_OK(builder.Append(count));
     return AnnotatedBatch::data(
         arrow::RecordBatch::Make(upload_url_request_schema(), 1, {unwrap(builder.Finish())}));
 }
@@ -205,6 +207,14 @@ struct BoundedHttpResponse {
     std::string retry_after;
     std::string auth_reason;
     std::string body;
+    struct StickyUpdate {
+        std::optional<std::string> token;
+        std::map<std::string, std::string> echo_headers;
+    };
+    std::optional<StickyUpdate> sticky_update;
+    // Keeps this session's request/response/Arrow-validation transaction
+    // serialized until its staged routing state is either committed or rejected.
+    std::unique_ptr<std::unique_lock<std::timed_mutex>> sticky_guard;
 };
 
 std::string bounded_text(std::string value, size_t limit) {
@@ -236,7 +246,7 @@ enum class ResponseShape {
     PRODUCER_TURN,
 };
 
-RpcRemoteError remote_error(const AnnotatedBatch& batch, int status) {
+[[noreturn]] void throw_remote_error(const AnnotatedBatch& batch, int status) {
     const auto& metadata = batch.custom_metadata;
     std::string message = get_metadata_value(metadata, keys::LOG_MESSAGE, "remote RPC error");
     std::string exception_type = "RpcError";
@@ -250,9 +260,14 @@ RpcRemoteError remote_error(const AnnotatedBatch& batch, int status) {
         } catch (const std::exception&) {
         }
     }
-    return RpcRemoteError(std::move(exception_type), std::move(message), std::move(error_kind),
-                          get_metadata_value(metadata, keys::SERVER_ID),
-                          get_metadata_value(metadata, keys::REQUEST_ID), status);
+    const std::string server_id = get_metadata_value(metadata, keys::SERVER_ID);
+    const std::string request_id = get_metadata_value(metadata, keys::REQUEST_ID);
+    if (exception_type == "SessionLostError") {
+        throw HttpSessionLostError(std::move(message), std::move(error_kind), server_id, request_id,
+                                   status);
+    }
+    throw RpcRemoteError(std::move(exception_type), std::move(message), std::move(error_kind),
+                         server_id, request_id, status);
 }
 
 DecodedResponse decode_response(const BoundedHttpResponse& response, const HttpClientConfig& config,
@@ -303,7 +318,7 @@ DecodedResponse decode_response(const BoundedHttpResponse& response, const HttpC
                 }
                 const auto level = get_metadata_value(batch.custom_metadata, keys::LOG_LEVEL);
                 if (batch.batch && batch.batch->num_rows() == 0 && !level.empty()) {
-                    if (level == "EXCEPTION") throw remote_error(batch, response.status);
+                    if (level == "EXCEPTION") throw_remote_error(batch, response.status);
                     if (config.on_log) config.on_log(batch);
                     continue;
                 }
@@ -346,7 +361,7 @@ DecodedResponse decode_response(const BoundedHttpResponse& response, const HttpC
             if (batch.batch && batch.batch->num_rows() == 0 && has(keys::LOG_LEVEL) &&
                 has(keys::LOG_MESSAGE)) {
                 if (get_metadata_value(metadata, keys::LOG_LEVEL) == "EXCEPTION") {
-                    throw remote_error(batch, response.status);
+                    throw_remote_error(batch, response.status);
                 }
                 if (config.on_log) config.on_log(batch);
                 continue;
@@ -616,6 +631,31 @@ void validate_headers(const std::map<std::string, std::string>& headers,
     }
 }
 
+void validate_sticky_echo_headers(const std::map<std::string, std::string>& headers,
+                                  bool allow_insecure_credentials, bool secure_transport) {
+    validate_headers(headers, allow_insecure_credentials, secure_transport);
+    if (headers.size() > 100) {
+        throw std::invalid_argument("sticky session has too many echo headers");
+    }
+    size_t total_bytes = 0;
+    for (const auto& [name, value] : headers) {
+        const std::string lower = ascii_lower(name);
+        if (lower == "authorization" || lower == "cookie" || lower == "proxy-authorization") {
+            throw std::invalid_argument("credential-bearing sticky echo headers are forbidden: " +
+                                        name);
+        }
+        if (name.size() > 1024 || value.size() > 8192 || total_bytes > 64 * 1024 ||
+            name.size() > 64 * 1024 - total_bytes) {
+            throw std::invalid_argument("sticky session echo-header state is too large");
+        }
+        total_bytes += name.size();
+        if (value.size() > 64 * 1024 - total_bytes) {
+            throw std::invalid_argument("sticky session echo-header state is too large");
+        }
+        total_bytes += value.size();
+    }
+}
+
 void merge_headers(httplib::Headers& destination,
                    const std::map<std::string, std::string>& source) {
     for (const auto& [name, value] : source) {
@@ -809,6 +849,14 @@ HttpAuthenticationError::HttpAuthenticationError(std::string message, int http_s
       www_authenticate_(bounded_text(std::move(www_authenticate), kMaxStructuredErrorHeaderBytes)) {
 }
 
+class HttpStickySessionState {
+public:
+    mutable std::timed_mutex mutex;
+    std::optional<std::string> token;
+    std::map<std::string, std::string> echo_headers;
+    std::atomic<bool> locally_closed{false};
+};
+
 class HttpClientState {
 public:
     HttpClientState(ParsedBaseUrl base_url, HttpClientConfig client_config, RetryPolicy retry,
@@ -881,9 +929,10 @@ public:
         while (config.prefix.size() > 1 && config.prefix.back() == '/') config.prefix.pop_back();
     }
 
-    BoundedHttpResponse post_inline(const std::string& method, const std::string& request_path,
-                                    const std::string& body, const std::string& request_id,
-                                    const CallOptions& options, bool retryable) {
+    BoundedHttpResponse post_inline(
+        const std::string& method, const std::string& request_path, const std::string& body,
+        const std::string& request_id, const CallOptions& options, bool retryable,
+        const std::shared_ptr<HttpStickySessionState>& sticky_session = nullptr) {
         check_call_active(options, method, request_id);
         std::map<std::string, std::string> auth_headers;
         if (auth_callback) {
@@ -905,6 +954,23 @@ public:
             }
         }
         validate_headers(options.headers, config.allow_insecure_credentials, secure_transport);
+
+        std::unique_lock<std::timed_mutex> session_lock;
+        if (sticky_session) {
+            session_lock =
+                std::unique_lock<std::timed_mutex>(sticky_session->mutex, std::defer_lock);
+            if (!options.deadline && !options.stop_token.stop_possible()) {
+                session_lock.lock();
+            } else {
+                while (!session_lock.try_lock_for(std::chrono::milliseconds(10))) {
+                    check_call_active(options, method, request_id);
+                }
+            }
+            if (sticky_session->locally_closed.load()) {
+                throw HttpClientError(HttpClientErrorKind::PROTOCOL,
+                                      "HTTP sticky-session view is closed", 0, method, request_id);
+            }
+        }
 
         std::unique_lock<std::timed_mutex> lock(mutex, std::defer_lock);
         if (!options.deadline && !options.stop_token.stop_possible()) {
@@ -934,6 +1000,15 @@ public:
             merge_headers(headers, config.headers);
             merge_headers(headers, auth_headers);
             merge_headers(headers, options.headers);
+            if (sticky_session) merge_headers(headers, sticky_session->echo_headers);
+            if (sticky_session) {
+                headers.erase("VGI-Session-Accept");
+                headers.emplace("VGI-Session-Accept", "true");
+                headers.erase("VGI-Session");
+                if (sticky_session->token) {
+                    headers.emplace("VGI-Session", *sticky_session->token);
+                }
+            }
             headers.emplace("Accept-Encoding", "zstd, identity");
             headers.emplace("X-VGI-Accept-Encoding", "zstd, identity");
             headers.emplace("X-Request-ID", request_id);
@@ -999,6 +1074,10 @@ public:
             response.www_authenticate = result->get_header_value("WWW-Authenticate");
             response.retry_after = result->get_header_value("Retry-After");
             response.auth_reason = result->get_header_value("VGI-Auth-Reason");
+            if (sticky_session) {
+                response.sticky_update =
+                    stage_sticky_response(*result, sticky_session, method, request_id);
+            }
             harvest_capabilities(*result, server_capabilities);
             if (server_capabilities.max_request_bytes) {
                 server_max_request_bytes = server_capabilities.max_request_bytes;
@@ -1035,7 +1114,8 @@ public:
         };
 
         auto send = [&](bool compress) {
-            const uint32_t attempts = retryable ? retry_policy.max_attempts : 1;
+            const uint32_t attempts =
+                retryable && options.idempotent ? retry_policy.max_attempts : 1;
             for (uint32_t attempt = 0; attempt < attempts; ++attempt) {
                 if (attempt > 0) {
                     wait_for_retry(retry_delay(retry_policy, attempt), options, method, request_id);
@@ -1065,6 +1145,13 @@ public:
             send_compressed = false;
             response = send(false);
         }
+        auto retain_session_lock = [&](BoundedHttpResponse value) {
+            if (sticky_session && session_lock.owns_lock()) {
+                value.sticky_guard =
+                    std::make_unique<std::unique_lock<std::timed_mutex>>(std::move(session_lock));
+            }
+            return value;
+        };
         const std::string& content_type = response.content_type;
         if (response.status == 401 || response.status == 403) {
             throw HttpAuthenticationError(
@@ -1073,8 +1160,12 @@ public:
                 response.retry_after, response.auth_reason);
         }
         if (response.status < 200 || response.status >= 300) {
-            if (response.status == 413 && external_http) return response;
-            if (content_type.rfind(kArrowContentType, 0) == 0) return response;
+            if (response.status == 413 && external_http) {
+                return retain_session_lock(std::move(response));
+            }
+            if (content_type.rfind(kArrowContentType, 0) == 0) {
+                return retain_session_lock(std::move(response));
+            }
             const std::string detail = safe_error_detail(response.body, 512);
             throw HttpClientError(HttpClientErrorKind::HTTP_STATUS,
                                   "HTTP RPC request failed with status " +
@@ -1089,12 +1180,13 @@ public:
                                       (content_type.empty() ? "<missing>" : content_type),
                                   response.status, method, request_id, response.body);
         }
-        return response;
+        return retain_session_lock(std::move(response));
     }
 
-    BoundedHttpResponse post(const std::string& method, const std::string& request_path,
-                             const std::string& body, const std::string& request_id,
-                             const CallOptions& options, bool retryable) {
+    BoundedHttpResponse post(
+        const std::string& method, const std::string& request_path, const std::string& body,
+        const std::string& request_id, const CallOptions& options, bool retryable,
+        const std::shared_ptr<HttpStickySessionState>& sticky_session = nullptr) {
         bool externalized = false;
         std::string request_body = body;
         auto cached_caps = [&] {
@@ -1107,7 +1199,7 @@ public:
         // either externalize within the separately bounded upload ceiling or
         // fail before transport.
         if (request_body.size() > static_cast<uint64_t>(config.max_request_bytes)) {
-            (void)capabilities(random_hex(16), options);
+            (void)capabilities(random_hex(16), options, sticky_session);
         }
         auto caps = cached_caps();
         const int64_t inline_cap = caps.max_request_bytes
@@ -1115,20 +1207,21 @@ public:
                                        : config.max_request_bytes;
         if (request_body.size() > static_cast<uint64_t>(inline_cap) && external_http &&
             caps.upload_url_support) {
-            request_body = externalize_request(body, options);
+            request_body = externalize_request(body, options, sticky_session);
             externalized = true;
         }
 
-        auto response =
-            post_inline(method, request_path, request_body, request_id, options, retryable);
+        auto response = post_inline(method, request_path, request_body, request_id, options,
+                                    retryable, sticky_session);
         // A 413 is a pre-dispatch rejection, so replacing the body with a
         // method-bound pointer and retrying once is safe even for exchange.
         if (response.status == 413 && !externalized && external_http) {
             caps = cached_caps();
             if (caps.upload_url_support) {
-                request_body = externalize_request(body, options);
-                response =
-                    post_inline(method, request_path, request_body, request_id, options, retryable);
+                response.sticky_guard.reset();
+                request_body = externalize_request(body, options, sticky_session);
+                response = post_inline(method, request_path, request_body, request_id, options,
+                                       retryable, sticky_session);
             }
         }
         if (response.status == 413 && response.content_type.rfind(kArrowContentType, 0) != 0) {
@@ -1141,7 +1234,101 @@ public:
         return response;
     }
 
-    HttpServerCapabilities capabilities(const std::string& request_id, const CallOptions& options) {
+    std::vector<HttpUploadUrl> request_upload_urls(
+        int64_t count, const CallOptions& options,
+        const std::shared_ptr<HttpStickySessionState>& sticky_session = nullptr) {
+        if (count < 1 || count > 100) {
+            throw std::invalid_argument("upload URL count must be between 1 and 100");
+        }
+        if (!external_http) {
+            throw HttpClientError(HttpClientErrorKind::LIMIT,
+                                  "upload URL requests require external URL validation", 0, {}, {});
+        }
+        const std::string control_method = "__upload_url__";
+        const std::string control_id = logical_request_id(options);
+        const auto metadata =
+            request_metadata(nullptr, control_method, config.protocol_version, control_id);
+        const std::string control_body =
+            encode_ipc(upload_url_request(count), metadata, config.max_request_bytes);
+        const auto response = post_inline(control_method, path(control_method, "/init"),
+                                          control_body, control_id, options, true, sticky_session);
+        auto decoded = decode(response, ResponseShape::UNARY, false, nullptr, sticky_session);
+        const auto expected_schema = upload_url_response_schema();
+        if (!schema_equals(decoded.schema, expected_schema) || decoded.data.size() != 1 ||
+            !decoded.data.front().batch || decoded.data.front().batch->num_rows() != count) {
+            throw HttpClientError("upload URL response has an invalid Arrow shape");
+        }
+        const auto& batch = decoded.data.front().batch;
+        auto uploads = std::dynamic_pointer_cast<arrow::StringArray>(batch->column(0));
+        auto downloads = std::dynamic_pointer_cast<arrow::StringArray>(batch->column(1));
+        auto expirations = std::dynamic_pointer_cast<arrow::TimestampArray>(batch->column(2));
+        if (!uploads || !downloads || !expirations) {
+            throw HttpClientError("upload URL response has invalid Arrow column types");
+        }
+        std::vector<HttpUploadUrl> urls;
+        urls.reserve(static_cast<size_t>(count));
+        for (int64_t row = 0; row < count; ++row) {
+            if (uploads->IsNull(row) || downloads->IsNull(row)) {
+                throw HttpClientError("upload URL response contains a null URL");
+            }
+            HttpUploadUrl url;
+            url.upload_url = uploads->GetString(row);
+            url.download_url = downloads->GetString(row);
+            if (!expirations->IsNull(row)) url.expires_at_us = expirations->Value(row);
+            try {
+                external_http->validate_url(url.upload_url);
+                external_http->validate_url(url.download_url);
+            } catch (const ExternalHttpError& error) {
+                throw HttpClientError(
+                    HttpClientErrorKind::PROTOCOL,
+                    std::string("upload URL response violates external URL policy: ") +
+                        error.what(),
+                    response.status, control_method, control_id);
+            }
+            urls.push_back(std::move(url));
+        }
+        return urls;
+    }
+
+    void delete_session_best_effort(
+        const std::string& token, const std::map<std::string, std::string>& echo_headers) noexcept {
+        try {
+            const std::string request_id = random_hex(16);
+            const std::string request_path = path("__session__");
+            validate_sticky_echo_headers(echo_headers, config.allow_insecure_credentials,
+                                         secure_transport);
+
+            std::unique_lock<std::timed_mutex> lock(mutex, std::defer_lock);
+            if (!lock.try_lock_for(std::chrono::milliseconds(50))) return;
+            httplib::Headers headers;
+            merge_headers(headers, config.headers);
+            merge_headers(headers, echo_headers);
+            headers.erase("VGI-Session");
+            headers.emplace("VGI-Session", token);
+            headers.emplace("X-Request-ID", request_id);
+
+            httplib::Request request;
+            request.method = "DELETE";
+            request.path = request_path;
+            request.headers = std::move(headers);
+            request.content_receiver = [](const char*, size_t, uint64_t, uint64_t) { return true; };
+            httplib::Response response;
+            httplib::Error error = httplib::Error::Success;
+            client->set_max_timeout(250);
+            try {
+                (void)client->send(request, response, error);
+            } catch (...) {
+                client->set_max_timeout(0);
+                throw;
+            }
+            client->set_max_timeout(0);
+        } catch (...) {
+        }
+    }
+
+    HttpServerCapabilities capabilities(
+        const std::string& request_id, const CallOptions& options,
+        const std::shared_ptr<HttpStickySessionState>& sticky_session = nullptr) {
         check_call_active(options, "OPTIONS", request_id);
         std::map<std::string, std::string> auth_headers;
         const std::string health_path = path("health");
@@ -1164,6 +1351,19 @@ public:
             }
         }
         validate_headers(options.headers, config.allow_insecure_credentials, secure_transport);
+        std::unique_lock<std::timed_mutex> session_lock;
+        if (sticky_session) {
+            session_lock =
+                std::unique_lock<std::timed_mutex>(sticky_session->mutex, std::defer_lock);
+            while (!session_lock.try_lock_for(std::chrono::milliseconds(10))) {
+                check_call_active(options, "OPTIONS", request_id);
+            }
+            if (sticky_session->locally_closed.load()) {
+                throw HttpClientError(HttpClientErrorKind::PROTOCOL,
+                                      "HTTP sticky-session view is closed", 0, "OPTIONS",
+                                      request_id);
+            }
+        }
         std::unique_lock<std::timed_mutex> lock(mutex, std::defer_lock);
         while (!lock.try_lock_for(std::chrono::milliseconds(10))) {
             check_call_active(options, "OPTIONS", request_id);
@@ -1180,6 +1380,15 @@ public:
             merge_headers(headers, config.headers);
             merge_headers(headers, auth_headers);
             merge_headers(headers, options.headers);
+            if (sticky_session) {
+                merge_headers(headers, sticky_session->echo_headers);
+                headers.erase("VGI-Session-Accept");
+                headers.emplace("VGI-Session-Accept", "true");
+                headers.erase("VGI-Session");
+                if (sticky_session->token) {
+                    headers.emplace("VGI-Session", *sticky_session->token);
+                }
+            }
             headers.emplace("Accept-Encoding", "identity");
             headers.emplace("X-Request-ID", request_id);
             if (options.deadline) {
@@ -1230,6 +1439,11 @@ public:
             // cpp-httplib routes a streaming receiver into Request::body;
             // move it onto the response-shaped object used below.
             response.body = std::move(request.body);
+            std::optional<BoundedHttpResponse::StickyUpdate> sticky_update;
+            if (sticky_session) {
+                sticky_update =
+                    stage_sticky_response(response, sticky_session, "OPTIONS", request_id);
+            }
             if (response.status == 401 || response.status == 403) {
                 throw HttpAuthenticationError("HTTP capability authentication failed",
                                               response.status, "OPTIONS", request_id, response.body,
@@ -1247,6 +1461,16 @@ public:
                     response.status, "OPTIONS", request_id, response.body,
                     response.get_header_value("Retry-After"),
                     response.get_header_value("VGI-Auth-Reason"));
+            }
+            if (sticky_update) {
+                if (sticky_session->locally_closed.load()) {
+                    throw HttpClientError(
+                        HttpClientErrorKind::PROTOCOL,
+                        "HTTP sticky-session view was closed before response commit",
+                        response.status, "OPTIONS", request_id);
+                }
+                sticky_session->token = std::move(sticky_update->token);
+                sticky_session->echo_headers = std::move(sticky_update->echo_headers);
             }
             server_capabilities = HttpServerCapabilities{};
             harvest_capabilities(response, server_capabilities);
@@ -1290,8 +1514,123 @@ public:
 
     ClientExternalHttp* external() const noexcept { return external_http.get(); }
 
+    DecodedResponse decode(const BoundedHttpResponse& response, ResponseShape shape,
+                           bool has_header, ClientExternalHttp* external_resolver,
+                           const std::shared_ptr<HttpStickySessionState>& sticky_session) {
+        if (sticky_session && (!response.sticky_guard || !response.sticky_guard->owns_lock())) {
+            throw HttpClientError(HttpClientErrorKind::PROTOCOL,
+                                  "sticky response lost its serialization guard", response.status,
+                                  {}, {});
+        }
+        if (sticky_session && sticky_session->locally_closed.load()) {
+            throw HttpClientError(HttpClientErrorKind::PROTOCOL,
+                                  "HTTP sticky-session view was closed before response commit",
+                                  response.status, {}, {});
+        }
+        try {
+            auto decoded = decode_response(response, config, shape, has_header, external_resolver);
+            commit_sticky_response(response, sticky_session);
+            return decoded;
+        } catch (const RpcRemoteError&) {
+            // A valid Arrow exception envelope is a protocol-valid response;
+            // it may intentionally rotate or close the sticky session.
+            commit_sticky_response(response, sticky_session);
+            throw;
+        }
+    }
+
+    void validate_sticky_seed(const std::map<std::string, std::string>& echo_headers) const {
+        validate_sticky_echo_headers(echo_headers, config.allow_insecure_credentials,
+                                     secure_transport);
+    }
+
 private:
-    std::string externalize_request(const std::string& body, const CallOptions& options) {
+    BoundedHttpResponse::StickyUpdate stage_sticky_response(
+        const httplib::Response& response,
+        const std::shared_ptr<HttpStickySessionState>& sticky_session, const std::string& method,
+        const std::string& request_id) {
+        auto next_token = sticky_session->token;
+        auto next_echo_headers = sticky_session->echo_headers;
+        const std::string token = response.get_header_value("VGI-Session");
+        if (!token.empty()) {
+            if (token.size() > 8192 || token.find_first_of("\r\n") != std::string::npos) {
+                throw HttpClientError(HttpClientErrorKind::PROTOCOL,
+                                      "server returned an invalid sticky-session token",
+                                      response.status, method, request_id);
+            }
+            next_token = token;
+        }
+        constexpr std::string_view echo_prefix = "vgi-echo-";
+        for (const auto& [name, value] : response.headers) {
+            if (ascii_lower(name).rfind(echo_prefix, 0) != 0) continue;
+            std::string replay_name = name.substr(echo_prefix.size());
+            if (replay_name.size() > 1024 || value.size() > 8192) {
+                throw HttpClientError(HttpClientErrorKind::PROTOCOL,
+                                      "server returned an oversized sticky echo header",
+                                      response.status, method, request_id);
+            }
+            std::map<std::string, std::string> candidate{{replay_name, value}};
+            try {
+                validate_sticky_echo_headers(candidate, config.allow_insecure_credentials,
+                                             secure_transport);
+            } catch (const std::exception& error) {
+                throw HttpClientError(
+                    HttpClientErrorKind::PROTOCOL,
+                    std::string("server returned an invalid sticky echo header: ") + error.what(),
+                    response.status, method, request_id);
+            }
+            for (auto it = next_echo_headers.begin(); it != next_echo_headers.end();) {
+                if (ascii_lower(it->first) == ascii_lower(replay_name)) {
+                    it = next_echo_headers.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+            next_echo_headers.insert_or_assign(std::move(replay_name), value);
+        }
+        size_t echo_bytes = 0;
+        for (const auto& [name, value] : next_echo_headers) {
+            if (name.size() > 1024 || value.size() > 8192 || echo_bytes > 64 * 1024 ||
+                name.size() > 64 * 1024 - echo_bytes) {
+                throw HttpClientError(HttpClientErrorKind::PROTOCOL,
+                                      "server returned too much sticky echo-header state",
+                                      response.status, method, request_id);
+            }
+            echo_bytes += name.size();
+            if (value.size() > 64 * 1024 - echo_bytes) {
+                throw HttpClientError(HttpClientErrorKind::PROTOCOL,
+                                      "server returned too much sticky echo-header state",
+                                      response.status, method, request_id);
+            }
+            echo_bytes += value.size();
+        }
+        if (next_echo_headers.size() > 100) {
+            throw HttpClientError(HttpClientErrorKind::PROTOCOL,
+                                  "server returned too many sticky echo headers", response.status,
+                                  method, request_id);
+        }
+        if (ascii_lower(trim_ascii(response.get_header_value("VGI-Session-Close"))) == "true") {
+            next_token.reset();
+            next_echo_headers.clear();
+        }
+        return {std::move(next_token), std::move(next_echo_headers)};
+    }
+
+    static void commit_sticky_response(
+        const BoundedHttpResponse& response,
+        const std::shared_ptr<HttpStickySessionState>& sticky_session) {
+        if (!sticky_session || !response.sticky_update) return;
+        if (sticky_session->locally_closed.load()) {
+            throw HttpClientError(HttpClientErrorKind::PROTOCOL,
+                                  "HTTP sticky-session view was closed before response commit",
+                                  response.status, {}, {});
+        }
+        sticky_session->token = response.sticky_update->token;
+        sticky_session->echo_headers = response.sticky_update->echo_headers;
+    }
+
+    std::string externalize_request(const std::string& body, const CallOptions& options,
+                                    const std::shared_ptr<HttpStickySessionState>& sticky_session) {
         if (!external_http) {
             throw HttpClientError(HttpClientErrorKind::LIMIT, "request externalization is disabled",
                                   0, {}, {});
@@ -1315,30 +1654,10 @@ private:
                                   0, {}, {});
         }
 
-        const std::string control_method = "__upload_url__";
-        const std::string control_id = random_hex(16);
-        const auto metadata =
-            request_metadata(nullptr, control_method, config.protocol_version, control_id);
-        const std::string control_body =
-            encode_ipc(upload_url_request(), metadata, config.max_request_bytes);
-        const auto response = post_inline(control_method, path(control_method, "/init"),
-                                          control_body, control_id, options, true);
-        auto decoded = decode_response(response, config, ResponseShape::UNARY, false, nullptr);
-        const auto expected_schema = upload_url_response_schema();
-        if (!schema_equals(decoded.schema, expected_schema) || decoded.data.size() != 1 ||
-            !decoded.data.front().batch || decoded.data.front().batch->num_rows() != 1) {
-            throw HttpClientError("upload URL response has an invalid Arrow shape");
-        }
-        const auto& batch = decoded.data.front().batch;
-        auto uploads = std::dynamic_pointer_cast<arrow::StringArray>(batch->column(0));
-        auto downloads = std::dynamic_pointer_cast<arrow::StringArray>(batch->column(1));
-        if (!uploads || !downloads || uploads->IsNull(0) || downloads->IsNull(0)) {
-            throw HttpClientError("upload URL response contains null or non-string URLs");
-        }
-        const std::string upload_url = uploads->GetString(0);
-        const std::string download_url = downloads->GetString(0);
+        const auto urls = request_upload_urls(1, options, sticky_session);
+        const std::string& upload_url = urls.front().upload_url;
+        const std::string& download_url = urls.front().download_url;
         try {
-            external_http->validate_url(download_url);
             external_http->put(upload_url, body, kArrowContentType);
         } catch (const ExternalHttpError& error) {
             throw HttpClientError(HttpClientErrorKind::TRANSPORT,
@@ -1373,6 +1692,12 @@ RpcRemoteError::RpcRemoteError(std::string exception_type, std::string message,
       error_kind_(std::move(error_kind)),
       server_id_(std::move(server_id)),
       request_id_(std::move(request_id)) {}
+
+HttpSessionLostError::HttpSessionLostError(std::string message, std::string error_kind,
+                                           std::string server_id, std::string request_id,
+                                           int http_status)
+    : RpcRemoteError("SessionLostError", std::move(message), std::move(error_kind),
+                     std::move(server_id), std::move(request_id), http_status) {}
 
 class HttpClientBuilder::Impl {
 public:
@@ -1512,7 +1837,9 @@ HttpClient::HttpClient(std::string base_url, HttpClientConfig config)
                                                std::move(config), RetryPolicy{}, TlsOptions{},
                                                HttpAuthCallback{}, ClientExternalHttpOptions{})) {}
 
-HttpClient::HttpClient(std::shared_ptr<HttpClientState> state) : state_(std::move(state)) {}
+HttpClient::HttpClient(std::shared_ptr<HttpClientState> state,
+                       std::shared_ptr<HttpStickySessionState> sticky_session)
+    : state_(std::move(state)), sticky_session_(std::move(sticky_session)) {}
 
 HttpClient::~HttpClient() = default;
 
@@ -1527,9 +1854,9 @@ AnnotatedBatch HttpClient::call(const std::string& method, const AnnotatedBatch&
     const auto response =
         state_->post(method, state_->path(method),
                      encode_ipc(request, metadata, state_->request_serialization_cap()), request_id,
-                     options, true);
+                     options, true, sticky_session_);
     auto decoded =
-        decode_response(response, state_->config, ResponseShape::UNARY, false, state_->external());
+        state_->decode(response, ResponseShape::UNARY, false, state_->external(), sticky_session_);
     if (expected_output_schema && !schema_equals(decoded.schema, expected_output_schema)) {
         throw HttpClientError(
             schema_mismatch("RPC response", expected_output_schema, decoded.schema));
@@ -1543,7 +1870,7 @@ AnnotatedBatch HttpClient::call(const std::string& method, const AnnotatedBatch&
 
 HttpServerCapabilities HttpClient::capabilities(const CallOptions& options) const {
     if (!state_) throw HttpClientError("HttpClient is moved from");
-    return state_->capabilities(logical_request_id(options), options);
+    return state_->capabilities(logical_request_id(options), options, sticky_session_);
 }
 
 ServiceDescription HttpClient::describe(const CallOptions& options) const {
@@ -1551,9 +1878,168 @@ ServiceDescription HttpClient::describe(const CallOptions& options) const {
     return parse_service_description(call("__describe__", request, nullptr, options));
 }
 
+std::vector<HttpUploadUrl> HttpClient::request_upload_urls(int64_t count,
+                                                           const CallOptions& options) const {
+    if (!state_) throw HttpClientError("HttpClient is moved from");
+    return state_->request_upload_urls(count, options, sticky_session_);
+}
+
+HttpSessionView HttpClient::with_session_token(
+    std::optional<std::string> token, std::map<std::string, std::string> echo_headers) const {
+    if (!state_) throw HttpClientError("HttpClient is moved from");
+    return HttpSessionView(state_, std::move(token), std::move(echo_headers));
+}
+
+class HttpSessionView::Impl {
+public:
+    Impl(std::shared_ptr<HttpClientState> state,
+         std::shared_ptr<HttpStickySessionState> sticky_session)
+        : state(std::move(state)),
+          sticky_session(std::move(sticky_session)),
+          client(this->state, this->sticky_session) {}
+
+    std::shared_ptr<HttpClientState> state;
+    std::shared_ptr<HttpStickySessionState> sticky_session;
+    HttpClient client;
+};
+
+HttpSessionView::HttpSessionView(std::shared_ptr<HttpClientState> state,
+                                 std::optional<std::string> token,
+                                 std::map<std::string, std::string> echo_headers) {
+    if (token && (token->empty() || token->size() > 8192 ||
+                  token->find_first_of("\r\n") != std::string::npos)) {
+        throw std::invalid_argument(
+            "initial sticky-session token must be 1-8192 characters without CR/LF");
+    }
+    state->validate_sticky_seed(echo_headers);
+    auto sticky_session = std::make_shared<HttpStickySessionState>();
+    sticky_session->token = std::move(token);
+    sticky_session->echo_headers = std::move(echo_headers);
+    impl_ = std::make_unique<Impl>(std::move(state), std::move(sticky_session));
+}
+
+HttpSessionView::~HttpSessionView() {
+    close();
+}
+
+HttpSessionView::HttpSessionView(HttpSessionView&&) noexcept = default;
+
+HttpSessionView& HttpSessionView::operator=(HttpSessionView&& other) noexcept {
+    if (this != &other) {
+        close();
+        impl_ = std::move(other.impl_);
+    }
+    return *this;
+}
+
+AnnotatedBatch HttpSessionView::call(const std::string& method, const AnnotatedBatch& request,
+                                     std::shared_ptr<arrow::Schema> expected_output_schema,
+                                     const CallOptions& options) const {
+    if (!impl_) throw HttpClientError("HTTP sticky-session view is moved from");
+    return impl_->client.call(method, request, std::move(expected_output_schema), options);
+}
+
+HttpServerCapabilities HttpSessionView::capabilities(const CallOptions& options) const {
+    if (!impl_) throw HttpClientError("HTTP sticky-session view is moved from");
+    return impl_->client.capabilities(options);
+}
+
+ServiceDescription HttpSessionView::describe(const CallOptions& options) const {
+    if (!impl_) throw HttpClientError("HTTP sticky-session view is moved from");
+    return impl_->client.describe(options);
+}
+
+std::vector<HttpUploadUrl> HttpSessionView::request_upload_urls(int64_t count,
+                                                                const CallOptions& options) const {
+    if (!impl_) throw HttpClientError("HTTP sticky-session view is moved from");
+    return impl_->client.request_upload_urls(count, options);
+}
+
+HttpExchangeSession HttpSessionView::open_exchange(const std::string& method,
+                                                   const AnnotatedBatch& request,
+                                                   std::shared_ptr<arrow::Schema> input_schema,
+                                                   std::shared_ptr<arrow::Schema> output_schema,
+                                                   const CallOptions& options) const {
+    if (!impl_) throw HttpClientError("HTTP sticky-session view is moved from");
+    return impl_->client.open_exchange(method, request, std::move(input_schema),
+                                       std::move(output_schema), options);
+}
+
+HttpStreamSession HttpSessionView::open_producer(const std::string& method,
+                                                 const AnnotatedBatch& request,
+                                                 std::shared_ptr<arrow::Schema> output_schema,
+                                                 bool has_header,
+                                                 const CallOptions& options) const {
+    if (!impl_) throw HttpClientError("HTTP sticky-session view is moved from");
+    return impl_->client.open_producer(method, request, std::move(output_schema), has_header,
+                                       options);
+}
+
+HttpStreamSession HttpSessionView::open_stream_exchange(
+    const std::string& method, const AnnotatedBatch& request,
+    std::shared_ptr<arrow::Schema> input_schema, std::shared_ptr<arrow::Schema> output_schema,
+    bool has_header, const CallOptions& options) const {
+    if (!impl_) throw HttpClientError("HTTP sticky-session view is moved from");
+    return impl_->client.open_stream_exchange(method, request, std::move(input_schema),
+                                              std::move(output_schema), has_header, options);
+}
+
+HttpStreamSession HttpSessionView::resume_stream(
+    const std::string& method, const std::vector<uint8_t>& resume_token,
+    std::shared_ptr<arrow::Schema> output_schema) const {
+    if (!impl_) throw HttpClientError("HTTP sticky-session view is moved from");
+    return impl_->client.resume_stream(method, resume_token, std::move(output_schema));
+}
+
+std::optional<std::string> HttpSessionView::current_session_token() const {
+    if (!impl_) return std::nullopt;
+    std::lock_guard<std::timed_mutex> lock(impl_->sticky_session->mutex);
+    return impl_->sticky_session->token;
+}
+
+std::map<std::string, std::string> HttpSessionView::current_echo_headers() const {
+    if (!impl_) return {};
+    std::lock_guard<std::timed_mutex> lock(impl_->sticky_session->mutex);
+    return impl_->sticky_session->echo_headers;
+}
+
+std::optional<std::string> HttpSessionView::detach() {
+    if (!impl_) return std::nullopt;
+    std::lock_guard<std::timed_mutex> lock(impl_->sticky_session->mutex);
+    auto token = std::move(impl_->sticky_session->token);
+    impl_->sticky_session->token.reset();
+    impl_->sticky_session->echo_headers.clear();
+    impl_->sticky_session->locally_closed.store(true);
+    return token;
+}
+
+void HttpSessionView::close() noexcept {
+    if (!impl_) return;
+    try {
+        if (impl_->sticky_session->locally_closed.exchange(true)) return;
+        std::unique_lock<std::timed_mutex> lock(impl_->sticky_session->mutex, std::defer_lock);
+        // Destruction is local and bounded even if another request is stuck.
+        // The server TTL is the safety net when we cannot safely snapshot a
+        // concurrently rotating token for DELETE.
+        if (!lock.try_lock_for(std::chrono::milliseconds(50))) return;
+        auto token = std::move(impl_->sticky_session->token);
+        auto echo_headers = std::move(impl_->sticky_session->echo_headers);
+        impl_->sticky_session->token.reset();
+        impl_->sticky_session->echo_headers.clear();
+        lock.unlock();
+        if (token) impl_->state->delete_session_best_effort(*token, echo_headers);
+    } catch (...) {
+    }
+}
+
+bool HttpSessionView::active() const noexcept {
+    return impl_ && !impl_->sticky_session->locally_closed.load();
+}
+
 class HttpExchangeSession::Impl {
 public:
     std::shared_ptr<HttpClientState> state;
+    std::shared_ptr<HttpStickySessionState> sticky_session;
     std::string method;
     std::shared_ptr<arrow::Schema> input_schema;
     std::shared_ptr<arrow::Schema> output_schema;
@@ -1578,9 +2064,9 @@ HttpExchangeSession HttpClient::open_exchange(const std::string& method,
     const auto response =
         state_->post(method, state_->path(method, "/init"),
                      encode_ipc(request, metadata, state_->request_serialization_cap()), request_id,
-                     options, true);
-    auto decoded = decode_response(response, state_->config, ResponseShape::EXCHANGE_INIT, false,
-                                   state_->external());
+                     options, true, sticky_session_);
+    auto decoded = state_->decode(response, ResponseShape::EXCHANGE_INIT, false, state_->external(),
+                                  sticky_session_);
     if (!schema_equals(decoded.schema, output_schema)) {
         throw HttpClientError(
             schema_mismatch("exchange init response", output_schema, decoded.schema));
@@ -1588,6 +2074,7 @@ HttpExchangeSession HttpClient::open_exchange(const std::string& method,
 
     auto impl = std::make_unique<HttpExchangeSession::Impl>();
     impl->state = state_;
+    impl->sticky_session = sticky_session_;
     impl->method = method;
     impl->input_schema = std::move(input_schema);
     impl->output_schema = std::move(output_schema);
@@ -1647,9 +2134,9 @@ AnnotatedBatch HttpExchangeSession::exchange(const AnnotatedBatch& input,
     impl_->is_active = false;
     const auto response =
         impl_->state->post(impl_->method, impl_->state->path(impl_->method, "/exchange"), body,
-                           request_id, options, false);
-    auto decoded = decode_response(response, impl_->state->config, ResponseShape::EXCHANGE_TURN,
-                                   false, impl_->state->external());
+                           request_id, options, false, impl_->sticky_session);
+    auto decoded = impl_->state->decode(response, ResponseShape::EXCHANGE_TURN, false,
+                                        impl_->state->external(), impl_->sticky_session);
     if (!schema_equals(decoded.schema, impl_->output_schema)) {
         throw HttpClientError(
             schema_mismatch("exchange response", impl_->output_schema, decoded.schema));
@@ -1693,7 +2180,7 @@ void HttpExchangeSession::cancel() noexcept {
         (void)impl_->state->post(
             impl_->method, impl_->state->path(impl_->method, "/exchange"),
             encode_ipc(cancel, metadata, impl_->state->request_serialization_cap()), request_id,
-            CallOptions{}, false);
+            CallOptions{}, false, impl_->sticky_session);
     } catch (const std::exception&) {
         // Cancellation is best-effort.  The opaque token's own expiry remains
         // the fallback when the peer is unavailable.
@@ -1707,6 +2194,7 @@ bool HttpExchangeSession::active() const noexcept {
 class HttpStreamSession::Impl {
 public:
     std::shared_ptr<HttpClientState> state;
+    std::shared_ptr<HttpStickySessionState> sticky_session;
     std::string method;
     HttpStreamKind stream_kind = HttpStreamKind::PRODUCER;
     std::shared_ptr<arrow::Schema> input_schema;
@@ -1746,13 +2234,15 @@ namespace {
 std::unique_ptr<HttpStreamSession::Impl> make_http_stream_impl(
     const std::shared_ptr<HttpClientState>& state, std::string method, HttpStreamKind kind,
     std::shared_ptr<arrow::Schema> input_schema, std::shared_ptr<arrow::Schema> output_schema,
-    DecodedResponse decoded) {
+    DecodedResponse decoded,
+    const std::shared_ptr<HttpStickySessionState>& sticky_session = nullptr) {
     if (!schema_equals(decoded.schema, output_schema)) {
         throw HttpClientError(
             schema_mismatch("stream init response", output_schema, decoded.schema));
     }
     auto impl = std::make_unique<HttpStreamSession::Impl>();
     impl->state = state;
+    impl->sticky_session = sticky_session;
     impl->method = std::move(method);
     impl->stream_kind = kind;
     impl->input_schema = std::move(input_schema);
@@ -1785,12 +2275,12 @@ HttpStreamSession HttpClient::open_producer(const std::string& method,
     const auto response =
         state_->post(method, state_->path(method, "/init"),
                      encode_ipc(request, metadata, state_->request_serialization_cap()), request_id,
-                     options, true);
-    auto decoded = decode_response(response, state_->config, ResponseShape::STREAM_INIT, has_header,
-                                   state_->external());
+                     options, true, sticky_session_);
+    auto decoded = state_->decode(response, ResponseShape::STREAM_INIT, has_header,
+                                  state_->external(), sticky_session_);
     return HttpStreamSession(make_http_stream_impl(state_, method, HttpStreamKind::PRODUCER,
                                                    empty_schema(), std::move(output_schema),
-                                                   std::move(decoded)));
+                                                   std::move(decoded), sticky_session_));
 }
 
 HttpStreamSession HttpClient::open_stream_exchange(const std::string& method,
@@ -1810,15 +2300,15 @@ HttpStreamSession HttpClient::open_stream_exchange(const std::string& method,
     const auto response =
         state_->post(method, state_->path(method, "/init"),
                      encode_ipc(request, metadata, state_->request_serialization_cap()), request_id,
-                     options, true);
-    auto decoded = decode_response(response, state_->config, ResponseShape::STREAM_INIT, has_header,
-                                   state_->external());
+                     options, true, sticky_session_);
+    auto decoded = state_->decode(response, ResponseShape::STREAM_INIT, has_header,
+                                  state_->external(), sticky_session_);
     if (!decoded.data.empty()) {
         throw HttpClientError("exchange init unexpectedly returned application data");
     }
     auto impl =
         make_http_stream_impl(state_, method, HttpStreamKind::EXCHANGE, std::move(input_schema),
-                              std::move(output_schema), std::move(decoded));
+                              std::move(output_schema), std::move(decoded), sticky_session_);
     if (impl->cursor.empty()) {
         throw HttpClientError("exchange init response did not contain a continuation token");
     }
@@ -1836,6 +2326,7 @@ HttpStreamSession HttpClient::resume_stream(const std::string& method,
     if (cursor.empty()) throw std::invalid_argument("resume token contains an empty cursor");
     auto impl = std::make_unique<HttpStreamSession::Impl>();
     impl->state = state_;
+    impl->sticky_session = sticky_session_;
     impl->method = method;
     impl->stream_kind = HttpStreamKind::PRODUCER;
     impl->input_schema = empty_schema();
@@ -1889,12 +2380,17 @@ std::optional<AnnotatedBatch> HttpStreamSession::tick(const CallOptions& options
         const std::string request_id = logical_request_id(options);
         auto metadata = impl_->continuation_metadata(request_id);
         const AnnotatedBatch request = AnnotatedBatch::data(make_empty_batch(empty_schema()));
+        // Producer continuation cursors describe immutable prior state, so
+        // replaying the same token is protocol-idempotent even when the caller
+        // has not opted an application RPC into POST retries.
+        CallOptions continuation_options = options;
+        continuation_options.idempotent = true;
         const auto response = impl_->state->post(
             impl_->method, impl_->state->path(impl_->method, "/exchange"),
             encode_ipc(request, metadata, impl_->state->request_serialization_cap()), request_id,
-            options, true);
-        auto decoded = decode_response(response, impl_->state->config, ResponseShape::PRODUCER_TURN,
-                                       false, impl_->state->external());
+            continuation_options, true, impl_->sticky_session);
+        auto decoded = impl_->state->decode(response, ResponseShape::PRODUCER_TURN, false,
+                                            impl_->state->external(), impl_->sticky_session);
         if (!schema_equals(decoded.schema, impl_->output_schema)) {
             throw HttpClientError(
                 schema_mismatch("producer response", impl_->output_schema, decoded.schema));
@@ -1950,9 +2446,9 @@ std::optional<AnnotatedBatch> HttpStreamSession::exchange(const AnnotatedBatch& 
     const auto response =
         impl_->state->post(impl_->method, impl_->state->path(impl_->method, "/exchange"),
                            encode_ipc(input, metadata, impl_->state->request_serialization_cap()),
-                           request_id, options, false);
-    auto decoded = decode_response(response, impl_->state->config, ResponseShape::EXCHANGE_TURN,
-                                   false, impl_->state->external());
+                           request_id, options, false, impl_->sticky_session);
+    auto decoded = impl_->state->decode(response, ResponseShape::EXCHANGE_TURN, false,
+                                        impl_->state->external(), impl_->sticky_session);
     if (!schema_equals(decoded.schema, impl_->output_schema)) {
         throw HttpClientError(
             schema_mismatch("exchange response", impl_->output_schema, decoded.schema));
@@ -2003,7 +2499,7 @@ void HttpStreamSession::cancel() noexcept {
         (void)impl_->state->post(
             impl_->method, impl_->state->path(impl_->method, "/exchange"),
             encode_ipc(request, metadata, impl_->state->request_serialization_cap()), request_id,
-            CallOptions{}, false);
+            CallOptions{}, false, impl_->sticky_session);
     } catch (const std::exception&) {
     }
     close();

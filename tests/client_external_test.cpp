@@ -196,12 +196,20 @@ TEST_CASE("external pointer resolution parses one IPC level and frees signed URL
     const std::string nested_payload = encode_ipc(
         value_schema(),
         {AnnotatedBatch::with_metadata(make_empty_batch(value_schema()), nested_metadata)});
+    const std::string trailing_payload = payload + "trailing-data";
+    const std::string additional_stream_payload = payload + payload;
     LoopbackServer server([&](httplib::Server& http) {
         http.Get("/pointer", [&](const httplib::Request&, httplib::Response& response) {
             response.set_content(payload, "application/vnd.apache.arrow.stream");
         });
         http.Get("/nested", [&](const httplib::Request&, httplib::Response& response) {
             response.set_content(nested_payload, "application/vnd.apache.arrow.stream");
+        });
+        http.Get("/trailing", [&](const httplib::Request&, httplib::Response& response) {
+            response.set_content(trailing_payload, "application/vnd.apache.arrow.stream");
+        });
+        http.Get("/additional-stream", [&](const httplib::Request&, httplib::Response& response) {
+            response.set_content(additional_stream_payload, "application/vnd.apache.arrow.stream");
         });
     });
     ClientExternalHttp client(loopback_options());
@@ -231,6 +239,14 @@ TEST_CASE("external pointer resolution parses one IPC level and frees signed URL
     const AnnotatedBatch nested_outer =
         AnnotatedBatch::with_metadata(make_empty_batch(value_schema()), nested_outer_metadata);
     REQUIRE_THROWS_AS(client.resolve_pointer(nested_outer), ExternalHttpError);
+
+    for (const std::string& path : {"/trailing", "/additional-stream"}) {
+        auto invalid_metadata = std::make_shared<arrow::KeyValueMetadata>();
+        invalid_metadata->Append(keys::LOCATION, server.url(path));
+        const AnnotatedBatch invalid =
+            AnnotatedBatch::with_metadata(make_empty_batch(value_schema()), invalid_metadata);
+        REQUIRE_THROWS_AS(client.resolve_pointer(invalid), ExternalHttpError);
+    }
 }
 
 TEST_CASE("external PUT is credential-free capped and never follows redirects",

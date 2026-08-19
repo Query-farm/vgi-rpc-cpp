@@ -368,6 +368,18 @@ int main() {
                     .config(config)
                     .external_http_options(external_options)
                     .build();
+            const auto upload_urls = external_client.request_upload_urls(2);
+            require(upload_urls.size() == 2 && !upload_urls[0].upload_url.empty() &&
+                        !upload_urls[0].download_url.empty() &&
+                        upload_urls[0].upload_url != upload_urls[0].download_url,
+                    "public upload URL API lost its method-bound pair");
+            bool rejected_bad_count = false;
+            try {
+                (void)external_client.request_upload_urls(0);
+            } catch (const std::invalid_argument&) {
+                rejected_bad_count = true;
+            }
+            require(rejected_bad_count, "public upload URL API accepted count=0");
             const auto bytes_schema =
                 arrow::schema({arrow::field("result", arrow::binary(), false)});
             std::string expected(32768, '\0');

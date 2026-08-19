@@ -205,6 +205,12 @@ public:
     std::atomic<int> advertised_identity_requests{0};
     std::atomic<int> exchange_fallback_requests{0};
     std::atomic<bool> fallback_request_ids_valid{true};
+    std::atomic<bool> sticky_headers_valid{false};
+    std::atomic<bool> sticky_block_entered{false};
+    std::atomic<bool> sticky_block_release{false};
+    std::atomic<bool> transport_block_entered{false};
+    std::atomic<bool> transport_block_release{false};
+    std::atomic<int> post_retry_requests{0};
 
 private:
     void arrow_response(httplib::Response& response, const std::string& body) {
@@ -308,6 +314,77 @@ private:
                     encode_response(schema_, {AnnotatedBatch::with_metadata(
                                                  value_batch(schema_, 88), std::move(metadata))}));
             });
+
+        server_.Post("/sticky-open", [this](const httplib::Request& request,
+                                            httplib::Response& response) {
+            sticky_headers_valid.store(request.get_header_value("VGI-Session-Accept") == "true" &&
+                                       request.get_header_value("VGI-Session").empty());
+            arrow_response(response, good_response_);
+            response.set_header("VGI-Session", "sticky-token");
+            response.set_header("VGI-Echo-X-Route", "worker-a");
+        });
+        server_.Post("/sticky-oversized", [this](const httplib::Request& request,
+                                                 httplib::Response& response) {
+            sticky_headers_valid.store(sticky_headers_valid.load() &&
+                                       request.get_header_value("VGI-Session") == "sticky-token" &&
+                                       request.get_header_value("X-Route") == "worker-a");
+            arrow_response(response, good_response_);
+            response.set_header("VGI-Session", "must-not-persist");
+            for (int index = 0; index < 10; ++index) {
+                response.set_header("VGI-Echo-X-Route-" + std::to_string(index),
+                                    std::string(7000, 'x'));
+            }
+        });
+        server_.Post("/sticky-reserved",
+                     [this](const httplib::Request&, httplib::Response& response) {
+                         arrow_response(response, good_response_);
+                         response.set_header("VGI-Session", "must-not-persist");
+                         response.set_header("VGI-Echo-Content-Type", "text/plain");
+                     });
+        server_.Post("/sticky-credential",
+                     [this](const httplib::Request&, httplib::Response& response) {
+                         arrow_response(response, good_response_);
+                         response.set_header("VGI-Session", "must-not-persist");
+                         response.set_header("VGI-Echo-Authorization", "Bearer reflected");
+                     });
+        server_.Post("/sticky-malformed", [](const httplib::Request&, httplib::Response& response) {
+            response.set_content("not an Arrow stream", kArrowContentType);
+            response.set_header("VGI-Session", "must-not-persist");
+            response.set_header("VGI-Echo-X-Route", "wrong-worker");
+        });
+        server_.Post("/sticky-recover", [this](const httplib::Request& request,
+                                               httplib::Response& response) {
+            sticky_headers_valid.store(sticky_headers_valid.load() &&
+                                       request.get_header_value("VGI-Session") == "sticky-token" &&
+                                       request.get_header_value("X-Route") == "worker-a");
+            arrow_response(response, good_response_);
+        });
+        server_.Post("/sticky-block", [this](const httplib::Request&, httplib::Response& response) {
+            sticky_block_entered.store(true);
+            while (!sticky_block_release.load()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            arrow_response(response, good_response_);
+        });
+        server_.Post("/transport-block",
+                     [this](const httplib::Request&, httplib::Response& response) {
+                         transport_block_entered.store(true);
+                         while (!transport_block_release.load()) {
+                             std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                         }
+                         arrow_response(response, good_response_);
+                     });
+        server_.Post("/post-retry", [this](const httplib::Request&, httplib::Response& response) {
+            if (post_retry_requests.fetch_add(1) < 2) {
+                response.status = 503;
+                response.set_content("retry", "text/plain");
+                return;
+            }
+            arrow_response(response, good_response_);
+        });
+        server_.Delete("/__session__", [](const httplib::Request&, httplib::Response& response) {
+            response.status = 204;
+        });
 
         server_.Post("/fixed-large", [this](const httplib::Request&, httplib::Response& response) {
             response.set_content(std::string(good_response_.size() + 4096, 'f'), kArrowContentType);
@@ -571,6 +648,25 @@ void test_compression_negotiation(FaultServer& server, const std::string& origin
     session.close();
 }
 
+void test_post_retry_requires_idempotency(FaultServer& server, const std::string& origin,
+                                          const std::shared_ptr<arrow::Schema>& schema) {
+    RetryPolicy policy;
+    policy.initial_backoff = std::chrono::milliseconds(0);
+    policy.retryable_status_codes = {503};
+    auto client = HttpClient::builder(origin).prefix("").retry_policy(policy).build();
+    const auto error =
+        require_http_client_error([&] { (void)client.call("post-retry", empty_request(), schema); },
+                                  "non-idempotent POST status");
+    require(error.http_status() == 503 && server.post_retry_requests.load() == 1,
+            "default POST call retried after dispatch without idempotency opt-in");
+
+    CallOptions idempotent;
+    idempotent.idempotent = true;
+    const auto result = client.call("post-retry", empty_request(), schema, idempotent);
+    require(result.batch && server.post_retry_requests.load() == 3,
+            "explicitly idempotent POST did not use the configured retry policy");
+}
+
 void test_capabilities_and_row_metadata(const std::string& origin,
                                         const std::shared_ptr<arrow::Schema>& schema) {
     HttpClientConfig config;
@@ -661,6 +757,146 @@ void test_pointer_metadata_sanitization(FaultServer& server, const std::string& 
         schema);
     require(server.pointer_metadata_sanitized.load(),
             "external-location or SHM control metadata reached the server");
+}
+
+void test_sticky_session_hardening(FaultServer& server, const std::string& origin,
+                                   const std::shared_ptr<arrow::Schema>& schema) {
+    HttpClientConfig config;
+    config.prefix = "";
+    HttpClient client(origin, config);
+    auto session = client.with_session_token();
+    (void)session.call("sticky-open", empty_request(), schema);
+    require(session.current_session_token() == std::optional<std::string>{"sticky-token"},
+            "sticky response token was not captured");
+    const auto original_echo = session.current_echo_headers();
+    require(original_echo.size() == 1 && original_echo.begin()->second == "worker-a",
+            "sticky routing echo header was not captured");
+
+    CallOptions spoofed_route;
+    spoofed_route.headers["X-Route"] = "wrong-worker";
+    const auto require_atomic_rejection = [&](const char* method) {
+        const auto error = require_http_client_error(
+            [&] { (void)session.call(method, empty_request(), schema, spoofed_route); }, method);
+        require(error.kind() == HttpClientErrorKind::PROTOCOL,
+                std::string(method) + " did not fail as a protocol error");
+        require(session.current_session_token() == std::optional<std::string>{"sticky-token"} &&
+                    session.current_echo_headers() == original_echo,
+                std::string(method) + " persisted partial untrusted session metadata");
+    };
+    require_atomic_rejection("sticky-oversized");
+    require_atomic_rejection("sticky-reserved");
+    require_atomic_rejection("sticky-credential");
+    (void)require_http_client_error(
+        [&] { (void)session.call("sticky-malformed", empty_request(), schema); },
+        "sticky-malformed");
+    require(session.current_session_token() == std::optional<std::string>{"sticky-token"} &&
+                session.current_echo_headers() == original_echo,
+            "malformed Arrow response persisted staged sticky metadata");
+    (void)session.call("sticky-recover", empty_request(), schema, spoofed_route);
+    require(server.sticky_headers_valid.load(),
+            "session routing headers did not override caller headers or survive rejection");
+
+    for (const auto& headers :
+         {std::map<std::string, std::string>{{"X-Test", "bad\r\nvalue"}},
+          std::map<std::string, std::string>{{"Content-Type", "text/plain"}},
+          std::map<std::string, std::string>{{"Authorization", "Bearer reflected"}}}) {
+        bool rejected = false;
+        try {
+            (void)client.with_session_token(std::nullopt, headers);
+        } catch (const std::invalid_argument&) {
+            rejected = true;
+        }
+        require(rejected, "invalid initial sticky echo metadata was accepted");
+    }
+    HttpClientConfig credential_opt_in;
+    credential_opt_in.prefix = "";
+    credential_opt_in.allow_insecure_credentials = true;
+    auto credential_client =
+        HttpClient::builder(origin).config(std::move(credential_opt_in)).build();
+    bool credential_echo_rejected = false;
+    try {
+        (void)credential_client.with_session_token(std::nullopt,
+                                                   {{"Authorization", "Bearer reflected"}});
+    } catch (const std::invalid_argument&) {
+        credential_echo_rejected = true;
+    }
+    require(credential_echo_rejected,
+            "sticky credential echo was accepted after transport credential opt-in");
+    (void)client.call("ok", empty_request(), schema);
+    session.close();
+    session.close();
+
+    auto blocked = client.with_session_token(std::string("sticky-token"), original_echo);
+    std::exception_ptr request_failure;
+    std::thread request([&] {
+        try {
+            (void)blocked.call("sticky-block", empty_request(), schema);
+        } catch (...) {
+            request_failure = std::current_exception();
+        }
+    });
+    for (int attempt = 0; attempt < 1000 && !server.sticky_block_entered.load(); ++attempt) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    require(server.sticky_block_entered.load(), "blocking sticky request did not reach the server");
+    const auto close_started = std::chrono::steady_clock::now();
+    blocked.close();
+    const auto close_elapsed = std::chrono::steady_clock::now() - close_started;
+    require(close_elapsed < std::chrono::milliseconds(250),
+            "sticky close waited unboundedly on an in-flight request");
+    require(!blocked.active(), "bounded sticky close did not retire local state");
+    server.sticky_block_release.store(true);
+    request.join();
+    require(request_failure != nullptr,
+            "response completed successfully after its sticky view was locally closed");
+    try {
+        std::rethrow_exception(request_failure);
+    } catch (const HttpClientError& error) {
+        require(
+            std::string(error.what()).find("closed before response commit") != std::string::npos,
+            "post-close sticky response produced the wrong error");
+    }
+
+    auto transport_contended =
+        client.with_session_token(std::string("sticky-token"), original_echo);
+    std::exception_ptr transport_failure;
+    std::thread transport_request([&] {
+        try {
+            (void)client.call("transport-block", empty_request(), schema);
+        } catch (...) {
+            transport_failure = std::current_exception();
+        }
+    });
+    for (int attempt = 0; attempt < 1000 && !server.transport_block_entered.load(); ++attempt) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    require(server.transport_block_entered.load(),
+            "transport-contention request did not reach the server");
+    const auto transport_close_started = std::chrono::steady_clock::now();
+    transport_contended.close();
+    require(
+        std::chrono::steady_clock::now() - transport_close_started < std::chrono::milliseconds(250),
+        "sticky close waited unboundedly on the shared transport mutex");
+    server.transport_block_release.store(true);
+    transport_request.join();
+    if (transport_failure) std::rethrow_exception(transport_failure);
+
+    std::atomic<int> auth_calls{0};
+    auto callback_client = HttpClient::builder(origin)
+                               .prefix("")
+                               .auth_callback([&](const HttpAuthRequest&) {
+                                   ++auth_calls;
+                                   std::this_thread::sleep_for(std::chrono::seconds(1));
+                                   return std::map<std::string, std::string>{};
+                               })
+                               .build();
+    auto callback_session = callback_client.with_session_token(std::string("sticky-token"));
+    const auto callback_close_started = std::chrono::steady_clock::now();
+    callback_session.close();
+    require(std::chrono::steady_clock::now() - callback_close_started <
+                    std::chrono::milliseconds(500) &&
+                auth_calls.load() == 0,
+            "sticky teardown invoked an unbounded authentication callback");
 }
 
 void test_config_validation(const std::string& origin) {
@@ -763,9 +999,11 @@ int main() {
         test_response_caps(server, origin, schema);
         test_compression(server, origin, schema);
         test_compression_negotiation(server, origin, schema);
+        test_post_retry_requires_idempotency(server, origin, schema);
         test_capabilities_and_row_metadata(origin, schema);
         test_response_headers(origin, schema);
         test_pointer_metadata_sanitization(server, origin, schema);
+        test_sticky_session_hardening(server, origin, schema);
         test_config_validation(origin);
         test_ambiguous_exchange(server, origin, schema);
         test_local_close_and_cancel(server, origin, schema);

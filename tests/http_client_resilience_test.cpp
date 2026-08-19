@@ -490,6 +490,7 @@ void test_retry_ids(PlainFaultServer& server, const std::shared_ptr<arrow::Schem
     auto client = plain_builder(server.origin()).retry_policy(policy).build();
     CallOptions options;
     options.request_id = "retry-logical-id";
+    options.idempotent = true;
     const auto result = client.call("retry", empty_request(), schema, options);
     require(result.batch && result.batch->num_rows() == 1 && server.retry_requests.load() == 3 &&
                 server.retry_request_ids_valid.load(),
