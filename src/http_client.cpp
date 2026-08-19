@@ -4,10 +4,13 @@
 #include "vgi_rpc/http_client.h"
 
 #include "vgi_rpc/arrow_utils.h"
+#include "vgi_rpc/crypto.h"
 #include "vgi_rpc/metadata.h"
 #include "vgi_rpc/wire.h"
 
 #include <arrow/buffer.h>
+#include <arrow/array.h>
+#include <arrow/builder.h>
 #include <arrow/io/memory.h>
 #include <arrow/record_batch.h>
 #include <arrow/type.h>
@@ -127,6 +130,47 @@ std::string encode_ipc(const AnnotatedBatch& batch,
                        static_cast<size_t>(buffer->size()));
 }
 
+std::string external_pointer_body(const std::string& original_body, const std::string& download_url,
+                                  int64_t max_bytes) {
+    auto input =
+        std::make_shared<arrow::io::BufferReader>(arrow::Buffer::FromString(original_body));
+    const auto contents = read_ipc_stream(input);
+    if (!contents || contents->batches.size() != 1) {
+        throw HttpClientError("externalized request must contain exactly one Arrow batch");
+    }
+    const int64_t consumed = unwrap(input->Tell(), "cannot inspect externalized request");
+    if (consumed != static_cast<int64_t>(original_body.size())) {
+        throw HttpClientError("externalized request contains trailing Arrow IPC data");
+    }
+    auto metadata = contents->batches.front().custom_metadata
+                        ? contents->batches.front().custom_metadata->Copy()
+                        : std::make_shared<arrow::KeyValueMetadata>();
+    replace_metadata(metadata, keys::LOCATION, download_url);
+    crypto::Sha256 digest;
+    digest.update(original_body);
+    replace_metadata(metadata, keys::LOCATION_SHA256, digest.hex_digest());
+    return encode_ipc(AnnotatedBatch::data(make_empty_batch(contents->schema)), metadata,
+                      max_bytes);
+}
+
+std::shared_ptr<arrow::Schema> upload_url_request_schema() {
+    return arrow::schema({arrow::field("count", arrow::int64(), true)});
+}
+
+std::shared_ptr<arrow::Schema> upload_url_response_schema() {
+    return arrow::schema(
+        {arrow::field("upload_url", arrow::utf8(), true),
+         arrow::field("download_url", arrow::utf8(), true),
+         arrow::field("expires_at", arrow::timestamp(arrow::TimeUnit::MICRO, "UTC"), true)});
+}
+
+AnnotatedBatch upload_url_request() {
+    arrow::Int64Builder builder;
+    VGI_RPC_THROW_NOT_OK(builder.Append(1));
+    return AnnotatedBatch::data(
+        arrow::RecordBatch::Make(upload_url_request_schema(), 1, {unwrap(builder.Finish())}));
+}
+
 bool schema_equals(const std::shared_ptr<arrow::Schema>& actual,
                    const std::shared_ptr<arrow::Schema>& expected) {
     return actual && expected && actual->Equals(*expected, /*check_metadata=*/true);
@@ -212,7 +256,8 @@ RpcRemoteError remote_error(const AnnotatedBatch& batch, int status) {
 }
 
 DecodedResponse decode_response(const BoundedHttpResponse& response, const HttpClientConfig& config,
-                                ResponseShape shape, bool has_header = false) {
+                                ResponseShape shape, bool has_header = false,
+                                ClientExternalHttp* external = nullptr) {
     // IPC arrays may retain slices of their source buffer.  FromString owns a
     // copy whose shared lifetime follows those slices; wrapping response.body
     // would leave returned batches pointing at a destroyed std::string.
@@ -240,6 +285,22 @@ DecodedResponse decode_response(const BoundedHttpResponse& response, const HttpC
         if (header_stream) {
             std::vector<AnnotatedBatch> header_data;
             for (auto& batch : contents.batches) {
+                if (batch.custom_metadata && batch.custom_metadata->FindKey(keys::LOCATION) >= 0) {
+                    if (!external) {
+                        throw HttpClientError(
+                            "external-location stream header received while resolution is disabled",
+                            response.status);
+                    }
+                    try {
+                        batch = external->resolve_pointer(batch, config.on_log);
+                    } catch (const ExternalHttpError& error) {
+                        throw HttpClientError(
+                            HttpClientErrorKind::PROTOCOL,
+                            std::string("failed to resolve external-location stream header: ") +
+                                error.what(),
+                            response.status, {}, {});
+                    }
+                }
                 const auto level = get_metadata_value(batch.custom_metadata, keys::LOG_LEVEL);
                 if (batch.batch && batch.batch->num_rows() == 0 && !level.empty()) {
                     if (level == "EXCEPTION") throw remote_error(batch, response.status);
@@ -258,6 +319,22 @@ DecodedResponse decode_response(const BoundedHttpResponse& response, const HttpC
 
         decoded.schema = contents.schema;
         for (auto& batch : contents.batches) {
+            if (batch.custom_metadata && batch.custom_metadata->FindKey(keys::LOCATION) >= 0) {
+                if (!external) {
+                    throw HttpClientError(
+                        "external-location response received while resolution is disabled",
+                        response.status);
+                }
+                try {
+                    batch = external->resolve_pointer(batch, config.on_log);
+                } catch (const ExternalHttpError& error) {
+                    throw HttpClientError(
+                        HttpClientErrorKind::PROTOCOL,
+                        std::string("failed to resolve external-location response: ") +
+                            error.what(),
+                        response.status, {}, {});
+                }
+            }
             const auto& metadata = batch.custom_metadata;
             const auto has = [&](const char* key) {
                 return metadata && metadata->FindKey(key) >= 0;
@@ -275,9 +352,8 @@ DecodedResponse decode_response(const BoundedHttpResponse& response, const HttpC
                 continue;
             }
             if (has(keys::LOCATION)) {
-                throw HttpClientError(
-                    "external-location response batches are not supported by HttpClient",
-                    response.status);
+                throw HttpClientError("nested external-location response is forbidden",
+                                      response.status);
             }
             if (has(keys::SHM_OFFSET)) {
                 throw HttpClientError("shared-memory response batches are invalid over HTTP",
@@ -736,12 +812,17 @@ HttpAuthenticationError::HttpAuthenticationError(std::string message, int http_s
 class HttpClientState {
 public:
     HttpClientState(ParsedBaseUrl base_url, HttpClientConfig client_config, RetryPolicy retry,
-                    TlsOptions tls, HttpAuthCallback auth)
+                    TlsOptions tls, HttpAuthCallback auth,
+                    std::optional<ClientExternalHttpOptions> external_options)
         : config(std::move(client_config)),
           retry_policy(std::move(retry)),
           tls_options(std::move(tls)),
           auth_callback(std::move(auth)),
           secure_transport(base_url.secure) {
+        if (external_options) {
+            external_max_upload_bytes = external_options->max_upload_bytes;
+            external_http = std::make_unique<ClientExternalHttp>(*external_options);
+        }
         if (config.max_request_bytes <= 0 || config.max_response_bytes < 0 ||
             config.max_encoded_response_bytes < 0 || config.max_decoded_response_bytes < 0) {
             throw std::invalid_argument(
@@ -800,9 +881,9 @@ public:
         while (config.prefix.size() > 1 && config.prefix.back() == '/') config.prefix.pop_back();
     }
 
-    BoundedHttpResponse post(const std::string& method, const std::string& request_path,
-                             const std::string& body, const std::string& request_id,
-                             const CallOptions& options, bool retryable) {
+    BoundedHttpResponse post_inline(const std::string& method, const std::string& request_path,
+                                    const std::string& body, const std::string& request_id,
+                                    const CallOptions& options, bool retryable) {
         check_call_active(options, method, request_id);
         std::map<std::string, std::string> auth_headers;
         if (auth_callback) {
@@ -992,6 +1073,7 @@ public:
                 response.retry_after, response.auth_reason);
         }
         if (response.status < 200 || response.status >= 300) {
+            if (response.status == 413 && external_http) return response;
             if (content_type.rfind(kArrowContentType, 0) == 0) return response;
             const std::string detail = safe_error_detail(response.body, 512);
             throw HttpClientError(HttpClientErrorKind::HTTP_STATUS,
@@ -1006,6 +1088,55 @@ public:
                                   "HTTP RPC response has unsupported Content-Type: " +
                                       (content_type.empty() ? "<missing>" : content_type),
                                   response.status, method, request_id, response.body);
+        }
+        return response;
+    }
+
+    BoundedHttpResponse post(const std::string& method, const std::string& request_path,
+                             const std::string& body, const std::string& request_id,
+                             const CallOptions& options, bool retryable) {
+        bool externalized = false;
+        std::string request_body = body;
+        auto cached_caps = [&] {
+            std::lock_guard<std::timed_mutex> lock(mutex);
+            return server_capabilities;
+        };
+
+        // A body larger than the local inline ceiling cannot be sent merely to
+        // discover a server's 413 behavior. Discover capabilities first, then
+        // either externalize within the separately bounded upload ceiling or
+        // fail before transport.
+        if (request_body.size() > static_cast<uint64_t>(config.max_request_bytes)) {
+            (void)capabilities(random_hex(16), options);
+        }
+        auto caps = cached_caps();
+        const int64_t inline_cap = caps.max_request_bytes
+                                       ? std::min(config.max_request_bytes, *caps.max_request_bytes)
+                                       : config.max_request_bytes;
+        if (request_body.size() > static_cast<uint64_t>(inline_cap) && external_http &&
+            caps.upload_url_support) {
+            request_body = externalize_request(body, options);
+            externalized = true;
+        }
+
+        auto response =
+            post_inline(method, request_path, request_body, request_id, options, retryable);
+        // A 413 is a pre-dispatch rejection, so replacing the body with a
+        // method-bound pointer and retrying once is safe even for exchange.
+        if (response.status == 413 && !externalized && external_http) {
+            caps = cached_caps();
+            if (caps.upload_url_support) {
+                request_body = externalize_request(body, options);
+                response =
+                    post_inline(method, request_path, request_body, request_id, options, retryable);
+            }
+        }
+        if (response.status == 413 && response.content_type.rfind(kArrowContentType, 0) != 0) {
+            const std::string detail = safe_error_detail(response.body, 512);
+            throw HttpClientError(
+                HttpClientErrorKind::HTTP_STATUS,
+                "HTTP RPC request failed with status 413" + (detail.empty() ? "" : ": " + detail),
+                413, method, request_id, response.body, response.retry_after, response.auth_reason);
         }
         return response;
     }
@@ -1141,18 +1272,89 @@ public:
         return config.max_request_bytes;
     }
 
+    int64_t request_serialization_cap() {
+        std::lock_guard<std::timed_mutex> lock(mutex);
+        int64_t limit = config.max_request_bytes;
+        if (external_http) limit = std::max(limit, external_max_upload_bytes);
+        if (server_capabilities.max_upload_bytes) {
+            limit = std::min(limit, *server_capabilities.max_upload_bytes);
+        }
+        return limit;
+    }
+
     std::string path(const std::string& method, const char* suffix = "") const {
         return (config.prefix == "/" ? std::string() : config.prefix) + "/" + method + suffix;
     }
 
     HttpClientConfig config;
 
+    ClientExternalHttp* external() const noexcept { return external_http.get(); }
+
 private:
+    std::string externalize_request(const std::string& body, const CallOptions& options) {
+        if (!external_http) {
+            throw HttpClientError(HttpClientErrorKind::LIMIT, "request externalization is disabled",
+                                  0, {}, {});
+        }
+        HttpServerCapabilities caps;
+        {
+            std::lock_guard<std::timed_mutex> lock(mutex);
+            caps = server_capabilities;
+        }
+        if (!caps.upload_url_support) {
+            throw HttpClientError(HttpClientErrorKind::LIMIT,
+                                  "server does not advertise upload URL support", 0, {}, {});
+        }
+        int64_t upload_cap = external_max_upload_bytes;
+        if (caps.max_upload_bytes) upload_cap = std::min(upload_cap, *caps.max_upload_bytes);
+        if (body.size() > static_cast<uint64_t>(upload_cap)) {
+            throw HttpClientError(HttpClientErrorKind::LIMIT,
+                                  "externalized request exceeds max_upload_bytes (" +
+                                      std::to_string(body.size()) + " > " +
+                                      std::to_string(upload_cap) + ")",
+                                  0, {}, {});
+        }
+
+        const std::string control_method = "__upload_url__";
+        const std::string control_id = random_hex(16);
+        const auto metadata =
+            request_metadata(nullptr, control_method, config.protocol_version, control_id);
+        const std::string control_body =
+            encode_ipc(upload_url_request(), metadata, config.max_request_bytes);
+        const auto response = post_inline(control_method, path(control_method, "/init"),
+                                          control_body, control_id, options, true);
+        auto decoded = decode_response(response, config, ResponseShape::UNARY, false, nullptr);
+        const auto expected_schema = upload_url_response_schema();
+        if (!schema_equals(decoded.schema, expected_schema) || decoded.data.size() != 1 ||
+            !decoded.data.front().batch || decoded.data.front().batch->num_rows() != 1) {
+            throw HttpClientError("upload URL response has an invalid Arrow shape");
+        }
+        const auto& batch = decoded.data.front().batch;
+        auto uploads = std::dynamic_pointer_cast<arrow::StringArray>(batch->column(0));
+        auto downloads = std::dynamic_pointer_cast<arrow::StringArray>(batch->column(1));
+        if (!uploads || !downloads || uploads->IsNull(0) || downloads->IsNull(0)) {
+            throw HttpClientError("upload URL response contains null or non-string URLs");
+        }
+        const std::string upload_url = uploads->GetString(0);
+        const std::string download_url = downloads->GetString(0);
+        try {
+            external_http->validate_url(download_url);
+            external_http->put(upload_url, body, kArrowContentType);
+        } catch (const ExternalHttpError& error) {
+            throw HttpClientError(HttpClientErrorKind::TRANSPORT,
+                                  std::string("request externalization failed: ") + error.what(), 0,
+                                  {}, {});
+        }
+        return external_pointer_body(body, download_url, config.max_request_bytes);
+    }
+
     std::unique_ptr<httplib::Client> client;
     std::timed_mutex mutex;
     RetryPolicy retry_policy;
     TlsOptions tls_options;
     HttpAuthCallback auth_callback;
+    std::unique_ptr<ClientExternalHttp> external_http;
+    int64_t external_max_upload_bytes = 0;
     bool secure_transport = false;
     std::optional<int64_t> server_max_request_bytes;
     int64_t max_encoded_response_bytes = 0;
@@ -1181,6 +1383,7 @@ public:
     RetryPolicy retry_policy;
     TlsOptions tls_options;
     HttpAuthCallback auth_callback;
+    std::optional<ClientExternalHttpOptions> external_options{ClientExternalHttpOptions{}};
 };
 
 HttpClientBuilder::HttpClientBuilder(std::string base_url)
@@ -1279,11 +1482,25 @@ HttpClientBuilder& HttpClientBuilder::dangerous_disable_tls_verification_for_tes
     return *this;
 }
 
+HttpClientBuilder& HttpClientBuilder::external_http_options(ClientExternalHttpOptions options) {
+    if (!impl_) throw std::logic_error("HttpClientBuilder is moved from");
+    impl_->external_options = std::move(options);
+    return *this;
+}
+
+HttpClientBuilder& HttpClientBuilder::disable_external_locations(bool disabled) {
+    if (!impl_) throw std::logic_error("HttpClientBuilder is moved from");
+    impl_->external_options =
+        disabled ? std::nullopt
+                 : std::optional<ClientExternalHttpOptions>{ClientExternalHttpOptions{}};
+    return *this;
+}
+
 HttpClient HttpClientBuilder::build() const {
     if (!impl_) throw std::logic_error("HttpClientBuilder is moved from");
-    return HttpClient(std::make_shared<HttpClientState>(impl_->base_url, impl_->config,
-                                                        impl_->retry_policy, impl_->tls_options,
-                                                        impl_->auth_callback));
+    return HttpClient(std::make_shared<HttpClientState>(
+        impl_->base_url, impl_->config, impl_->retry_policy, impl_->tls_options,
+        impl_->auth_callback, impl_->external_options));
 }
 
 HttpClientBuilder HttpClient::builder(std::string base_url) {
@@ -1293,7 +1510,7 @@ HttpClientBuilder HttpClient::builder(std::string base_url) {
 HttpClient::HttpClient(std::string base_url, HttpClientConfig config)
     : state_(std::make_shared<HttpClientState>(parse_base_url(std::move(base_url)),
                                                std::move(config), RetryPolicy{}, TlsOptions{},
-                                               HttpAuthCallback{})) {}
+                                               HttpAuthCallback{}, ClientExternalHttpOptions{})) {}
 
 HttpClient::HttpClient(std::shared_ptr<HttpClientState> state) : state_(std::move(state)) {}
 
@@ -1307,10 +1524,12 @@ AnnotatedBatch HttpClient::call(const std::string& method, const AnnotatedBatch&
     const std::string request_id = logical_request_id(options);
     const auto metadata = request_metadata(request.custom_metadata, method,
                                            state_->config.protocol_version, request_id);
-    const auto response = state_->post(method, state_->path(method),
-                                       encode_ipc(request, metadata, state_->request_cap()),
-                                       request_id, options, true);
-    auto decoded = decode_response(response, state_->config, ResponseShape::UNARY);
+    const auto response =
+        state_->post(method, state_->path(method),
+                     encode_ipc(request, metadata, state_->request_serialization_cap()), request_id,
+                     options, true);
+    auto decoded =
+        decode_response(response, state_->config, ResponseShape::UNARY, false, state_->external());
     if (expected_output_schema && !schema_equals(decoded.schema, expected_output_schema)) {
         throw HttpClientError(
             schema_mismatch("RPC response", expected_output_schema, decoded.schema));
@@ -1356,10 +1575,12 @@ HttpExchangeSession HttpClient::open_exchange(const std::string& method,
     const std::string request_id = logical_request_id(options);
     const auto metadata = request_metadata(request.custom_metadata, method,
                                            state_->config.protocol_version, request_id);
-    const auto response = state_->post(method, state_->path(method, "/init"),
-                                       encode_ipc(request, metadata, state_->request_cap()),
-                                       request_id, options, true);
-    auto decoded = decode_response(response, state_->config, ResponseShape::EXCHANGE_INIT);
+    const auto response =
+        state_->post(method, state_->path(method, "/init"),
+                     encode_ipc(request, metadata, state_->request_serialization_cap()), request_id,
+                     options, true);
+    auto decoded = decode_response(response, state_->config, ResponseShape::EXCHANGE_INIT, false,
+                                   state_->external());
     if (!schema_equals(decoded.schema, output_schema)) {
         throw HttpClientError(
             schema_mismatch("exchange init response", output_schema, decoded.schema));
@@ -1418,7 +1639,7 @@ AnnotatedBatch HttpExchangeSession::exchange(const AnnotatedBatch& input,
     if (!impl_->call_state.empty()) {
         replace_metadata(metadata, keys::CALL_STATE_B64, impl_->call_state);
     }
-    const auto body = encode_ipc(input, metadata, impl_->state->request_cap());
+    const auto body = encode_ipc(input, metadata, impl_->state->request_serialization_cap());
     // Once the request leaves this process, failure is ambiguous: the worker
     // may have advanced the state even if its reply was lost.  Retire the old
     // cursor before POST and reactivate only after a complete response yields
@@ -1427,7 +1648,8 @@ AnnotatedBatch HttpExchangeSession::exchange(const AnnotatedBatch& input,
     const auto response =
         impl_->state->post(impl_->method, impl_->state->path(impl_->method, "/exchange"), body,
                            request_id, options, false);
-    auto decoded = decode_response(response, impl_->state->config, ResponseShape::EXCHANGE_TURN);
+    auto decoded = decode_response(response, impl_->state->config, ResponseShape::EXCHANGE_TURN,
+                                   false, impl_->state->external());
     if (!schema_equals(decoded.schema, impl_->output_schema)) {
         throw HttpClientError(
             schema_mismatch("exchange response", impl_->output_schema, decoded.schema));
@@ -1468,9 +1690,10 @@ void HttpExchangeSession::cancel() noexcept {
         }
         replace_metadata(metadata, keys::CANCEL, "1");
         const AnnotatedBatch cancel = AnnotatedBatch::data(make_empty_batch(empty_schema()));
-        (void)impl_->state->post(impl_->method, impl_->state->path(impl_->method, "/exchange"),
-                                 encode_ipc(cancel, metadata, impl_->state->request_cap()),
-                                 request_id, CallOptions{}, false);
+        (void)impl_->state->post(
+            impl_->method, impl_->state->path(impl_->method, "/exchange"),
+            encode_ipc(cancel, metadata, impl_->state->request_serialization_cap()), request_id,
+            CallOptions{}, false);
     } catch (const std::exception&) {
         // Cancellation is best-effort.  The opaque token's own expiry remains
         // the fallback when the peer is unavailable.
@@ -1559,11 +1782,12 @@ HttpStreamSession HttpClient::open_producer(const std::string& method,
     const std::string request_id = logical_request_id(options);
     const auto metadata = request_metadata(request.custom_metadata, method,
                                            state_->config.protocol_version, request_id);
-    const auto response = state_->post(method, state_->path(method, "/init"),
-                                       encode_ipc(request, metadata, state_->request_cap()),
-                                       request_id, options, true);
-    auto decoded =
-        decode_response(response, state_->config, ResponseShape::STREAM_INIT, has_header);
+    const auto response =
+        state_->post(method, state_->path(method, "/init"),
+                     encode_ipc(request, metadata, state_->request_serialization_cap()), request_id,
+                     options, true);
+    auto decoded = decode_response(response, state_->config, ResponseShape::STREAM_INIT, has_header,
+                                   state_->external());
     return HttpStreamSession(make_http_stream_impl(state_, method, HttpStreamKind::PRODUCER,
                                                    empty_schema(), std::move(output_schema),
                                                    std::move(decoded)));
@@ -1583,11 +1807,12 @@ HttpStreamSession HttpClient::open_stream_exchange(const std::string& method,
     const std::string request_id = logical_request_id(options);
     const auto metadata = request_metadata(request.custom_metadata, method,
                                            state_->config.protocol_version, request_id);
-    const auto response = state_->post(method, state_->path(method, "/init"),
-                                       encode_ipc(request, metadata, state_->request_cap()),
-                                       request_id, options, true);
-    auto decoded =
-        decode_response(response, state_->config, ResponseShape::STREAM_INIT, has_header);
+    const auto response =
+        state_->post(method, state_->path(method, "/init"),
+                     encode_ipc(request, metadata, state_->request_serialization_cap()), request_id,
+                     options, true);
+    auto decoded = decode_response(response, state_->config, ResponseShape::STREAM_INIT, has_header,
+                                   state_->external());
     if (!decoded.data.empty()) {
         throw HttpClientError("exchange init unexpectedly returned application data");
     }
@@ -1666,9 +1891,10 @@ std::optional<AnnotatedBatch> HttpStreamSession::tick(const CallOptions& options
         const AnnotatedBatch request = AnnotatedBatch::data(make_empty_batch(empty_schema()));
         const auto response = impl_->state->post(
             impl_->method, impl_->state->path(impl_->method, "/exchange"),
-            encode_ipc(request, metadata, impl_->state->request_cap()), request_id, options, true);
-        auto decoded =
-            decode_response(response, impl_->state->config, ResponseShape::PRODUCER_TURN);
+            encode_ipc(request, metadata, impl_->state->request_serialization_cap()), request_id,
+            options, true);
+        auto decoded = decode_response(response, impl_->state->config, ResponseShape::PRODUCER_TURN,
+                                       false, impl_->state->external());
         if (!schema_equals(decoded.schema, impl_->output_schema)) {
             throw HttpClientError(
                 schema_mismatch("producer response", impl_->output_schema, decoded.schema));
@@ -1721,10 +1947,12 @@ std::optional<AnnotatedBatch> HttpStreamSession::exchange(const AnnotatedBatch& 
         replace_metadata(metadata, keys::CALL_STATE_B64, impl_->call_state);
     }
     impl_->is_closed = true;
-    const auto response = impl_->state->post(
-        impl_->method, impl_->state->path(impl_->method, "/exchange"),
-        encode_ipc(input, metadata, impl_->state->request_cap()), request_id, options, false);
-    auto decoded = decode_response(response, impl_->state->config, ResponseShape::EXCHANGE_TURN);
+    const auto response =
+        impl_->state->post(impl_->method, impl_->state->path(impl_->method, "/exchange"),
+                           encode_ipc(input, metadata, impl_->state->request_serialization_cap()),
+                           request_id, options, false);
+    auto decoded = decode_response(response, impl_->state->config, ResponseShape::EXCHANGE_TURN,
+                                   false, impl_->state->external());
     if (!schema_equals(decoded.schema, impl_->output_schema)) {
         throw HttpClientError(
             schema_mismatch("exchange response", impl_->output_schema, decoded.schema));
@@ -1772,9 +2000,10 @@ void HttpStreamSession::cancel() noexcept {
         const std::string request_id = random_hex(16);
         auto metadata = impl_->continuation_metadata(request_id, true);
         const AnnotatedBatch request = AnnotatedBatch::data(make_empty_batch(empty_schema()));
-        (void)impl_->state->post(impl_->method, impl_->state->path(impl_->method, "/exchange"),
-                                 encode_ipc(request, metadata, impl_->state->request_cap()),
-                                 request_id, CallOptions{}, false);
+        (void)impl_->state->post(
+            impl_->method, impl_->state->path(impl_->method, "/exchange"),
+            encode_ipc(request, metadata, impl_->state->request_serialization_cap()), request_id,
+            CallOptions{}, false);
     } catch (const std::exception&) {
     }
     close();

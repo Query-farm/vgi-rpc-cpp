@@ -21,6 +21,7 @@ vgi_rpc_add_test(output_collector_test)
 vgi_rpc_add_test(server_test)
 vgi_rpc_add_test(shm_test)
 vgi_rpc_add_test(client_description_test)
+vgi_rpc_add_test(client_external_test)
 vgi_rpc_add_test(client_test)
 
 add_executable(http_client_integration http_client_integration.cpp)

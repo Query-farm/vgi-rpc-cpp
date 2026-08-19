@@ -75,6 +75,28 @@ int64_t producer_index(const AnnotatedBatch& value) {
     return std::static_pointer_cast<arrow::Int64Array>(value.batch->column(0))->Value(0);
 }
 
+AnnotatedBatch int_request(const std::string& name, int64_t value) {
+    arrow::Int64Builder builder;
+    VGI_RPC_THROW_NOT_OK(builder.Append(value));
+    auto schema = arrow::schema({arrow::field(name, arrow::int64(), false)});
+    return AnnotatedBatch::data(arrow::RecordBatch::Make(schema, 1, {unwrap(builder.Finish())}));
+}
+
+AnnotatedBatch binary_request(const std::string& name, const std::string& value) {
+    arrow::BinaryBuilder builder;
+    VGI_RPC_THROW_NOT_OK(builder.Append(value));
+    auto schema = arrow::schema({arrow::field(name, arrow::binary(), false)});
+    return AnnotatedBatch::data(arrow::RecordBatch::Make(schema, 1, {unwrap(builder.Finish())}));
+}
+
+std::string binary_result(const AnnotatedBatch& value) {
+    auto array = std::dynamic_pointer_cast<arrow::BinaryArray>(value.batch->column(0));
+    if (!array || value.batch->num_rows() != 1 || array->IsNull(0)) {
+        throw std::runtime_error("binary RPC result has an invalid Arrow shape");
+    }
+    return array->GetString(0);
+}
+
 std::shared_ptr<arrow::RecordBatch> null_batch(const std::shared_ptr<arrow::Schema>& schema,
                                                int64_t rows) {
     std::vector<std::shared_ptr<arrow::Array>> arrays;
@@ -161,7 +183,8 @@ AnnotatedBatch exchange_and_require_equal(HttpExchangeSession& session,
 #ifndef _WIN32
 class PythonWorker {
 public:
-    explicit PythonWorker(std::optional<int> producer_turn_bytes = std::nullopt) {
+    explicit PythonWorker(std::optional<int> producer_turn_bytes = std::nullopt,
+                          bool external = false) {
         int output[2];
         if (::pipe(output) != 0) throw std::runtime_error("cannot create worker discovery pipe");
         pid_ = ::fork();
@@ -172,7 +195,10 @@ public:
             ::close(output[1]);
             const char* python = std::getenv("VGI_RPC_PYTHON");
             if (!python || !*python) python = "python3";
-            if (producer_turn_bytes) {
+            if (external) {
+                ::execlp(python, python, "-m", "vgi_rpc.conformance.client_worker", "--http", "0",
+                         "--external", "--external-threshold", "4096", static_cast<char*>(nullptr));
+            } else if (producer_turn_bytes) {
                 const std::string turn_bytes = std::to_string(*producer_turn_bytes);
                 ::execlp(python, python, "-m", "vgi_rpc.conformance.client_worker", "--http", "0",
                          "--producer-turn-bytes", turn_bytes.c_str(), static_cast<char*>(nullptr));
@@ -329,6 +355,68 @@ int main() {
             }
             require(!buffered.tick() && buffered.finished(),
                     "buffered producer did not reach its terminal response");
+        }
+
+        {
+            PythonWorker external_worker(std::nullopt, true);
+            require(external_worker.port() != 0,
+                    "external-location conformance worker is unavailable");
+            ClientExternalHttpOptions external_options;
+            external_options.url_policy = ExternalUrlPolicy::LOOPBACK_HTTP_TEST;
+            auto external_client =
+                HttpClient::builder("http://127.0.0.1:" + std::to_string(external_worker.port()))
+                    .config(config)
+                    .external_http_options(external_options)
+                    .build();
+            const auto bytes_schema =
+                arrow::schema({arrow::field("result", arrow::binary(), false)});
+            std::string expected(32768, '\0');
+            uint32_t entropy = 0x9e3779b9U;
+            for (char& byte : expected) {
+                entropy ^= entropy << 13;
+                entropy ^= entropy >> 17;
+                entropy ^= entropy << 5;
+                byte = static_cast<char>(entropy & 0xffU);
+            }
+            // Start with the oversized request so the client must recover
+            // from the server's pre-dispatch 413, harvest capabilities, vend
+            // a URL pair, upload, and retry exactly once.
+            auto reactive_echo =
+                external_client.call("echo_bytes", binary_request("value", expected), bytes_schema);
+            require(binary_result(reactive_echo) == expected,
+                    "413-triggered request externalization did not recover");
+
+            auto large =
+                external_client.call("large_response", int_request("size", 32768), bytes_schema);
+            const auto fetched = binary_result(large);
+            require(fetched.size() == 32768,
+                    "externalized response was not resolved to application data");
+            for (size_t index = 0; index < fetched.size(); ++index) {
+                require(static_cast<unsigned char>(fetched[index]) == index % 251,
+                        "externalized response bytes were corrupted");
+            }
+
+            // Cached capabilities make the next oversized body externalize
+            // proactively, without a second rejected inline attempt.
+            auto echoed =
+                external_client.call("echo_bytes", binary_request("value", expected), bytes_schema);
+            require(binary_result(echoed) == expected,
+                    "oversized request was not externalized and echoed exactly");
+
+            auto disabled =
+                HttpClient::builder("http://127.0.0.1:" + std::to_string(external_worker.port()))
+                    .config(config)
+                    .disable_external_locations()
+                    .build();
+            bool failed_closed = false;
+            try {
+                (void)disabled.call("large_response", int_request("size", 32768), bytes_schema);
+            } catch (const HttpClientError& error) {
+                failed_closed =
+                    std::string(error.what()).find("resolution is disabled") != std::string::npos;
+            }
+            require(failed_closed,
+                    "disabled external-location resolution returned a pointer as data");
         }
 
         auto session = client.open_exchange("typed_exchange", init_request(), schema, schema);

@@ -19,6 +19,7 @@
 
 #include "vgi_rpc/annotated_batch.h"
 #include "vgi_rpc/client_description.h"
+#include "vgi_rpc/client_external.h"
 #include "vgi_rpc/export.h"
 
 namespace vgi_rpc {
@@ -204,6 +205,10 @@ public:
     HttpClientBuilder& client_certificate(std::string certificate_file,
                                           std::string private_key_file);
     HttpClientBuilder& dangerous_disable_tls_verification_for_testing(bool disabled = true);
+    // External-location resolution is securely enabled by default. Override
+    // limits/policy here; LOOPBACK_HTTP_TEST is only for local conformance.
+    HttpClientBuilder& external_http_options(ClientExternalHttpOptions options);
+    HttpClientBuilder& disable_external_locations(bool disabled = true);
 
     HttpClient build() const;
 
