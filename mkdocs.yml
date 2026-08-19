@@ -91,6 +91,7 @@ nav:
       - Result: api/result.md
       - Streaming: api/stream.md
       - CallContext: api/call-context.md
+      - Raw Client: api/raw-client.md
       - HTTP Client: api/http-client.md
       - Wire Protocol: api/wire.md
       - Utilities: api/utilities.md
