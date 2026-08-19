@@ -56,6 +56,9 @@ struct HttpConfig {
     // Response caps.  Negative means unbounded.
     int64_t max_response_bytes = -1;
     int64_t max_externalized_response_bytes = -1;
+    // Inline request cap, applied independently to encoded and decoded bytes.
+    // Negative means unbounded and omits the capability advertisement.
+    int64_t max_request_bytes = -1;
 
     // Externalization: payloads at or above the threshold are uploaded to the
     // configured backend and replaced by a pointer batch.  Empty URL = off.

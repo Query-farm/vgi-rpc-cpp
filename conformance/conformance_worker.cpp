@@ -1311,6 +1311,8 @@ int main(int argc, char** argv) {
             http_cfg.max_response_bytes = std::stoll(take_value(i));
         } else if (arg == "--max-externalized-response-bytes") {
             http_cfg.max_externalized_response_bytes = std::stoll(take_value(i));
+        } else if (arg == "--max-request-bytes") {
+            http_cfg.max_request_bytes = std::stoll(take_value(i));
         } else if (arg == "--externalize-threshold") {
             http_cfg.externalize_threshold = std::stoll(take_value(i));
         } else if (arg == "--fake-storage" || arg == "--external-storage") {

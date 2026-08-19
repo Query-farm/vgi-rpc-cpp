@@ -116,6 +116,13 @@ def conformance_http_port() -> Iterator[int]:
         yield port
 
 
+@pytest.fixture(scope="session")
+def conformance_http_small_request_cap_port() -> Iterator[int]:
+    """A worker with the shared suite's canonical 4 KiB request cap."""
+    with spawn_http("--max-request-bytes", "4096") as port:
+        yield port
+
+
 @contextlib.contextmanager
 def _spawn_listener(flag: str, value: str, prefix: str) -> Iterator[str]:
     """Spawn the worker on a socket transport, yielding its discovery line's payload."""

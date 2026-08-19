@@ -374,7 +374,8 @@ private:
     void handle_health(const httplib::Request& req, httplib::Response& res) const;
     void handle_introspect(const httplib::Request& req, httplib::Response& res);
     void handle_session_delete(const httplib::Request& req, httplib::Response& res);
-    void handle_rpc(const httplib::Request& req, httplib::Response& res);
+    void handle_rpc(const httplib::Request& req, httplib::Response& res,
+                    const std::string& request_body);
 
     // Externalize an output cycle when its data batch is over the threshold:
     // upload the whole IPC stream and return a body carrying one zero-row
@@ -421,6 +422,9 @@ void HttpServer::stamp_capabilities(httplib::Response& res) const {
         res.set_header("VGI-Max-Externalized-Response-Bytes",
                        std::to_string(cfg_.max_externalized_response_bytes));
     }
+    if (cfg_.max_request_bytes >= 0) {
+        res.set_header("VGI-Max-Request-Bytes", std::to_string(cfg_.max_request_bytes));
+    }
     // Always present: an absent header means "unknown", and the client needs
     // to know whether to expect pointer batches at all.
     res.set_header("VGI-Externalization-Enabled", externalization() ? "true" : "false");
@@ -429,7 +433,9 @@ void HttpServer::stamp_capabilities(httplib::Response& res) const {
         // The threshold doubles as the inline-request ceiling: a body over it
         // is what the client externalizes instead, so advertising one number
         // keeps the two sides from disagreeing about where the line is.
-        res.set_header("VGI-Max-Request-Bytes", std::to_string(cfg_.externalize_threshold));
+        if (cfg_.max_request_bytes < 0) {
+            res.set_header("VGI-Max-Request-Bytes", std::to_string(cfg_.externalize_threshold));
+        }
         res.set_header("VGI-Max-Upload-Bytes",
                        std::to_string(cfg_.max_externalized_response_bytes >= 0
                                           ? cfg_.max_externalized_response_bytes
@@ -848,7 +854,8 @@ void HttpServer::handle_session_delete(const httplib::Request& req, httplib::Res
 // RPC dispatch
 // ---------------------------------------------------------------------------
 
-void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res) {
+void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
+                            const std::string& request_body) {
     std::lock_guard<std::mutex> lock(mutex_);
 
     std::string request_id = req.get_header_value(REQUEST_ID_HEADER);
@@ -863,15 +870,6 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res)
     if (ctype.rfind(ARROW_CONTENT_TYPE, 0) != 0) {
         res.status = 415;
         res.set_content("Unsupported Media Type", "text/plain");
-        return;
-    }
-
-    // Over the advertised inline ceiling: 413 is the signal that tells a
-    // capability-aware client to externalize and re-POST a pointer batch.
-    if (storage_ && cfg_.externalize_threshold >= 0 &&
-        static_cast<int64_t>(req.body.size()) > cfg_.externalize_threshold) {
-        res.status = 413;
-        res.set_content("Request body exceeds VGI-Max-Request-Bytes", "text/plain");
         return;
     }
 
@@ -895,7 +893,7 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res)
                           error_body(empty_schema(), type, msg, rpc_.server_id(), request_id));
     };
 
-    auto body_buf = arrow::Buffer::Wrap(req.body.data(), req.body.size());
+    auto body_buf = arrow::Buffer::Wrap(request_body.data(), request_body.size());
     auto reader = std::make_shared<arrow::io::BufferReader>(body_buf);
     std::optional<IpcStreamContents> contents;
     try {
@@ -1389,6 +1387,9 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res)
 
 void HttpServer::run() {
     httplib::Server svr;
+    if (cfg_.max_request_bytes >= 0) {
+        svr.set_payload_max_length(static_cast<size_t>(cfg_.max_request_bytes));
+    }
     // httplib's default multi-threaded pool stays: the global mutex above
     // preserves the single-threaded dispatch model, while a single-thread pool
     // would let one idle keep-alive connection starve every other.
@@ -1461,8 +1462,35 @@ void HttpServer::run() {
         res.status = 204;
     });
 
-    svr.Post(R"(/(.+))",
-             [this](const httplib::Request& req, httplib::Response& res) { handle_rpc(req, res); });
+    svr.Post(R"(/(.+))", [this](const httplib::Request& req, httplib::Response& res,
+                                const httplib::ContentReader& reader) {
+        const int64_t cap = cfg_.max_request_bytes >= 0
+                                ? cfg_.max_request_bytes
+                                : (storage_ ? cfg_.externalize_threshold : -1);
+        std::string body;
+        bool decoded_too_large = false;
+        const bool read = reader([&](const char* data, size_t size) {
+            if (cap >= 0 && (size > static_cast<size_t>(cap) ||
+                             body.size() > static_cast<size_t>(cap) - size)) {
+                decoded_too_large = true;
+                return false;
+            }
+            body.append(data, size);
+            return true;
+        });
+        if (!read) {
+            stamp_common(req, res, random_hex(16));
+            if (decoded_too_large || res.status == 413) {
+                res.status = 413;
+                res.set_content("Request body exceeds VGI-Max-Request-Bytes", "text/plain");
+            } else if (res.status < 400) {
+                res.status = 400;
+                res.set_content("Invalid compressed request body", "text/plain");
+            }
+            return;
+        }
+        handle_rpc(req, res, body);
+    });
 
     int bound;
     if (cfg_.port == 0) {
