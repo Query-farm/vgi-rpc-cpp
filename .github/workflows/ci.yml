@@ -73,7 +73,10 @@ jobs:
         run: |
           git clone --depth 1 https://github.com/Query-farm/vgi-rpc-python.git ../vgi-rpc
           python -m pip install --upgrade pip
-          python -m pip install '../vgi-rpc[http,conformance,external]'
+          # httpx2 2.12 stopped transparently decoding Content-Encoding while
+          # retaining the decoded-response API contract used by vgi-rpc.
+          # Keep cross-language CI on the reference client's known-good stack.
+          python -m pip install '../vgi-rpc[http,conformance,external]' 'httpx2==2.9.1'
           python -m pip install pytest pytest-timeout
 
       - name: Clone and bootstrap vcpkg

@@ -15,6 +15,8 @@
 #include <arrow/type.h>
 #include <arrow/util/decimal.h>
 
+#include <httplib.h>
+
 #include <cstdlib>
 #include <iostream>
 #include <memory>
@@ -175,6 +177,24 @@ public:
             return;
         }
         port_ = std::stoi(discovery.substr(5));
+
+        // PORT is printed immediately after bind.  On slower runners the
+        // server thread may not have entered its accept loop yet, so make the
+        // readiness contract explicit before the first one-shot RPC.
+        bool accepting = false;
+        for (int i = 0; i < 100; ++i) {
+            httplib::Client probe("127.0.0.1", port_);
+            probe.set_connection_timeout(0, 100000);
+            if (const auto response = probe.Get("/health"); response) {
+                accepting = true;
+                break;
+            }
+            ::usleep(50000);
+        }
+        if (!accepting) {
+            stop();
+            port_ = 0;
+        }
     }
 
     ~PythonWorker() { stop(); }

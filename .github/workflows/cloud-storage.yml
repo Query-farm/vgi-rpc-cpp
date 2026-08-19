@@ -59,7 +59,9 @@ jobs:
         run: |
           git clone --depth 1 https://github.com/Query-farm/vgi-rpc-python.git ../vgi-rpc
           python -m pip install --upgrade pip
-          python -m pip install '../vgi-rpc[http,conformance,external]'
+          # Match the main conformance matrix; newer httpx2 currently exposes
+          # compressed bytes through Response.content instead of decoding them.
+          python -m pip install '../vgi-rpc[http,conformance,external]' 'httpx2==2.9.1'
           # boto3 creates the bucket and asserts objects landed in it; the
           # backend under test is the C++ one, not boto3.
           python -m pip install pytest pytest-timeout boto3
