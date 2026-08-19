@@ -13,6 +13,7 @@
       "name": "cpp-httplib",
       "features": ["zstd", "zlib", "brotli"]
     },
+    "zstd",
     "catch2"
   ],
   "features": {

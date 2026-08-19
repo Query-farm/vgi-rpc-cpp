@@ -35,7 +35,7 @@ if(Python3_FOUND)
 endif()
 
 add_executable(http_client_fault_test http_client_fault_test.cpp)
-target_link_libraries(http_client_fault_test PRIVATE vgi_rpc)
+target_link_libraries(http_client_fault_test PRIVATE vgi_rpc zstd::libzstd)
 add_test(NAME http_client_fault_test COMMAND http_client_fault_test)
 set_tests_properties(http_client_fault_test PROPERTIES TIMEOUT 60)
 

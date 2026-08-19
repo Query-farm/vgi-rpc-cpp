@@ -11,6 +11,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 #include <arrow/type_fwd.h>
 
@@ -18,6 +19,21 @@
 #include "vgi_rpc/export.h"
 
 namespace vgi_rpc {
+
+struct HttpServerCapabilities {
+    bool sticky_enabled = false;
+    std::optional<int64_t> sticky_default_ttl;
+    std::vector<std::string> sticky_echo_headers;
+    bool upload_url_support = false;
+    std::optional<int64_t> max_request_bytes;
+    std::optional<int64_t> max_response_bytes;
+    std::optional<int64_t> max_externalized_response_bytes;
+    bool externalization_enabled = false;
+    std::optional<int64_t> max_upload_bytes;
+    // An absent advertisement is the legacy-server answer: zstd.  A
+    // present-but-empty header replaces this with an empty vector.
+    std::vector<std::string> supported_encodings = {"zstd"};
+};
 
 struct HttpClientConfig {
     // RPC mount prefix.  Empty means bare method paths.
@@ -27,6 +43,8 @@ struct HttpClientConfig {
     // Independent mandatory local allocation guards.  Both must be positive;
     // the client never offers an unbounded buffering mode.
     int64_t max_request_bytes = 64LL * 1024 * 1024;
+    // Compatibility ceiling used for both encoded and decoded responses unless
+    // either more-specific limit below is positive.
     int64_t max_response_bytes = 256LL * 1024 * 1024;
     int connection_timeout_seconds = 10;
     int read_timeout_seconds = 30;
@@ -39,6 +57,13 @@ struct HttpClientConfig {
     // Non-exception log batches are not returned as data.  Install this hook
     // to observe them; leaving it empty discards them.
     std::function<void(const AnnotatedBatch&)> on_log;
+    // zstd request-body compression level.  nullopt sends identity request
+    // bodies.  The client always supports bounded zstd response decoding.
+    std::optional<int> compression_level = 3;
+    // Independent wire and post-decompression response limits.  Zero inherits
+    // max_response_bytes, preserving existing configurations and guarantees.
+    int64_t max_encoded_response_bytes = 0;
+    int64_t max_decoded_response_bytes = 0;
 };
 
 class VGI_RPC_EXPORT HttpClientError : public std::runtime_error {
@@ -74,9 +99,9 @@ class HttpClientState;
 
 class VGI_RPC_EXPORT HttpClient {
 public:
-    // The initial implementation intentionally accepts plain http:// origins
-    // only.  TLS, external-location fetching and producer iteration are not
-    // implied by this focused unary/exchange API.
+    // This implementation intentionally accepts plain http:// origins only.
+    // TLS, external-location fetching and producer iteration are not implied
+    // by this focused unary/exchange API.
     explicit HttpClient(std::string base_url, HttpClientConfig config = {});
     ~HttpClient();
 
@@ -89,6 +114,10 @@ public:
     // verbatim; expected_output_schema, when present, is enforced exactly.
     AnnotatedBatch call(const std::string& method, const AnnotatedBatch& request,
                         std::shared_ptr<arrow::Schema> expected_output_schema = nullptr) const;
+
+    // Query OPTIONS {prefix}/health once and cache its advertised transport
+    // capabilities.  Ordinary RPC responses refine the same cache.
+    HttpServerCapabilities capabilities() const;
 
     // Initialize a bidirectional exchange.  Every input and output batch is
     // checked against the declared schemas before it crosses the API boundary.

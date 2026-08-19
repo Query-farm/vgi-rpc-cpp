@@ -7,6 +7,7 @@
 #include <vgi_rpc/wire.h>
 
 #include <arrow/array/builder_primitive.h>
+#include <arrow/array/builder_binary.h>
 #include <arrow/buffer.h>
 #include <arrow/io/memory.h>
 #include <arrow/record_batch.h>
@@ -14,6 +15,7 @@
 #include <arrow/util/key_value_metadata.h>
 
 #include <httplib.h>
+#include <zstd.h>
 
 #include <algorithm>
 #include <atomic>
@@ -22,6 +24,7 @@
 #include <exception>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -51,6 +54,13 @@ std::shared_ptr<arrow::RecordBatch> value_batch(const std::shared_ptr<arrow::Sch
 
 AnnotatedBatch empty_request() {
     return AnnotatedBatch::data(make_empty_batch(empty_schema()));
+}
+
+AnnotatedBatch incompressible_request() {
+    const auto schema = arrow::schema({arrow::field("x", arrow::binary(), true)});
+    arrow::BinaryBuilder builder;
+    VGI_RPC_THROW_NOT_OK(builder.Append(""));
+    return AnnotatedBatch::data(arrow::RecordBatch::Make(schema, 1, {unwrap(builder.Finish())}));
 }
 
 std::string encode_response(const std::shared_ptr<arrow::Schema>& schema,
@@ -93,8 +103,36 @@ std::string pointer_response(const std::shared_ptr<arrow::Schema>& schema, const
         schema, {AnnotatedBatch::with_metadata(value_batch(schema, 99), std::move(metadata))});
 }
 
+std::string zstd_encode(const std::string& body) {
+    std::string encoded(ZSTD_compressBound(body.size()), '\0');
+    const size_t size = ZSTD_compress(encoded.data(), encoded.size(), body.data(), body.size(), 3);
+    if (ZSTD_isError(size)) throw std::runtime_error(ZSTD_getErrorName(size));
+    encoded.resize(size);
+    return encoded;
+}
+
+std::string request_body(const httplib::Request& request) {
+    if (request.get_header_value("Content-Encoding") != "zstd") return request.body;
+    const unsigned long long size =
+        ZSTD_getFrameContentSize(request.body.data(), request.body.size());
+    // cpp-httplib transparently decodes request bodies before invoking a
+    // handler while retaining Content-Encoding.  In that case the bytes are
+    // already Arrow rather than a zstd frame.
+    if (size == ZSTD_CONTENTSIZE_ERROR) return request.body;
+    if (size == ZSTD_CONTENTSIZE_UNKNOWN || size > 64 * 1024 * 1024) {
+        throw std::runtime_error("invalid bounded zstd request in fault test");
+    }
+    std::string decoded(static_cast<size_t>(size), '\0');
+    const size_t actual =
+        ZSTD_decompress(decoded.data(), decoded.size(), request.body.data(), request.body.size());
+    if (ZSTD_isError(actual) || actual != decoded.size()) {
+        throw std::runtime_error("cannot decode zstd request in fault test");
+    }
+    return decoded;
+}
+
 bool request_has_cancel(const httplib::Request& request) {
-    auto buffer = arrow::Buffer::FromString(request.body);
+    auto buffer = arrow::Buffer::FromString(request_body(request));
     auto input = std::make_shared<arrow::io::BufferReader>(std::move(buffer));
     const auto contents = read_ipc_stream(input);
     if (!contents || contents->batches.size() != 1) return false;
@@ -104,8 +142,16 @@ bool request_has_cancel(const httplib::Request& request) {
            !get_metadata_value(metadata, keys::CALL_STATE_B64).empty();
 }
 
+std::string request_metadata_value(const httplib::Request& request, const char* key) {
+    auto buffer = arrow::Buffer::FromString(request_body(request));
+    auto input = std::make_shared<arrow::io::BufferReader>(std::move(buffer));
+    const auto contents = read_ipc_stream(input);
+    if (!contents || contents->batches.size() != 1) return {};
+    return get_metadata_value(contents->batches[0].custom_metadata, key);
+}
+
 bool request_omits_pointer_controls(const httplib::Request& request) {
-    auto buffer = arrow::Buffer::FromString(request.body);
+    auto buffer = arrow::Buffer::FromString(request_body(request));
     auto input = std::make_shared<arrow::io::BufferReader>(std::move(buffer));
     const auto contents = read_ipc_stream(input);
     if (!contents || contents->batches.size() != 1) return false;
@@ -146,6 +192,7 @@ public:
     const std::string& good_response() const { return good_response_; }
 
     std::atomic<int> preflight_requests{0};
+    std::atomic<int> encoded_request_cap_requests{0};
     std::atomic<int> recovery_requests{0};
     std::atomic<int> ambiguous_exchange_requests{0};
     std::atomic<int> explicit_close_exchange_requests{0};
@@ -153,6 +200,11 @@ public:
     std::atomic<int> cancel_exchange_requests{0};
     std::atomic<bool> cancel_metadata_valid{false};
     std::atomic<bool> pointer_metadata_sanitized{false};
+    std::atomic<bool> compressed_request_valid{false};
+    std::atomic<int> fallback_requests{0};
+    std::atomic<int> advertised_identity_requests{0};
+    std::atomic<int> exchange_fallback_requests{0};
+    std::atomic<bool> fallback_request_ids_valid{true};
 
 private:
     void arrow_response(httplib::Response& response, const std::string& body) {
@@ -167,14 +219,95 @@ private:
     }
 
     void install_handlers() {
+        server_.Options("/health", [](const httplib::Request&, httplib::Response& response) {
+            response.status = 204;
+            response.set_header("VGI-Sticky-Enabled", "true");
+            response.set_header("VGI-Sticky-Default-TTL", "45");
+            response.set_header("VGI-Sticky-Echo-Headers", "X-Tenant, X-Region");
+            response.set_header("VGI-Max-Request-Bytes", "123456");
+            response.set_header("VGI-Max-Response-Bytes", "234567");
+            response.set_header("VGI-Max-Externalized-Response-Bytes", "345678");
+            response.set_header("VGI-Externalization-Enabled", "true");
+            response.set_header("VGI-Upload-URL-Support", "true");
+            response.set_header("VGI-Max-Upload-Bytes", "456789");
+            response.set_header("VGI-Supported-Encodings", "ZSTD, gzip");
+        });
         server_.Post("/preflight", [this](const httplib::Request&, httplib::Response& response) {
             ++preflight_requests;
             arrow_response(response, good_response_);
         });
+        server_.Post("/encoded-request-cap",
+                     [this](const httplib::Request&, httplib::Response& response) {
+                         ++encoded_request_cap_requests;
+                         arrow_response(response, good_response_);
+                     });
         server_.Post("/ok", [this](const httplib::Request&, httplib::Response& response) {
             ++recovery_requests;
             arrow_response(response, good_response_);
         });
+        server_.Post(
+            "/compressed", [this](const httplib::Request& request, httplib::Response& response) {
+                compressed_request_valid.store(
+                    request.get_header_value("Content-Encoding") == "zstd" &&
+                    request.get_header_value("Accept-Encoding").find("zstd") != std::string::npos &&
+                    request.get_header_value("X-VGI-Accept-Encoding").find("zstd") !=
+                        std::string::npos &&
+                    !request_body(request).empty());
+                arrow_response(response, zstd_encode(good_response_));
+                response.set_header("Content-Encoding", "ZSTD");
+                response.set_header("VGI-Supported-Encodings", "zstd");
+            });
+        server_.Post("/decoded-large",
+                     [this](const httplib::Request&, httplib::Response& response) {
+                         arrow_response(response, zstd_encode(std::string(256 * 1024, 'd')));
+                         response.set_header("Content-Encoding", "zstd");
+                     });
+        server_.Post("/truncated-zstd",
+                     [this](const httplib::Request&, httplib::Response& response) {
+                         std::string encoded = zstd_encode(good_response_);
+                         encoded.resize(encoded.size() / 2);
+                         arrow_response(response, encoded);
+                         response.set_header("Content-Encoding", "zstd");
+                     });
+        server_.Post(
+            "/fallback", [this](const httplib::Request& request, httplib::Response& response) {
+                const int attempt = fallback_requests.fetch_add(1);
+                const std::string header_id = request.get_header_value("X-Request-ID");
+                const std::string arrow_id = request_metadata_value(request, keys::REQUEST_ID);
+                {
+                    std::lock_guard<std::mutex> lock(fallback_mutex_);
+                    if (attempt == 0) fallback_request_id_ = header_id;
+                    fallback_request_ids_valid.store(
+                        fallback_request_ids_valid.load() && !header_id.empty() &&
+                        header_id != "caller-spoof" && header_id == arrow_id &&
+                        header_id == fallback_request_id_);
+                }
+                if (request.get_header_value("Content-Encoding") == "zstd") {
+                    response.status = 415;
+                    response.set_content("unsupported", "text/plain");
+                    response.set_header("VGI-Supported-Encodings", "");
+                    return;
+                }
+                arrow_response(response, good_response_);
+            });
+        server_.Post("/advertise-none",
+                     [this](const httplib::Request& request, httplib::Response& response) {
+                         if (request.get_header_value("Content-Encoding").empty()) {
+                             ++advertised_identity_requests;
+                         }
+                         arrow_response(response, good_response_);
+                         response.set_header("VGI-Supported-Encodings", "");
+                     });
+        server_.Post(
+            "/row-log-metadata", [this](const httplib::Request&, httplib::Response& response) {
+                auto metadata = std::make_shared<arrow::KeyValueMetadata>();
+                metadata->Append(keys::LOG_LEVEL, "EXCEPTION");
+                metadata->Append(keys::LOG_MESSAGE, "application-owned metadata");
+                arrow_response(
+                    response,
+                    encode_response(schema_, {AnnotatedBatch::with_metadata(
+                                                 value_batch(schema_, 88), std::move(metadata))}));
+            });
 
         server_.Post("/fixed-large", [this](const httplib::Request&, httplib::Response& response) {
             response.set_content(std::string(good_response_.size() + 4096, 'f'), kArrowContentType);
@@ -255,6 +388,24 @@ private:
             }
             arrow_response(response, encode_response(empty_schema(), {empty_request()}));
         });
+
+        install_init("codec-fallback");
+        server_.Post("/codec-fallback/exchange", [this](const httplib::Request& request,
+                                                        httplib::Response& response) {
+            ++exchange_fallback_requests;
+            if (request.get_header_value("Content-Encoding") == "zstd") {
+                response.status = 415;
+                response.set_content("unsupported", "text/plain");
+                response.set_header("VGI-Supported-Encodings", "");
+                return;
+            }
+            auto metadata = std::make_shared<arrow::KeyValueMetadata>();
+            metadata->Append(keys::STATE_B64, "next-cursor");
+            arrow_response(
+                response,
+                encode_response(schema_, {AnnotatedBatch::with_metadata(value_batch(schema_, 41),
+                                                                        std::move(metadata))}));
+        });
     }
 
     void stop() noexcept {
@@ -267,6 +418,8 @@ private:
     httplib::Server server_;
     std::thread thread_;
     int port_ = 0;
+    std::mutex fallback_mutex_;
+    std::string fallback_request_id_;
 };
 
 template <typename Function>
@@ -288,6 +441,32 @@ void test_request_preflight(const FaultServer& server, const std::string& origin
                                     "request preflight cap");
     require(server.preflight_requests.load() == 0,
             "request exceeding the local preflight cap reached the server");
+}
+
+void test_encoded_request_cap(const FaultServer& server, const std::string& origin) {
+    const auto request = incompressible_request();
+    auto metadata = std::make_shared<arrow::KeyValueMetadata>();
+    metadata->Append(keys::METHOD, "encoded-request-cap");
+    metadata->Append(keys::REQUEST_VERSION, REQUEST_VERSION_VALUE);
+    metadata->Append(keys::REQUEST_ID, "0123456789abcdef");
+    const std::string raw =
+        encode_response(request.batch->schema(),
+                        {AnnotatedBatch::with_metadata(request.batch, std::move(metadata))});
+
+    HttpClientConfig config;
+    config.prefix = "";
+    config.max_request_bytes = static_cast<int64_t>(raw.size());
+    // The fastest zstd mode emits this deliberately tiny, literal-heavy frame
+    // slightly larger than its Arrow input.  That pins the post-compression
+    // guard, distinct from the existing decoded IPC preflight test.
+    config.compression_level = -131072;
+    HttpClient client(origin, config);
+    const auto error = require_http_client_error(
+        [&] { (void)client.call("encoded-request-cap", request); }, "encoded request cap");
+    require(std::string(error.what()).find("encoded HTTP RPC request") != std::string::npos,
+            "encoded request cap produced the wrong error");
+    require(server.encoded_request_cap_requests.load() == 0,
+            "request exceeding the encoded cap reached the server");
 }
 
 void test_response_caps(FaultServer& server, const std::string& origin,
@@ -312,6 +491,107 @@ void test_response_caps(FaultServer& server, const std::string& origin,
             "client did not recover after chunked response overflow");
     require(server.recovery_requests.load() == 2,
             "response-cap recovery requests did not both reach the server");
+}
+
+void test_compression(FaultServer& server, const std::string& origin,
+                      const std::shared_ptr<arrow::Schema>& schema) {
+    HttpClientConfig config;
+    config.prefix = "";
+    config.max_encoded_response_bytes = 64 * 1024;
+    config.max_decoded_response_bytes = 1024 * 1024;
+    HttpClient client(origin, config);
+
+    auto compressed = client.call("compressed", empty_request(), schema);
+    require(compressed.batch && compressed.batch->num_rows() == 1,
+            "zstd response did not decode to one batch");
+    require(server.compressed_request_valid.load(),
+            "client did not send a valid compressed request and codec advertisements");
+
+    HttpClientConfig decoded_cap;
+    decoded_cap.prefix = "";
+    decoded_cap.max_encoded_response_bytes = 64 * 1024;
+    decoded_cap.max_decoded_response_bytes =
+        static_cast<int64_t>(server.good_response().size() + 32);
+    HttpClient decoded_limited(origin, decoded_cap);
+    const auto decoded_error = require_http_client_error(
+        [&] { (void)decoded_limited.call("decoded-large", empty_request(), schema); },
+        "decoded zstd response cap");
+    require(
+        std::string(decoded_error.what()).find("max_decoded_response_bytes") != std::string::npos,
+        "decoded zstd cap produced the wrong error");
+
+    HttpClientConfig encoded_cap;
+    encoded_cap.prefix = "";
+    encoded_cap.max_encoded_response_bytes = 8;
+    encoded_cap.max_decoded_response_bytes = 1024 * 1024;
+    HttpClient encoded_limited(origin, encoded_cap);
+    const auto encoded_error = require_http_client_error(
+        [&] { (void)encoded_limited.call("compressed", empty_request(), schema); },
+        "encoded zstd response cap");
+    require(
+        std::string(encoded_error.what()).find("max_encoded_response_bytes") != std::string::npos,
+        "encoded zstd cap produced the wrong error");
+
+    const auto truncated_error = require_http_client_error(
+        [&] { (void)client.call("truncated-zstd", empty_request(), schema); },
+        "truncated zstd response");
+    require(std::string(truncated_error.what()).find("zstd") != std::string::npos,
+            "truncated zstd response produced the wrong error");
+}
+
+void test_compression_negotiation(FaultServer& server, const std::string& origin,
+                                  const std::shared_ptr<arrow::Schema>& schema) {
+    HttpClientConfig config;
+    config.prefix = "";
+    HttpClient fallback(origin, config);
+    auto spoofed = empty_request();
+    spoofed.custom_metadata = std::make_shared<arrow::KeyValueMetadata>();
+    spoofed.custom_metadata->Append(keys::REQUEST_ID, "caller-spoof");
+    auto result = fallback.call("fallback", spoofed, schema);
+    require(result.batch && result.batch->num_rows() == 1,
+            "415 compression fallback did not return data");
+    require(server.fallback_requests.load() == 2,
+            "415 compression fallback did not make exactly two attempts");
+    require(server.fallback_request_ids_valid.load(),
+            "logical request ID diverged between Arrow, HTTP, or 415 retry attempts");
+
+    HttpClient advertised(origin, config);
+    (void)advertised.call("advertise-none", empty_request(), schema);
+    (void)advertised.call("advertise-none", empty_request(), schema);
+    require(server.advertised_identity_requests.load() == 1,
+            "present-but-empty encoding advertisement did not disable later request compression");
+
+    HttpClient exchange_client(origin, config);
+    auto session = exchange_client.open_exchange("codec-fallback", empty_request(), schema, schema);
+    auto output = session.exchange(AnnotatedBatch::data(value_batch(schema, 1)));
+    require(output.batch && output.batch->num_rows() == 1 && session.active(),
+            "unambiguous exchange 415 fallback did not preserve the session");
+    require(server.exchange_fallback_requests.load() == 2,
+            "exchange 415 fallback did not make exactly two attempts");
+    session.close();
+}
+
+void test_capabilities_and_row_metadata(const std::string& origin,
+                                        const std::shared_ptr<arrow::Schema>& schema) {
+    HttpClientConfig config;
+    config.prefix = "";
+    HttpClient client(origin, config);
+    const auto caps = client.capabilities();
+    require(caps.sticky_enabled && caps.sticky_default_ttl == 45,
+            "sticky capability fields were not parsed");
+    require(caps.sticky_echo_headers == std::vector<std::string>({"X-Tenant", "X-Region"}),
+            "sticky echo capability list was not parsed");
+    require(caps.upload_url_support && caps.externalization_enabled,
+            "externalization capability flags were not parsed");
+    require(caps.max_request_bytes == 123456 && caps.max_response_bytes == 234567 &&
+                caps.max_externalized_response_bytes == 345678 && caps.max_upload_bytes == 456789,
+            "capability byte limits were not parsed");
+    require(caps.supported_encodings == std::vector<std::string>({"zstd", "gzip"}),
+            "capability encodings were not normalized");
+
+    auto result = client.call("row-log-metadata", empty_request(), schema);
+    require(result.batch && result.batch->num_rows() == 1,
+            "non-empty application batch with log metadata was swallowed as control");
 }
 
 void test_response_headers(const std::string& origin,
@@ -408,6 +688,16 @@ void test_config_validation(const std::string& origin) {
     HttpClientConfig zero_cap;
     zero_cap.max_response_bytes = 0;
     require_invalid(std::move(zero_cap), "unbounded/zero response cap");
+
+    HttpClientConfig negative_encoded_cap;
+    negative_encoded_cap.max_encoded_response_bytes = -1;
+    require_invalid(std::move(negative_encoded_cap), "negative encoded response cap");
+
+    HttpClientConfig explicit_caps;
+    explicit_caps.max_response_bytes = 0;
+    explicit_caps.max_encoded_response_bytes = 1024;
+    explicit_caps.max_decoded_response_bytes = 2048;
+    HttpClient explicit_client(origin, std::move(explicit_caps));
 }
 
 void test_ambiguous_exchange(FaultServer& server, const std::string& origin,
@@ -469,7 +759,11 @@ int main() {
         FaultServer server(schema);
         const std::string origin = server.origin();
         test_request_preflight(server, origin);
+        test_encoded_request_cap(server, origin);
         test_response_caps(server, origin, schema);
+        test_compression(server, origin, schema);
+        test_compression_negotiation(server, origin, schema);
+        test_capabilities_and_row_metadata(origin, schema);
         test_response_headers(origin, schema);
         test_pointer_metadata_sanitization(server, origin, schema);
         test_config_validation(origin);
