@@ -24,6 +24,19 @@ vgi_rpc_add_test(client_description_test)
 vgi_rpc_add_test(client_external_test)
 vgi_rpc_add_test(client_test)
 
+add_executable(client_integration client_integration.cpp)
+target_link_libraries(client_integration PRIVATE vgi_rpc)
+add_test(NAME client_integration COMMAND client_integration)
+set_tests_properties(client_integration PROPERTIES
+    TIMEOUT 90
+    SKIP_RETURN_CODE 77
+)
+if(Python3_FOUND)
+    set_tests_properties(client_integration PROPERTIES
+        ENVIRONMENT "VGI_RPC_PYTHON=${Python3_EXECUTABLE}"
+    )
+endif()
+
 add_executable(http_client_integration http_client_integration.cpp)
 target_link_libraries(http_client_integration PRIVATE vgi_rpc)
 add_test(NAME http_client_integration COMMAND http_client_integration)
