@@ -240,8 +240,14 @@ int main() {
         config.prefix = "";
         config.max_request_bytes = 8 * 1024 * 1024;
         config.max_response_bytes = 8 * 1024 * 1024;
-        HttpClient client("http://127.0.0.1:" + std::to_string(worker.port()), config);
+        auto client = HttpClient::builder("http://127.0.0.1:" + std::to_string(worker.port()))
+                          .config(config)
+                          .build();
         const auto schema = typed_schema();
+
+        const auto description = client.describe();
+        require(description.method("typed_exchange") != nullptr,
+                "native HTTP describe did not parse the Python worker protocol");
 
         auto session = client.open_exchange("typed_exchange", init_request(), schema, schema);
         // Caller-supplied protocol metadata cannot override the client's

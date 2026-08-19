@@ -73,6 +73,12 @@ add_library(vgi_rpc
 )
 
 target_compile_definitions(vgi_rpc PRIVATE VGI_RPC_BUILDING)
+# Apple's libc++ ships the standard C++20 stop-token implementation behind
+# its experimental-library feature gate.  HttpClient exposes std::stop_token,
+# so propagate the gate to consumers of both the build and installed targets.
+if(APPLE AND CMAKE_CXX_COMPILER_ID STREQUAL "AppleClang")
+    target_compile_definitions(vgi_rpc PUBLIC _LIBCPP_ENABLE_EXPERIMENTAL)
+endif()
 # PUBLIC so it reaches consumers, including those of the installed package:
 # whether the dllimport attribute is correct is a property of how this library
 # was built, and only this build knows it.

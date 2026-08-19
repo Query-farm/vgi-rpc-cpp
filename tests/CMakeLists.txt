@@ -41,6 +41,11 @@ target_link_libraries(http_client_fault_test PRIVATE vgi_rpc zstd::libzstd)
 add_test(NAME http_client_fault_test COMMAND http_client_fault_test)
 set_tests_properties(http_client_fault_test PROPERTIES TIMEOUT 60)
 
+add_executable(http_client_resilience_test http_client_resilience_test.cpp)
+target_link_libraries(http_client_resilience_test PRIVATE vgi_rpc)
+add_test(NAME http_client_resilience_test COMMAND http_client_resilience_test)
+set_tests_properties(http_client_resilience_test PROPERTIES TIMEOUT 60)
+
 if(VGI_RPC_BUILD_BENCHMARKS)
     add_executable(vgi_rpc_benchmark benchmark.cpp)
     target_link_libraries(vgi_rpc_benchmark PRIVATE vgi_rpc Catch2::Catch2WithMain)

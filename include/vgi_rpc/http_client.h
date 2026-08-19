@@ -4,21 +4,76 @@
 /// Native HTTP client for unary and typed exchange RPCs.
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <map>
 #include <memory>
 #include <optional>
 #include <stdexcept>
+#include <stop_token>
 #include <string>
 #include <vector>
 
 #include <arrow/type_fwd.h>
 
 #include "vgi_rpc/annotated_batch.h"
+#include "vgi_rpc/client_description.h"
 #include "vgi_rpc/export.h"
 
 namespace vgi_rpc {
+
+enum class HttpClientErrorKind {
+    TRANSPORT,
+    TLS,
+    TIMEOUT,
+    CANCELLED,
+    HTTP_STATUS,
+    AUTHENTICATION,
+    PROTOCOL,
+    LIMIT,
+    REMOTE,
+};
+
+struct RetryPolicy {
+    uint32_t max_attempts = 3;
+    std::chrono::milliseconds initial_backoff{100};
+    std::chrono::milliseconds max_backoff{10'000};
+    double multiplier = 2.0;
+    double jitter = 0.2;
+    // Empty by default, matching Rust: automatic retries cover connection
+    // failures only. Status retries are an explicit idempotency decision.
+    std::vector<int> retryable_status_codes;
+
+    static RetryPolicy disabled();
+};
+
+struct CallOptions {
+    std::map<std::string, std::string> headers;
+    std::optional<std::chrono::steady_clock::time_point> deadline;
+    std::optional<std::string> request_id;
+    std::stop_token stop_token;
+
+    static CallOptions with_timeout(std::chrono::milliseconds timeout);
+};
+
+struct HttpAuthRequest {
+    std::string method;
+    std::string path;
+    std::string request_id;
+};
+
+using HttpAuthCallback =
+    std::function<std::map<std::string, std::string>(const HttpAuthRequest& request)>;
+
+struct TlsOptions {
+    // Empty means OpenSSL's system trust store.
+    std::string ca_file;
+    std::string client_certificate_file;
+    std::string client_private_key_file;
+    // Deliberately loud and test-scoped. Never enable in production.
+    bool insecure_skip_verification_for_testing = false;
+};
 
 struct HttpServerCapabilities {
     bool sticky_enabled = false;
@@ -68,13 +123,41 @@ struct HttpClientConfig {
 
 class VGI_RPC_EXPORT HttpClientError : public std::runtime_error {
 public:
-    HttpClientError(std::string message, int http_status = 0)
-        : std::runtime_error(std::move(message)), http_status_(http_status) {}
+    HttpClientError(std::string message, int http_status = 0);
+    HttpClientError(HttpClientErrorKind kind, std::string message, int http_status,
+                    std::string method, std::string request_id, std::string response_body = {},
+                    std::string retry_after = {}, std::string auth_reason = {});
 
     int http_status() const noexcept { return http_status_; }
+    int status_code() const noexcept { return http_status_; }
+    HttpClientErrorKind kind() const noexcept { return kind_; }
+    const std::string& method() const noexcept { return method_; }
+    const std::string& request_id() const noexcept { return request_id_; }
+    const std::string& response_body() const noexcept { return response_body_; }
+    const std::string& retry_after() const noexcept { return retry_after_; }
+    const std::string& auth_reason() const noexcept { return auth_reason_; }
 
 private:
+    HttpClientErrorKind kind_ = HttpClientErrorKind::PROTOCOL;
     int http_status_;
+    std::string method_;
+    std::string request_id_;
+    std::string response_body_;
+    std::string retry_after_;
+    std::string auth_reason_;
+};
+
+class VGI_RPC_EXPORT HttpAuthenticationError : public HttpClientError {
+public:
+    HttpAuthenticationError(std::string message, int http_status, std::string method,
+                            std::string request_id, std::string response_body,
+                            std::string www_authenticate, std::string retry_after = {},
+                            std::string auth_reason = {});
+
+    const std::string& www_authenticate() const noexcept { return www_authenticate_; }
+
+private:
+    std::string www_authenticate_;
 };
 
 class VGI_RPC_EXPORT RpcRemoteError : public HttpClientError {
@@ -96,12 +179,45 @@ private:
 
 class HttpExchangeSession;
 class HttpClientState;
+class HttpClient;
+
+class VGI_RPC_EXPORT HttpClientBuilder {
+public:
+    explicit HttpClientBuilder(std::string base_url);
+    ~HttpClientBuilder();
+    HttpClientBuilder(const HttpClientBuilder&);
+    HttpClientBuilder& operator=(const HttpClientBuilder&);
+    HttpClientBuilder(HttpClientBuilder&&) noexcept;
+    HttpClientBuilder& operator=(HttpClientBuilder&&) noexcept;
+
+    HttpClientBuilder& config(HttpClientConfig config);
+    HttpClientBuilder& prefix(std::string prefix);
+    HttpClientBuilder& protocol_version(std::string version);
+    HttpClientBuilder& header(std::string name, std::string value);
+    HttpClientBuilder& compression_level(std::optional<int> level);
+    HttpClientBuilder& response_limits(int64_t max_encoded_bytes, int64_t max_decoded_bytes);
+    HttpClientBuilder& retry_policy(RetryPolicy policy);
+    HttpClientBuilder& auth_callback(HttpAuthCallback callback);
+    HttpClientBuilder& tls_options(TlsOptions options);
+    HttpClientBuilder& custom_ca_file(std::string path);
+    HttpClientBuilder& client_certificate(std::string certificate_file,
+                                          std::string private_key_file);
+    HttpClientBuilder& dangerous_disable_tls_verification_for_testing(bool disabled = true);
+
+    HttpClient build() const;
+
+private:
+    class Impl;
+    std::unique_ptr<Impl> impl_;
+};
 
 class VGI_RPC_EXPORT HttpClient {
 public:
-    // This implementation intentionally accepts plain http:// origins only.
-    // TLS, external-location fetching and producer iteration are not implied
-    // by this focused unary/exchange API.
+    static HttpClientBuilder builder(std::string base_url);
+
+    // Compatibility adapter. New code should use builder(), which exposes TLS,
+    // retry, authentication and per-call controls without growing this ABI.
+    [[deprecated("use HttpClient::builder(base_url).config(config).build()")]]
     explicit HttpClient(std::string base_url, HttpClientConfig config = {});
     ~HttpClient();
 
@@ -113,19 +229,26 @@ public:
     // Invoke a unary method.  The request batch's declared schema is written
     // verbatim; expected_output_schema, when present, is enforced exactly.
     AnnotatedBatch call(const std::string& method, const AnnotatedBatch& request,
-                        std::shared_ptr<arrow::Schema> expected_output_schema = nullptr) const;
+                        std::shared_ptr<arrow::Schema> expected_output_schema = nullptr,
+                        const CallOptions& options = {}) const;
 
     // Query OPTIONS {prefix}/health once and cache its advertised transport
     // capabilities.  Ordinary RPC responses refine the same cache.
-    HttpServerCapabilities capabilities() const;
+    HttpServerCapabilities capabilities(const CallOptions& options = {}) const;
+
+    // Fetch and validate the protocol's version-4 introspection document.
+    ServiceDescription describe(const CallOptions& options = {}) const;
 
     // Initialize a bidirectional exchange.  Every input and output batch is
     // checked against the declared schemas before it crosses the API boundary.
     HttpExchangeSession open_exchange(const std::string& method, const AnnotatedBatch& request,
                                       std::shared_ptr<arrow::Schema> input_schema,
-                                      std::shared_ptr<arrow::Schema> output_schema) const;
+                                      std::shared_ptr<arrow::Schema> output_schema,
+                                      const CallOptions& options = {}) const;
 
 private:
+    friend class HttpClientBuilder;
+    explicit HttpClient(std::shared_ptr<HttpClientState> state);
     std::shared_ptr<HttpClientState> state_;
 };
 
@@ -137,7 +260,7 @@ public:
     HttpExchangeSession(const HttpExchangeSession&) = delete;
     HttpExchangeSession& operator=(const HttpExchangeSession&) = delete;
 
-    AnnotatedBatch exchange(const AnnotatedBatch& input);
+    AnnotatedBatch exchange(const AnnotatedBatch& input, const CallOptions& options = {});
     // Local and idempotent: no network I/O, including from the destructor.
     void close() noexcept;
     // Best-effort network cancellation followed by local close.  Idempotent.

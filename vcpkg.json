@@ -11,7 +11,7 @@
     "nlohmann-json",
     {
       "name": "cpp-httplib",
-      "features": ["zstd", "zlib", "brotli"]
+      "features": ["zstd", "zlib", "brotli", "openssl"]
     },
     "zstd",
     "catch2"
