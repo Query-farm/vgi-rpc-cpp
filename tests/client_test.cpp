@@ -301,7 +301,7 @@ TEST_CASE("negotiated SHM externalizes exchange input and releases its allocatio
     std::atomic<bool> received_pointer{false};
     std::atomic<bool> returned_pointer{false};
 
-    std::jthread server([&] {
+    std::thread server([&] {
         try {
             auto input = std::make_shared<FdInputStream>(sockets[1]);
             auto output = std::make_shared<FdOutputStream>(sockets[1]);

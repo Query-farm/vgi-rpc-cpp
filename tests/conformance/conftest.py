@@ -42,6 +42,20 @@ _DEFAULT_WORKER = _REPO_ROOT / "build" / "conformance" / "conformance_worker"
 CONFORMANCE_CORS_ORIGIN = "https://conformance.example"
 
 
+def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
+    """Give the C++ HTTP soak enough time on slower CI architectures.
+
+    The portable suite's 50-second default is appropriate for most workers,
+    but the C++ unary soak performs thousands of HTTP round trips and reaches
+    that budget on both hosted x64 and ARM runners. Keep the larger allowance
+    scoped to this resource test class rather than weakening other timeouts.
+
+    """
+    for item in items:
+        if item.cls is not None and item.cls.__name__ == "TestResourceSoak":
+            item.add_marker(pytest.mark.timeout(120), append=False)
+
+
 def worker_path() -> str:
     """Absolute path to the C++ conformance worker under test."""
     override = os.environ.get("VGI_RPC_CPP_WORKER")
