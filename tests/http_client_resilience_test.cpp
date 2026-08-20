@@ -412,7 +412,7 @@ void test_builder_errors_and_redirects(PlainFaultServer& server,
     require(defaults.max_attempts == 3 && defaults.initial_backoff.count() == 100 &&
                 defaults.max_backoff.count() == 10'000 && defaults.multiplier == 2.0 &&
                 defaults.jitter == 0.2,
-            "RetryPolicy defaults diverged from Rust");
+            "RetryPolicy schedule defaults changed unexpectedly");
 
     HttpClientConfig limited_config;
     limited_config.prefix = "/large";

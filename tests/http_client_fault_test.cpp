@@ -211,6 +211,7 @@ public:
     std::atomic<bool> transport_block_entered{false};
     std::atomic<bool> transport_block_release{false};
     std::atomic<int> post_retry_requests{0};
+    std::atomic<int> producer_retry_requests{0};
 
 private:
     void arrow_response(httplib::Response& response, const std::string& body) {
@@ -382,6 +383,16 @@ private:
             }
             arrow_response(response, good_response_);
         });
+        install_init("producer-retry");
+        server_.Post("/producer-retry/exchange",
+                     [this](const httplib::Request&, httplib::Response& response) {
+                         if (producer_retry_requests.fetch_add(1) < 2) {
+                             response.status = 503;
+                             response.set_content("retry", "text/plain");
+                             return;
+                         }
+                         arrow_response(response, good_response_);
+                     });
         server_.Delete("/__session__", [](const httplib::Request&, httplib::Response& response) {
             response.status = 204;
         });
@@ -665,6 +676,27 @@ void test_post_retry_requires_idempotency(FaultServer& server, const std::string
     const auto result = client.call("post-retry", empty_request(), schema, idempotent);
     require(result.batch && server.post_retry_requests.load() == 3,
             "explicitly idempotent POST did not use the configured retry policy");
+}
+
+void test_producer_retry_requires_idempotency(FaultServer& server, const std::string& origin,
+                                              const std::shared_ptr<arrow::Schema>& schema) {
+    RetryPolicy policy;
+    policy.initial_backoff = std::chrono::milliseconds(0);
+    policy.retryable_status_codes = {503};
+    auto client = HttpClient::builder(origin).prefix("").retry_policy(policy).build();
+
+    auto default_session = client.open_producer("producer-retry", empty_request(), schema);
+    const auto error = require_http_client_error([&] { (void)default_session.tick(); },
+                                                 "non-idempotent producer continuation");
+    require(error.http_status() == 503 && server.producer_retry_requests.load() == 1,
+            "producer continuation retried without idempotency opt-in");
+
+    auto idempotent_session = client.open_producer("producer-retry", empty_request(), schema);
+    CallOptions idempotent;
+    idempotent.idempotent = true;
+    const auto result = idempotent_session.tick(idempotent);
+    require(result && result->batch && server.producer_retry_requests.load() == 3,
+            "explicitly idempotent producer continuation did not use retry policy");
 }
 
 void test_capabilities_and_row_metadata(const std::string& origin,
@@ -1000,6 +1032,7 @@ int main() {
         test_compression(server, origin, schema);
         test_compression_negotiation(server, origin, schema);
         test_post_retry_requires_idempotency(server, origin, schema);
+        test_producer_retry_requires_idempotency(server, origin, schema);
         test_capabilities_and_row_metadata(origin, schema);
         test_response_headers(origin, schema);
         test_pointer_metadata_sanitization(server, origin, schema);

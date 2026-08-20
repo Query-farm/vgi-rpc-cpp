@@ -2380,15 +2380,13 @@ std::optional<AnnotatedBatch> HttpStreamSession::tick(const CallOptions& options
         const std::string request_id = logical_request_id(options);
         auto metadata = impl_->continuation_metadata(request_id);
         const AnnotatedBatch request = AnnotatedBatch::data(make_empty_batch(empty_schema()));
-        // Producer continuation cursors describe immutable prior state, so
-        // replaying the same token is protocol-idempotent even when the caller
-        // has not opted an application RPC into POST retries.
-        CallOptions continuation_options = options;
-        continuation_options.idempotent = true;
+        // Producing the next batch may have application side effects even
+        // though the continuation cursor itself is immutable. Replay only
+        // when the caller has explicitly declared this turn idempotent.
         const auto response = impl_->state->post(
             impl_->method, impl_->state->path(impl_->method, "/exchange"),
             encode_ipc(request, metadata, impl_->state->request_serialization_cap()), request_id,
-            continuation_options, true, impl_->sticky_session);
+            options, true, impl_->sticky_session);
         auto decoded = impl_->state->decode(response, ResponseShape::PRODUCER_TURN, false,
                                             impl_->state->external(), impl_->sticky_session);
         if (!schema_equals(decoded.schema, impl_->output_schema)) {

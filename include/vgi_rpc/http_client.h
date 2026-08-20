@@ -42,8 +42,8 @@ struct RetryPolicy {
     std::chrono::milliseconds max_backoff{10'000};
     double multiplier = 2.0;
     double jitter = 0.2;
-    // Empty by default, matching Rust: automatic retries cover connection
-    // failures only. Status retries are an explicit idempotency decision.
+    // Empty by default: status retries require both an explicit status list
+    // and CallOptions::idempotent. Connection retries use the same gate.
     std::vector<int> retryable_status_codes;
 
     static RetryPolicy disabled();

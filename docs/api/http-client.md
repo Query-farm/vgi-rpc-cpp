@@ -67,15 +67,14 @@ The client overwrites caller Arrow metadata and writes the same value into both
 Arrow `vgi_rpc.request_id` and HTTP `X-Request-ID`; it remains unchanged across
 connection retries and the safe 415 codec fallback.
 
-`RetryPolicy` defaults match Rust: three attempts, 100 ms initial backoff,
-10 second maximum backoff, multiplier 2, and 20% jitter. RPC POSTs still make
-one attempt by default because a transport failure after dispatch is
-ambiguous. Set `CallOptions::idempotent = true` only after the application has
-made the logical operation safe to replay; its transport and configured status
-retries then use the policy. Producer continuation tokens are immutable
-prior-state cursors and remain automatically retryable by the protocol.
-Exchange turns are never retried and their session is poisoned on ambiguous
-failure. HTTP status retry is off until `retryable_status_codes` is populated.
+`RetryPolicy` carries a three-attempt schedule with 100 ms initial backoff, a
+10 second maximum backoff, multiplier 2, and 20% jitter. RPC POSTs—including
+producer continuations—still make one attempt by default because a transport
+failure after dispatch is ambiguous. Set `CallOptions::idempotent = true` only
+after the application has made that logical operation safe to replay; its
+transport and configured status retries then use the policy. Exchange turns
+are never retried and their session is poisoned on ambiguous failure. HTTP
+status retry is off until `retryable_status_codes` is populated.
 `RetryPolicy::disabled()` makes exactly one attempt in every case.
 
 ## Exchange contract
@@ -112,8 +111,10 @@ blob that resumes *after* that batch. `resume_stream()` starts directly from a
 persisted token without replaying `/init`, and `seek_to_token()` repositions a
 fresh producer session. Responses that buffer more than one batch cannot expose
 a truthful per-batch resume point, so `next_with_token()` rejects them; consume
-such responses with `tick()` instead. Producer continuations are token-addressed
-and retryable. Exchange turns are never retried after dispatch ambiguity.
+such responses with `tick()` instead. Producer continuations use the
+`CallOptions` passed to `tick()` / `next_with_token()` and are retried only when
+the caller marks the turn idempotent. Exchange turns are never retried after
+dispatch ambiguity.
 
 Optional stream headers are parsed as their own IPC substream and returned by
 `header()`. Externalized headers and data are resolved before cursor metadata is
