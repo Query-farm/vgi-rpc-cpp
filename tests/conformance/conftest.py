@@ -133,6 +133,53 @@ def conformance_http_port() -> Iterator[int]:
         yield port
 
 
+@pytest.fixture
+def conformance_resource_soak_target() -> Iterator[Any]:
+    """Expose one isolated C++ HTTP worker to the shared resource soak."""
+    from vgi_rpc.conformance import ConformanceService
+    from vgi_rpc.conformance._resource_soak_pytest import (
+        ResourceSoakLimits,
+        ResourceSoakTarget,
+    )
+    from vgi_rpc.http import http_connect
+
+    proc = subprocess.Popen(
+        [worker_path(), "--http"],
+        stdout=subprocess.PIPE,
+        stderr=sys.stderr,
+    )
+    try:
+        assert proc.stdout is not None
+        line = proc.stdout.readline().decode().strip()
+        if not line.startswith("PORT:"):
+            raise RuntimeError(f"expected PORT:<n> on stdout, got {line!r}")
+        port = int(line.split(":", 1)[1])
+        _wait_for_http(port)
+
+        def connect() -> contextlib.AbstractContextManager[Any]:
+            return http_connect(ConformanceService, f"http://127.0.0.1:{port}")
+
+        yield ResourceSoakTarget(
+            name="cpp-http",
+            pid=proc.pid,
+            connect=connect,
+            limits=ResourceSoakLimits(
+                rss_growth_bytes=32 * 1024 * 1024,
+                rss_slope_bytes_per_epoch=2 * 1024 * 1024,
+                descriptor_growth=3,
+                thread_growth=2,
+                child_growth=0,
+            ),
+        )
+    finally:
+        proc.terminate()
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            proc.wait(timeout=5)
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=5)
+
+
 @pytest.fixture(scope="session")
 def conformance_http_small_request_cap_port() -> Iterator[int]:
     """A worker with the shared suite's canonical 4 KiB request cap."""
