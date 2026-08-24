@@ -9,6 +9,7 @@
 
 #include <cstdint>
 #include <fstream>
+#include <mutex>
 #include <string>
 
 #include "vgi_rpc/export.h"
@@ -45,8 +46,8 @@ VGI_RPC_EXPORT std::string base64_encode(const uint8_t* data, size_t len);
 // Character length of the base64 encoding of `len` bytes, without encoding it.
 VGI_RPC_EXPORT int64_t base64_encoded_length(int64_t len);
 
-// Writes one JSON line per call to the configured path.  NOT thread-safe;
-// designed for the single-threaded pipe server.
+// Writes one JSON line per call to the configured path.  Concurrent emitters
+// are serialized so threaded HTTP dispatch cannot interleave JSON records.
 class VGI_RPC_EXPORT AccessLogWriter {
 public:
     AccessLogWriter(const std::string& path, std::string server_id, std::string protocol_name,
@@ -70,6 +71,7 @@ private:
     std::string protocol_name_;
     std::string protocol_hash_;
     int64_t max_record_bytes_ = kDefaultMaxRecordBytes;
+    std::mutex mutex_;
 };
 
 }  // namespace vgi_rpc

@@ -137,8 +137,10 @@ private:
     int64_t access_log_max_record_bytes_ = kDefaultMaxRecordBytes;
 };
 
-// NOT thread-safe.  Designed for single-threaded pipe-based operation
-// (one request at a time on stdin/stdout).
+// Pipe operation dispatches one request at a time. HTTP may invoke unrelated
+// handlers concurrently; implementations that share mutable state between
+// calls must provide their own synchronization. Stream turns and sticky
+// session calls are serialized per state object by the HTTP transport.
 class VGI_RPC_EXPORT Server {
     friend class ServerBuilder;
 

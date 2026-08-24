@@ -19,12 +19,15 @@
 #include <arrow/type.h>
 
 #include <algorithm>
+#include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
 #include <format>
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -519,6 +522,34 @@ static Result oversized_unary_handler(const Request& req, CallContext&) {
 
 static void void_noop_handler(const Request&, CallContext&) {}
 static void void_with_param_handler(const Request&, CallContext&) {}
+
+// Test-only rendezvous for proving that unrelated HTTP requests may execute
+// concurrently.  A worker-wide dispatch lock makes the first caller time out;
+// per-stream and per-session locks allow both callers through together.
+static Result http_concurrency_probe_handler(const Request& req, CallContext&) {
+    static std::mutex mutex;
+    static std::condition_variable ready;
+    static uint64_t generation = 0;
+    static unsigned arrivals = 0;
+
+    const int64_t tag = req.get<int64_t>("tag");
+    std::unique_lock lock(mutex);
+    const uint64_t my_generation = generation;
+    if (++arrivals == 2) {
+        arrivals = 0;
+        ++generation;
+        ready.notify_all();
+    } else if (!ready.wait_for(lock, std::chrono::seconds(5),
+                               [&] { return generation != my_generation; })) {
+        --arrivals;
+        throw std::runtime_error("unrelated HTTP handlers were serialized");
+    }
+    lock.unlock();
+
+    arrow::Int64Builder builder;
+    VGI_RPC_THROW_NOT_OK(builder.Append(tag));
+    return Result::value(int_result_schema(), {unwrap(builder.Finish())});
+}
 
 // =========================================================================
 // Unary handlers: complex type echo
@@ -1415,6 +1446,7 @@ int main(int argc, char** argv) {
     bool fail_serve_start_once = false;
     bool transport_kind_probe = false;
     bool polymorphic_stream_probe = false;
+    bool http_concurrency_probe = false;
     std::string server_id;
     vgi_rpc::HttpConfig http_cfg;
     // Sticky is on by default here, matching the reference conformance worker,
@@ -1463,6 +1495,8 @@ int main(int argc, char** argv) {
             transport_kind_probe = true;
         } else if (arg == "--polymorphic-stream-probe") {
             polymorphic_stream_probe = true;
+        } else if (arg == "--http-concurrency-probe") {
+            http_concurrency_probe = true;
         } else if (arg == "--host") {
             http_cfg.host = take_value(i);
         } else if (arg == "--port") {
@@ -1593,6 +1627,10 @@ int main(int argc, char** argv) {
         builder.add_exchange("polymorphic_stream",
                              params({arrow::field("as_producer", arrow::boolean())}),
                              scale_input_schema(), scale_output_schema(), make_polymorphic_stream);
+    }
+    if (http_concurrency_probe) {
+        builder.add_unary("rendezvous", params({arrow::field("tag", arrow::int64())}),
+                          int_result_schema(), http_concurrency_probe_handler);
     }
 
     // --- Scalar Echo ---
@@ -1938,7 +1976,9 @@ int main(int argc, char** argv) {
         http_cfg.sticky_echo_headers["x-vgi-conformance-echo"] = "conformance-fixed-marker";
     }
 
-    if (!transport_kind_probe && !polymorphic_stream_probe) builder.protocol_version("2.0.0");
+    if (!transport_kind_probe && !polymorphic_stream_probe && !http_concurrency_probe) {
+        builder.protocol_version("2.0.0");
+    }
     builder.enable_describe("ConformanceService");
     // We implement SHM, so we must answer the handshake: a worker that stays
     // silent is treated as "no SHM" and clients never negotiate it.

@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <deque>
 #include <map>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 
@@ -76,6 +77,7 @@ private:
     int skew_seconds_;
     bool replay_cache_;
     size_t replay_capacity_;
+    std::mutex replay_mutex_;
     std::unordered_map<std::string, int64_t> nonces_;  // nonce -> first-seen unix
     std::deque<std::string> nonce_order_;
 };

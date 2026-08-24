@@ -99,6 +99,7 @@ bool AccessLogWriter::payload_fits(int64_t b64_len) const noexcept {
 
 void AccessLogWriter::emit(const AccessRecord& rec) {
     if (!enabled_) return;
+    std::lock_guard<std::mutex> lock(mutex_);
 
     nlohmann::json j;
     j["timestamp"] = utc_timestamp_ms();

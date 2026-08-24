@@ -11,6 +11,7 @@
 #pragma once
 
 #include <chrono>
+#include <atomic>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -59,9 +60,12 @@ public:
                      std::optional<int> ttl_seconds = std::nullopt);
 
     // Resolve a token presented under `aad`.  On OK, `out_state` and
-    // `out_session_id` are populated.
+    // `out_session_id` are populated.  When `out_dispatch_lock` is supplied,
+    // it remains locked for the caller: concurrent calls on one session are
+    // serialized while calls on different sessions remain independent.
     SessionLookup resolve(const std::string& token, const std::string& aad,
-                          std::shared_ptr<SessionState>* out_state, std::string* out_session_id);
+                          std::shared_ptr<SessionState>* out_state, std::string* out_session_id,
+                          std::unique_lock<std::recursive_mutex>* out_dispatch_lock = nullptr);
 
     // Drop a session and run its close hook.  Idempotent.
     bool close(const std::string& token, const std::string& aad);
@@ -70,10 +74,10 @@ public:
     void sweep();
 
     // Flip the drain flag: open() then refuses, while live sessions keep serving.
-    void drain() { draining_ = true; }
+    void drain() { draining_.store(true); }
     // Only a conformance run needs this: a deployment drains once and exits.
-    void undrain() { draining_ = false; }
-    bool draining() const noexcept { return draining_; }
+    void undrain() { draining_.store(false); }
+    bool draining() const noexcept { return draining_.load(); }
 
     // Run every live session's close hook and empty the registry.
     void shutdown();
@@ -84,6 +88,7 @@ private:
     struct Entry {
         std::shared_ptr<SessionState> state;
         std::chrono::steady_clock::time_point expires_at;
+        std::recursive_mutex dispatch_mutex;
     };
 
     // Decode a token to its session id, verifying the seal, the AAD, and that
@@ -94,9 +99,9 @@ private:
     std::array<uint8_t, crypto::kAeadKeyBytes> key_;
     std::string server_id_;
     int default_ttl_seconds_;
-    bool draining_ = false;
+    std::atomic<bool> draining_{false};
     std::mutex mutex_;
-    std::unordered_map<std::string, Entry> entries_;
+    std::unordered_map<std::string, std::shared_ptr<Entry>> entries_;
 };
 
 }  // namespace vgi_rpc

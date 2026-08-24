@@ -157,6 +157,7 @@ ProofVerifier::ProofVerifier(ProofMode mode, std::string origin_id, const std::s
 
 bool ProofVerifier::seen_nonce(const std::string& nonce) {
     if (!replay_cache_) return false;
+    std::lock_guard<std::mutex> lock(replay_mutex_);
     const int64_t now = unix_now();
 
     // Drop entries that have aged past the window: a nonce older than the skew

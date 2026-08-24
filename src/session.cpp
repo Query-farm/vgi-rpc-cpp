@@ -75,12 +75,12 @@ std::string SessionRegistry::open(std::shared_ptr<SessionState> state, const std
     frame += session_id;
     put_u64_le(frame, now + static_cast<uint64_t>(ttl));
 
+    auto entry = std::make_shared<Entry>();
+    entry->state = std::move(state);
+    entry->expires_at = std::chrono::steady_clock::now() + std::chrono::seconds(ttl);
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        entries_[session_id] = Entry{
-            std::move(state),
-            std::chrono::steady_clock::now() + std::chrono::seconds(ttl),
-        };
+        entries_[session_id] = std::move(entry);
     }
 
     std::string sealed = crypto::aead_seal(key_, frame, aad);
@@ -127,72 +127,101 @@ SessionLookup SessionRegistry::unseal(const std::string& token, const std::strin
 
 SessionLookup SessionRegistry::resolve(const std::string& token, const std::string& aad,
                                        std::shared_ptr<SessionState>* out_state,
-                                       std::string* out_session_id) {
+                                       std::string* out_session_id,
+                                       std::unique_lock<std::recursive_mutex>* out_dispatch_lock) {
     std::string session_id;
     const SessionLookup status = unseal(token, aad, &session_id);
     if (status != SessionLookup::OK) return status;
 
-    std::lock_guard<std::mutex> lock(mutex_);
-    auto it = entries_.find(session_id);
-    if (it == entries_.end()) return SessionLookup::MISSING;
-    if (std::chrono::steady_clock::now() > it->second.expires_at) {
-        auto state = it->second.state;
-        entries_.erase(it);
-        if (state) state->close();
-        return SessionLookup::EXPIRED;
+    std::shared_ptr<Entry> entry;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = entries_.find(session_id);
+        if (it == entries_.end()) return SessionLookup::MISSING;
+        entry = it->second;
     }
 
-    *out_state = it->second.state;
-    *out_session_id = session_id;
-    return SessionLookup::OK;
+    // Never wait for a session while holding the registry mutex: a handler
+    // already holding this per-session lock may legitimately open or close a
+    // session, both of which need the registry briefly.
+    std::unique_lock<std::recursive_mutex> dispatch_lock(entry->dispatch_mutex);
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = entries_.find(session_id);
+        if (it == entries_.end() || it->second != entry) return SessionLookup::MISSING;
+        if (std::chrono::steady_clock::now() > entry->expires_at) {
+            entries_.erase(it);
+        } else {
+            *out_state = entry->state;
+            *out_session_id = session_id;
+            if (out_dispatch_lock) *out_dispatch_lock = std::move(dispatch_lock);
+            return SessionLookup::OK;
+        }
+    }
+
+    if (entry->state) entry->state->close();
+    return SessionLookup::EXPIRED;
 }
 
 bool SessionRegistry::close(const std::string& token, const std::string& aad) {
     std::string session_id;
     if (unseal(token, aad, &session_id) != SessionLookup::OK) return false;
 
-    std::shared_ptr<SessionState> state;
+    std::shared_ptr<Entry> entry;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         auto it = entries_.find(session_id);
         if (it == entries_.end()) return false;
-        state = it->second.state;
+        entry = it->second;
+    }
+
+    std::unique_lock<std::recursive_mutex> dispatch_lock(entry->dispatch_mutex);
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = entries_.find(session_id);
+        if (it == entries_.end() || it->second != entry) return false;
         entries_.erase(it);
     }
-    if (state) state->close();
+    if (entry->state) entry->state->close();
     return true;
 }
 
 void SessionRegistry::sweep() {
-    std::vector<std::shared_ptr<SessionState>> expired;
+    std::vector<std::pair<std::string, std::shared_ptr<Entry>>> candidates;
+    const auto now = std::chrono::steady_clock::now();
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        const auto now = std::chrono::steady_clock::now();
-        for (auto it = entries_.begin(); it != entries_.end();) {
-            if (now > it->second.expires_at) {
-                expired.push_back(it->second.state);
-                it = entries_.erase(it);
-            } else {
-                ++it;
-            }
+        for (const auto& [session_id, entry] : entries_) {
+            if (now > entry->expires_at) candidates.emplace_back(session_id, entry);
         }
     }
-    // Close hooks run outside the lock: an application's close() may be slow,
-    // and holding the registry lock through it would stall every other session.
-    for (auto& s : expired) {
-        if (s) s->close();
+
+    for (auto& [session_id, entry] : candidates) {
+        std::unique_lock<std::recursive_mutex> dispatch_lock(entry->dispatch_mutex);
+        bool removed = false;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            auto it = entries_.find(session_id);
+            if (it != entries_.end() && it->second == entry &&
+                std::chrono::steady_clock::now() > entry->expires_at) {
+                entries_.erase(it);
+                removed = true;
+            }
+        }
+        if (removed && entry->state) entry->state->close();
     }
 }
 
 void SessionRegistry::shutdown() {
-    std::vector<std::shared_ptr<SessionState>> live;
+    std::vector<std::shared_ptr<Entry>> live;
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        for (auto& [_, entry] : entries_) live.push_back(entry.state);
+        for (auto& [_, entry] : entries_) live.push_back(entry);
         entries_.clear();
     }
-    for (auto& s : live) {
-        if (s) s->close();
+    for (auto& entry : live) {
+        std::unique_lock<std::recursive_mutex> dispatch_lock(entry->dispatch_mutex);
+        if (entry->state) entry->state->close();
     }
 }
 

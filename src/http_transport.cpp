@@ -11,8 +11,9 @@
 // keeps the C++ stream-state objects — live handles, not serializable values —
 // alive across the separate HTTP requests of one stream.  The token itself is
 // AEAD-sealed and bound to the worker and the caller's identity, so it is
-// opaque to the client and useless at any other worker.  Requests are
-// serialized under one mutex to preserve the framework's single-threaded model.
+// opaque to the client and useless at any other worker.  The registries have
+// short metadata locks and each live state has its own dispatch lock: one
+// stream/session remains lock-step without serializing unrelated RPCs.
 
 #include "vgi_rpc/server.h"
 #include "vgi_rpc/arrow_utils.h"
@@ -81,6 +82,7 @@ constexpr const char* UNAVAILABLE_TOKEN = "conformance-unavailable-token";
 
 // Live stream held across the separate HTTP requests of one stream call.
 struct HttpStreamSession {
+    std::mutex dispatch_mutex;
     std::shared_ptr<StreamState> state;
     std::shared_ptr<arrow::Schema> output_schema;
     std::shared_ptr<arrow::Schema> input_schema;
@@ -442,8 +444,8 @@ private:
     ProofVerifier proof_;
     std::unique_ptr<ExternalStorage> storage_;
 
-    std::mutex mutex_;
-    std::unordered_map<std::string, HttpStreamSession> streams_;
+    std::mutex streams_mutex_;
+    std::unordered_map<std::string, std::shared_ptr<HttpStreamSession>> streams_;
 };
 
 std::string HttpServer::strip_prefix(const std::string& path) const {
@@ -907,8 +909,6 @@ void HttpServer::handle_session_delete(const httplib::Request& req, httplib::Res
 
 void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
                             const std::string& request_body) {
-    std::lock_guard<std::mutex> lock(mutex_);
-
     std::string request_id = req.get_header_value(REQUEST_ID_HEADER);
     if (request_id.empty()) request_id = random_hex(16);
     stamp_common(req, res, request_id);
@@ -1072,6 +1072,7 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
     // Sticky machinery for this request, installed only on HTTP.
     StickySlot sticky;
     std::string resumed_token;
+    std::unique_lock<std::recursive_mutex> sticky_dispatch_lock;
     if (cfg_.sticky) {
         sticky.client_accepts = req.get_header_value(SESSION_ACCEPT_HEADER) == "true";
         sticky.draining = sessions_.draining();
@@ -1084,7 +1085,8 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
         if (!resumed_token.empty()) {
             std::shared_ptr<SessionState> state;
             std::string session_id;
-            const SessionLookup status = sessions_.resolve(resumed_token, aad, &state, &session_id);
+            const SessionLookup status =
+                sessions_.resolve(resumed_token, aad, &state, &session_id, &sticky_dispatch_lock);
             if (status != SessionLookup::OK) {
                 // Every cause reports identically — see SessionLookup.
                 res.status = 200;
@@ -1242,8 +1244,15 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
                 ob.push_back(AnnotatedBatch::with_metadata(make_empty_batch(output_schema),
                                                            init_metadata(cursor, call_token)));
                 write_ipc_stream(out, output_schema, ob);
-                streams_[cursor] = {stream.state, output_schema, input_schema,
-                                    true,         method_name,   aad};
+                auto session = std::make_shared<HttpStreamSession>();
+                session->state = stream.state;
+                session->output_schema = output_schema;
+                session->input_schema = input_schema;
+                session->is_exchange = true;
+                session->method_name = method_name;
+                session->aad = aad;
+                std::lock_guard<std::mutex> registry_lock(streams_mutex_);
+                streams_[cursor] = std::move(session);
             } else {
                 auto writer = unwrap(arrow::ipc::MakeStreamWriter(out, output_schema));
                 if (!stream.header) {
@@ -1260,8 +1269,15 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
                 if (!finished) {
                     VGI_RPC_THROW_NOT_OK(writer->WriteRecordBatch(
                         *make_empty_batch(output_schema), init_metadata(cursor, call_token)));
-                    streams_[cursor] = {stream.state, output_schema, input_schema,
-                                        false,        method_name,   aad};
+                    auto session = std::make_shared<HttpStreamSession>();
+                    session->state = stream.state;
+                    session->output_schema = output_schema;
+                    session->input_schema = input_schema;
+                    session->is_exchange = false;
+                    session->method_name = method_name;
+                    session->aad = aad;
+                    std::lock_guard<std::mutex> registry_lock(streams_mutex_);
+                    streams_[cursor] = std::move(session);
                 }
                 VGI_RPC_THROW_NOT_OK(writer->Close());
             }
@@ -1271,7 +1287,10 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
         // is nothing for a soft cap to spread the overshoot across.
         if (cfg_.max_externalized_response_bytes >= 0 &&
             externalized > cfg_.max_externalized_response_bytes) {
-            streams_.erase(cursor);
+            {
+                std::lock_guard<std::mutex> registry_lock(streams_mutex_);
+                streams_.erase(cursor);
+            }
             res.status = 200;
             res.set_header(RPC_ERROR_HEADER, "true");
             apply_sticky();
@@ -1294,15 +1313,32 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
 
     // ---- Stream exchange / producer continuation ----
     auto cursor = get_metadata_value(custom_metadata, keys::STATE_B64);
-    auto sit = streams_.find(cursor);
-    if (cursor.empty() || sit == streams_.end()) {
+    std::shared_ptr<HttpStreamSession> sess;
+    if (!cursor.empty()) {
+        std::lock_guard<std::mutex> registry_lock(streams_mutex_);
+        auto sit = streams_.find(cursor);
+        if (sit != streams_.end()) sess = sit->second;
+    }
+    if (!sess) {
         fail(400, "ProtocolError", "Unknown or missing stream state token");
         return;
     }
-    HttpStreamSession& sess = sit->second;
+    std::unique_lock<std::mutex> stream_dispatch_lock(sess->dispatch_mutex);
+    // A concurrent terminal/cancel turn may have removed this session while
+    // this request waited on its state lock. Revalidate before touching state.
+    bool still_live = false;
+    {
+        std::lock_guard<std::mutex> registry_lock(streams_mutex_);
+        auto sit = streams_.find(cursor);
+        still_live = sit != streams_.end() && sit->second == sess;
+    }
+    if (!still_live) {
+        fail(400, "ProtocolError", "Unknown or missing stream state token");
+        return;
+    }
     // A stream is bound to the identity that opened it for the same reason a
     // session is: otherwise a second caller could resume the first's cursor.
-    if (sess.aad != aad) {
+    if (sess->aad != aad) {
         fail(400, "ProtocolError", "Unknown or missing stream state token");
         return;
     }
@@ -1321,7 +1357,7 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
                 if (auto opened = crypto::aead_open(cfg_.token_key, *raw, aad)) {
                     const size_t sep = opened->find('\0');
                     resolved = sep != std::string::npos &&
-                               opened->substr(0, sep) == sess.method_name &&
+                               opened->substr(0, sep) == sess->method_name &&
                                opened->substr(sep + 1) == cursor;
                 }
             }
@@ -1333,14 +1369,18 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
             return;
         }
     }
-    auto output_schema = sess.output_schema;
+    auto output_schema = sess->output_schema;
 
     if (custom_metadata && custom_metadata->FindKey(keys::CANCEL) >= 0) {
         try {
-            sess.state->on_cancel(ctx);
+            sess->state->on_cancel(ctx);
         } catch (...) {
         }
-        streams_.erase(sit);
+        {
+            std::lock_guard<std::mutex> registry_lock(streams_mutex_);
+            auto sit = streams_.find(cursor);
+            if (sit != streams_.end() && sit->second == sess) streams_.erase(sit);
+        }
         res.status = 200;
         apply_sticky();
         set_arrow_content(req, res,
@@ -1351,7 +1391,11 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
     }
 
     auto stream_error = [&](const std::exception& e) {
-        streams_.erase(cursor);
+        {
+            std::lock_guard<std::mutex> registry_lock(streams_mutex_);
+            auto sit = streams_.find(cursor);
+            if (sit != streams_.end() && sit->second == sess) streams_.erase(sit);
+        }
         res.status = 200;
         res.set_header(RPC_ERROR_HEADER, "true");
         apply_sticky();
@@ -1370,7 +1414,11 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
     auto external_cap_exceeded = [&]() {
         if (cfg_.max_externalized_response_bytes < 0) return false;
         if (externalized <= cfg_.max_externalized_response_bytes) return false;
-        streams_.erase(cursor);
+        {
+            std::lock_guard<std::mutex> registry_lock(streams_mutex_);
+            auto sit = streams_.find(cursor);
+            if (sit != streams_.end() && sit->second == sess) streams_.erase(sit);
+        }
         res.status = 200;
         res.set_header(RPC_ERROR_HEADER, "true");
         apply_sticky();
@@ -1380,16 +1428,16 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
                        "Externalised payload exceeds max_externalized_response_bytes (" +
                            std::to_string(externalized) + " > " +
                            std::to_string(cfg_.max_externalized_response_bytes) + ") for method '" +
-                           sess.method_name + "'",
+                           sess->method_name + "'",
                        rpc_.server_id(), request_id));
         return true;
     };
 
     try {
-        if (sess.is_exchange) {
-            auto coerced = coerce_input(batch, sess.input_schema);
+        if (sess->is_exchange) {
+            auto coerced = coerce_input(batch, sess->input_schema);
             OutputCollector oc(output_schema, /*producer=*/false, rpc_.server_id(), request_id);
-            sess.state->process(AnnotatedBatch::data(coerced), oc, ctx);
+            sess->state->process(AnnotatedBatch::data(coerced), oc, ctx);
             std::string body = build_body([&](const std::shared_ptr<arrow::io::OutputStream>& out) {
                 std::vector<AnnotatedBatch> batches = oc.batches();
                 // Only the cursor is re-minted; re-issuing the call token
@@ -1417,7 +1465,7 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
                                              "HTTP body exceeds max_response_bytes (" +
                                                  std::to_string(body.size()) + " > " +
                                                  std::to_string(cfg_.max_response_bytes) +
-                                                 ") for method '" + sess.method_name + "'",
+                                                 ") for method '" + sess->method_name + "'",
                                              rpc_.server_id(), request_id));
                 return;
             }
@@ -1430,7 +1478,7 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
             std::string body = build_body([&](const std::shared_ptr<arrow::io::OutputStream>& out) {
                 auto writer = unwrap(arrow::ipc::MakeStreamWriter(out, output_schema));
                 finished = run_producer_turns(
-                    writer, sess.state, output_schema, ctx, rpc_.server_id(), request_id, &errored,
+                    writer, sess->state, output_schema, ctx, rpc_.server_id(), request_id, &errored,
                     externalize, AnnotatedBatch::with_metadata(batch, custom_metadata));
                 if (!finished) {
                     VGI_RPC_THROW_NOT_OK(writer->WriteRecordBatch(*make_empty_batch(output_schema),
@@ -1439,7 +1487,11 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
                 VGI_RPC_THROW_NOT_OK(writer->Close());
             });
             if (external_cap_exceeded()) return;
-            if (finished) streams_.erase(cursor);
+            if (finished) {
+                std::lock_guard<std::mutex> registry_lock(streams_mutex_);
+                auto sit = streams_.find(cursor);
+                if (sit != streams_.end() && sit->second == sess) streams_.erase(sit);
+            }
             res.status = 200;
             if (errored) res.set_header(RPC_ERROR_HEADER, "true");
             apply_sticky();
@@ -1455,9 +1507,9 @@ void HttpServer::run() {
     if (cfg_.max_request_bytes >= 0) {
         svr.set_payload_max_length(static_cast<size_t>(cfg_.max_request_bytes));
     }
-    // httplib's default multi-threaded pool stays: the global mutex above
-    // preserves the single-threaded dispatch model, while a single-thread pool
-    // would let one idle keep-alive connection starve every other.
+    // Keep httplib's default multi-threaded pool. Independent calls dispatch in
+    // parallel; the HTTP state registries serialize only turns that address the
+    // same stream or sticky session.
 
     // Without this, an escaping exception drops the connection, which a client
     // reads as "server disconnected" — indistinguishable from a crash and
