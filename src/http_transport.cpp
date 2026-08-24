@@ -1504,6 +1504,11 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
 
 void HttpServer::run() {
     httplib::Server svr;
+    // RPC responses are frequently split into a header segment and a small
+    // Arrow payload. Leaving Nagle enabled can deadlock that trailing segment
+    // against the peer's delayed ACK timer, adding roughly 40-50 ms even on
+    // loopback. Raw TCP already disables Nagle for the same reason.
+    svr.set_tcp_nodelay(true);
     if (cfg_.max_request_bytes >= 0) {
         svr.set_payload_max_length(static_cast<size_t>(cfg_.max_request_bytes));
     }
