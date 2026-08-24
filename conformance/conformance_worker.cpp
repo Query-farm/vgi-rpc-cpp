@@ -23,7 +23,6 @@
 #include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
-#include <format>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -31,9 +30,39 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
+#include <utility>
 #include <vector>
 
 using namespace vgi_rpc;
+
+template <typename T>
+static std::string format_value(T&& value) {
+    std::ostringstream out;
+    out << std::forward<T>(value);
+    return out.str();
+}
+
+// std::format is still missing from the libstdc++ shipped with some supported
+// C++20 toolchains (notably GCC 11). The conformance worker only needs simple
+// positional replacement, so keep its diagnostics portable.
+template <typename... Args>
+static std::string simple_format(std::string_view pattern, Args&&... args) {
+    const std::vector<std::string> values{format_value(std::forward<Args>(args))...};
+    std::string result;
+    result.reserve(pattern.size() + values.size() * 8);
+    std::size_t value_index = 0;
+    for (std::size_t i = 0; i < pattern.size(); ++i) {
+        if (i + 1 < pattern.size() && pattern[i] == '{' && pattern[i + 1] == '}' &&
+            value_index < values.size()) {
+            result += values[value_index++];
+            ++i;
+        } else {
+            result += pattern[i];
+        }
+    }
+    return result;
+}
 
 // =========================================================================
 // Shared schemas
@@ -671,8 +700,8 @@ static Result inspect_point_handler(const Request& req, CallContext&) {
     auto batch = deserialize_dataclass(req, "point");
     auto x_col = checked_cast_column<arrow::DoubleArray>(batch, "x");
     auto y_col = checked_cast_column<arrow::DoubleArray>(batch, "y");
-    auto result_str = std::format("Point({}, {})", fmt_py_double(x_col->Value(0)),
-                                  fmt_py_double(y_col->Value(0)));
+    auto result_str = simple_format("Point({}, {})", fmt_py_double(x_col->Value(0)),
+                                    fmt_py_double(y_col->Value(0)));
     arrow::StringBuilder builder;
     VGI_RPC_THROW_NOT_OK(builder.Append(result_str));
     return Result::value(str_result_schema(), {unwrap(builder.Finish())});
@@ -770,8 +799,8 @@ static Result with_defaults_handler(const Request& req, CallContext&) {
     auto required = req.get<int64_t>("required");
     auto optional_str = req.get<std::string>("optional_str");
     auto optional_int = req.get<int64_t>("optional_int");
-    auto result = std::format("required={}, optional_str={}, optional_int={}", required,
-                              optional_str, optional_int);
+    auto result = simple_format("required={}, optional_str={}, optional_int={}", required,
+                                optional_str, optional_int);
     arrow::StringBuilder builder;
     VGI_RPC_THROW_NOT_OK(builder.Append(result));
     return Result::value(str_result_schema(), {unwrap(builder.Finish())});
@@ -1021,7 +1050,7 @@ public:
             out.finish();
             return;
         }
-        out.client_log(LogLevel::INFO, std::format("producing batch {}", current_));
+        out.client_log(LogLevel::INFO, simple_format("producing batch {}", current_));
         arrow::Int64Builder idx, val;
         VGI_RPC_THROW_NOT_OK(idx.Append(current_));
         VGI_RPC_THROW_NOT_OK(val.Append(current_ * 10));
@@ -1038,7 +1067,7 @@ public:
     ErrorAfterNState(int64_t n) : n_(n) {}
     void produce(OutputCollector& out, CallContext&) override {
         if (current_ >= n_) {
-            throw std::runtime_error(std::format("intentional error after {} batches", n_));
+            throw std::runtime_error(simple_format("intentional error after {} batches", n_));
         }
         arrow::Int64Builder idx, val;
         VGI_RPC_THROW_NOT_OK(idx.Append(current_));
@@ -1222,7 +1251,7 @@ public:
         ++exchange_count_;
         if (exchange_count_ >= fail_on_) {
             throw std::runtime_error(
-                std::format("intentional error on exchange {}", exchange_count_));
+                simple_format("intentional error on exchange {}", exchange_count_));
         }
         out.emit_batch(input.batch);
     }
@@ -1316,13 +1345,13 @@ static Stream make_produce_oversized_batch(const Request& req, CallContext&) {
 
 static Stream make_produce_with_header(const Request& req, CallContext&) {
     auto count = req.get<int64_t>("count");
-    auto header = make_header_batch(count, std::format("producing {} batches", count));
+    auto header = make_header_batch(count, simple_format("producing {} batches", count));
     return {counter_schema(), empty_schema(), std::make_shared<HeaderProducerState>(count), header};
 }
 static Stream make_produce_with_header_and_logs(const Request& req, CallContext& ctx) {
     auto count = req.get<int64_t>("count");
     ctx.client_log(LogLevel::INFO, "stream init log");
-    auto header = make_header_batch(count, std::format("producing {} with logs", count));
+    auto header = make_header_batch(count, simple_format("producing {} with logs", count));
     return {counter_schema(), empty_schema(), std::make_shared<HeaderProducerState>(count), header};
 }
 

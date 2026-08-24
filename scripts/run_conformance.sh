@@ -171,6 +171,7 @@ run_pytest_suite() {
         "$REPO_ROOT/tests/conformance/test_suite.py" \
         "$REPO_ROOT/tests/conformance/test_polymorphic_stream.py" \
         "$REPO_ROOT/tests/conformance/test_http_concurrency.py" \
+        "$REPO_ROOT/tests/conformance/test_socket_concurrency.py" \
         -q -p no:randomly || rc=1
   fi
   echo "::endgroup::"

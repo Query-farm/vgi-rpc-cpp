@@ -12,11 +12,19 @@
 #include "vgi_rpc/wire.h"
 
 #include <cerrno>
+#include <algorithm>
+#include <condition_variable>
 #include <cstdio>
 #include <cstring>
+#include <deque>
+#include <functional>
 #include <iostream>
+#include <mutex>
 #include <stdexcept>
 #include <string>
+#include <thread>
+#include <unordered_set>
+#include <vector>
 
 #ifndef _WIN32
 #include <arpa/inet.h>
@@ -32,17 +40,16 @@ namespace vgi_rpc {
 
 #ifndef _WIN32
 
-namespace {
-
 // Serve one accepted connection to completion: request after request over the
 // same socket, exactly as the pipe transport does over stdin/stdout, until the
 // peer closes or the framing breaks.
-void serve_connection(Server& server, int fd, TransportKind transport_kind) {
+void Server::serve_socket_fd(int fd, TransportKind transport_kind) {
     auto input = std::make_shared<FdInputStream>(fd);
     auto output = std::make_shared<FdOutputStream>(fd);
+    ConnectionState connection;
     while (true) {
         try {
-            if (!server.serve_one(input, output, transport_kind)) break;
+            if (!serve_one_with_state(input, output, transport_kind, connection)) break;
         } catch (const std::exception& e) {
             // One bad connection must not take the listener down; say what
             // happened and move on to the next peer.
@@ -52,10 +59,8 @@ void serve_connection(Server& server, int fd, TransportKind transport_kind) {
     }
 }
 
-// Accept and serve connections one at a time, forever.  Sequential by design:
-// the framework's dispatch model is single-threaded, and a concurrent listener
-// would need a lock around every handler that bought nothing.
-//
+namespace {
+
 // Socket buffer asked for on an accepted Unix domain socket.  macOS gives one
 // 8192 bytes by default — against ~64 KiB for a pipe — so a megabyte of Arrow
 // costs 128 round trips through the kernel instead of a handful.  Best effort:
@@ -73,10 +78,98 @@ void widen_socket_buffers(int fd) {
     ::setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &size, sizeof(size));
 }
 
+// Persistent raw connections need dedicated execution slots: serving an
+// accepted fd inline would prevent accept() from ever reaching the other
+// clients until that first connection closed.  Bound both the workers and the
+// pending queue so an unreachable or malicious peer cannot create an
+// unbounded number of threads or retained descriptors.
+class SocketConnectionPool {
+public:
+    explicit SocketConnectionPool(std::function<void(int)> serve) : serve_(std::move(serve)) {
+        const unsigned detected = std::thread::hardware_concurrency();
+        worker_count_ = detected == 0 ? 8u : std::max(2u, detected);
+        max_pending_ = worker_count_ * 4;
+        workers_.reserve(worker_count_);
+        for (unsigned i = 0; i < worker_count_; ++i) {
+            workers_.emplace_back([this] { worker_loop(); });
+        }
+    }
+
+    SocketConnectionPool(const SocketConnectionPool&) = delete;
+    SocketConnectionPool& operator=(const SocketConnectionPool&) = delete;
+
+    ~SocketConnectionPool() { stop(); }
+
+    bool submit(int fd) {
+        std::unique_lock lock(mutex_);
+        space_available_.wait(lock, [this] { return stopping_ || pending_.size() < max_pending_; });
+        if (stopping_) return false;
+        pending_.push_back(fd);
+        work_available_.notify_one();
+        return true;
+    }
+
+private:
+    void worker_loop() {
+        while (true) {
+            int fd;
+            {
+                std::unique_lock lock(mutex_);
+                work_available_.wait(lock, [this] { return stopping_ || !pending_.empty(); });
+                if (stopping_ && pending_.empty()) return;
+                fd = pending_.front();
+                pending_.pop_front();
+                active_.insert(fd);
+                space_available_.notify_one();
+            }
+
+            serve_(fd);
+            ::close(fd);
+
+            {
+                std::lock_guard lock(mutex_);
+                active_.erase(fd);
+            }
+        }
+    }
+
+    void stop() {
+        std::vector<int> queued;
+        std::vector<int> active;
+        {
+            std::lock_guard lock(mutex_);
+            if (stopping_) return;
+            stopping_ = true;
+            queued.assign(pending_.begin(), pending_.end());
+            pending_.clear();
+            active.assign(active_.begin(), active_.end());
+        }
+        for (int fd : queued) ::close(fd);
+        for (int fd : active) ::shutdown(fd, SHUT_RDWR);
+        work_available_.notify_all();
+        space_available_.notify_all();
+        for (auto& worker : workers_) {
+            if (worker.joinable()) worker.join();
+        }
+    }
+
+    std::function<void(int)> serve_;
+    unsigned worker_count_ = 0;
+    size_t max_pending_ = 0;
+    std::mutex mutex_;
+    std::condition_variable work_available_;
+    std::condition_variable space_available_;
+    std::deque<int> pending_;
+    std::unordered_set<int> active_;
+    bool stopping_ = false;
+    std::vector<std::thread> workers_;
+};
+
 // `is_tcp` picks the per-socket tuning: Nagle off for TCP, wider buffers for a
 // Unix socket.  Neither setting means anything on the other family.
-void accept_loop(Server& server, int listen_fd, TransportKind transport_kind) {
+void accept_loop(int listen_fd, TransportKind transport_kind, std::function<void(int)> serve) {
     const bool is_tcp = transport_kind == TransportKind::TCP;
+    SocketConnectionPool connections(std::move(serve));
     while (true) {
         int fd = ::accept(listen_fd, nullptr, nullptr);
         if (fd < 0) {
@@ -102,8 +195,10 @@ void accept_loop(Server& server, int listen_fd, TransportKind transport_kind) {
             int one = 1;
             ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
         }
-        serve_connection(server, fd, transport_kind);
-        ::close(fd);
+        if (!connections.submit(fd)) {
+            ::close(fd);
+            break;
+        }
     }
     ::close(listen_fd);
 }
@@ -148,7 +243,8 @@ void Server::serve_unix(const std::string& path) {
     // Discovery line, then flush: a launcher blocks on this to learn the
     // socket is ready, so buffering it would look like a hung worker.
     std::cout << "UNIX:" << path << std::endl;
-    accept_loop(*this, listen_fd, TransportKind::UNIX);
+    accept_loop(listen_fd, TransportKind::UNIX,
+                [this](int fd) { serve_socket_fd(fd, TransportKind::UNIX); });
     ::unlink(path.c_str());
 }
 
@@ -195,7 +291,8 @@ void Server::serve_tcp(const std::string& host, int port) {
     }
 
     std::cout << "TCP:" << bind_host << ":" << bound_port << std::endl;
-    accept_loop(*this, listen_fd, TransportKind::TCP);
+    accept_loop(listen_fd, TransportKind::TCP,
+                [this](int fd) { serve_socket_fd(fd, TransportKind::TCP); });
 }
 
 #else  // _WIN32

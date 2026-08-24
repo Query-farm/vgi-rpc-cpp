@@ -137,9 +137,10 @@ private:
     int64_t access_log_max_record_bytes_ = kDefaultMaxRecordBytes;
 };
 
-// Pipe operation dispatches one request at a time. HTTP may invoke unrelated
-// handlers concurrently; implementations that share mutable state between
-// calls must provide their own synchronization. Stream turns and sticky
+// Pipe operation dispatches one request at a time. HTTP and the Unix/TCP
+// listeners may invoke unrelated handlers concurrently; implementations that
+// share mutable state between calls must provide their own synchronization.
+// Calls remain ordered within one raw connection. Stream turns and sticky
 // session calls are serialized per state object by the HTTP transport.
 class VGI_RPC_EXPORT Server {
     friend class ServerBuilder;
@@ -202,6 +203,12 @@ public:
                           const std::shared_ptr<arrow::io::OutputStream>& output, CallContext& ctx);
 
 private:
+    struct ConnectionState {
+        std::shared_ptr<ShmSegment> shm;
+        std::string shm_name;
+        std::shared_ptr<ShmSegment> call_shm;
+    };
+
     Server(std::unordered_map<std::string, MethodInfo> methods, std::string server_id,
            std::string protocol_name, std::string protocol_hash, std::string protocol_version,
            const std::string& access_log_path, int64_t access_log_max_record_bytes,
@@ -210,17 +217,29 @@ private:
     void serve_unary(const MethodInfo& method_info, const Request& request,
                      const std::string& request_id,
                      const std::shared_ptr<arrow::io::OutputStream>& output,
-                     TransportKind transport_kind);
+                     TransportKind transport_kind, const std::shared_ptr<ShmSegment>& call_shm);
+
+    bool serve_unary_impl(const MethodInfo& method_info, const Request& request,
+                          const std::string& request_id,
+                          const std::shared_ptr<arrow::io::OutputStream>& output, CallContext& ctx,
+                          const std::shared_ptr<ShmSegment>& call_shm);
 
     void serve_stream(const MethodInfo& method_info, const Request& request,
                       const std::string& request_id,
                       const std::shared_ptr<arrow::io::InputStream>& input,
                       const std::shared_ptr<arrow::io::OutputStream>& output,
-                      TransportKind transport_kind);
+                      TransportKind transport_kind, ConnectionState& connection);
+
+    bool serve_one_with_state(const std::shared_ptr<arrow::io::InputStream>& input,
+                              const std::shared_ptr<arrow::io::OutputStream>& output,
+                              TransportKind transport_kind, ConnectionState& connection);
+
+    void serve_socket_fd(int fd, TransportKind transport_kind);
 
     // Attach (or reuse) the peer-owned segment this request advertises.
     // Cached per connection because a segment is process-level, not per-call.
-    void refresh_shm(const std::shared_ptr<arrow::KeyValueMetadata>& custom_metadata);
+    void refresh_shm(ConnectionState& connection,
+                     const std::shared_ptr<arrow::KeyValueMetadata>& custom_metadata);
 
     std::unordered_map<std::string, MethodInfo> methods_;
     std::string server_id_;
@@ -232,12 +251,9 @@ private:
     std::once_flag serve_start_once_;
     std::optional<TransportKind> transport_kind_;
 
-    // Segment the peer advertised, and the segment for the call in flight.
-    // The second is set only when the client signalled SHM for *this* call, so
-    // a response is never routed through a channel the caller is not reading.
-    std::shared_ptr<ShmSegment> shm_;
-    std::string shm_name_;
-    std::shared_ptr<ShmSegment> call_shm_;
+    // State for the public serve_one API's one logical pipe connection. Socket
+    // listeners allocate a separate state object per accepted connection.
+    ConnectionState default_connection_state_;
 };
 
 }  // namespace vgi_rpc
