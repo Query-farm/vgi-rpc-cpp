@@ -43,6 +43,29 @@ constexpr const char* kZstdEncoding = "zstd";
 constexpr size_t kMaxStructuredErrorBodyBytes = 4096;
 constexpr size_t kMaxStructuredErrorHeaderBytes = 1024;
 
+class ScopedHttpMaxTimeout {
+public:
+    ScopedHttpMaxTimeout(httplib::Client& client, int64_t milliseconds)
+        : client_(client), enabled_(milliseconds > 0) {
+        client_.set_max_timeout(milliseconds);
+    }
+
+    ~ScopedHttpMaxTimeout() { client_.set_max_timeout(0); }
+
+    ScopedHttpMaxTimeout(const ScopedHttpMaxTimeout&) = delete;
+    ScopedHttpMaxTimeout& operator=(const ScopedHttpMaxTimeout&) = delete;
+
+    void start(httplib::Request& request) const {
+        // cpp-httplib initializes this field in its verb helpers, but not when
+        // callers construct a raw Request and pass it to Client::send().
+        if (enabled_) request.start_time_ = std::chrono::steady_clock::now();
+    }
+
+private:
+    httplib::Client& client_;
+    bool enabled_;
+};
+
 bool deadline_expired(const CallOptions& options) {
     return options.deadline && std::chrono::steady_clock::now() >= *options.deadline;
 }
@@ -1022,16 +1045,16 @@ public:
 
             BoundedHttpResponse response;
             bool response_too_large = false;
+            int64_t max_timeout_milliseconds = 0;
             if (options.deadline) {
                 const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
                     *options.deadline - std::chrono::steady_clock::now());
                 if (remaining <= std::chrono::milliseconds::zero()) {
                     check_call_active(options, method, request_id);
                 }
-                client->set_max_timeout(std::max<int64_t>(1, remaining.count()));
-            } else {
-                client->set_max_timeout(0);
+                max_timeout_milliseconds = std::max<int64_t>(1, remaining.count());
             }
+            ScopedHttpMaxTimeout max_timeout(*client, max_timeout_milliseconds);
             std::stop_callback stop_callback(options.stop_token, [this] { client->stop(); });
             check_call_active(options, method, request_id);
             auto result =
@@ -1046,7 +1069,6 @@ public:
                                  response.body.append(data, size);
                                  return true;
                              });
-            client->set_max_timeout(0);
             if (response_too_large) {
                 throw HttpClientError(
                     HttpClientErrorKind::LIMIT,
@@ -1314,14 +1336,9 @@ public:
             request.content_receiver = [](const char*, size_t, uint64_t, uint64_t) { return true; };
             httplib::Response response;
             httplib::Error error = httplib::Error::Success;
-            client->set_max_timeout(250);
-            try {
-                (void)client->send(request, response, error);
-            } catch (...) {
-                client->set_max_timeout(0);
-                throw;
-            }
-            client->set_max_timeout(0);
+            ScopedHttpMaxTimeout max_timeout(*client, 250);
+            max_timeout.start(request);
+            (void)client->send(request, response, error);
         } catch (...) {
         }
     }
@@ -1391,11 +1408,13 @@ public:
             }
             headers.emplace("Accept-Encoding", "identity");
             headers.emplace("X-Request-ID", request_id);
+            int64_t max_timeout_milliseconds = 0;
             if (options.deadline) {
                 const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
                     *options.deadline - std::chrono::steady_clock::now());
-                client->set_max_timeout(std::max<int64_t>(1, remaining.count()));
+                max_timeout_milliseconds = std::max<int64_t>(1, remaining.count());
             }
+            ScopedHttpMaxTimeout max_timeout(*client, max_timeout_milliseconds);
             std::stop_callback stop_callback(options.stop_token, [this] { client->stop(); });
             check_call_active(options, "OPTIONS", request_id);
             httplib::Request request;
@@ -1415,8 +1434,8 @@ public:
             };
             httplib::Response response;
             httplib::Error transport_error = httplib::Error::Success;
+            max_timeout.start(request);
             const bool sent = client->send(request, response, transport_error);
-            client->set_max_timeout(0);
             if (response_too_large) {
                 throw HttpClientError(
                     HttpClientErrorKind::LIMIT,
