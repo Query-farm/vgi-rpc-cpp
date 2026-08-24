@@ -10,11 +10,12 @@
 #   1. `vgi-rpc-test` — the CLI runner, driven over pipe (with and without the
 #      shared-memory side channel), Unix socket, TCP and HTTP, plus access-log
 #      validation.
-#   2. `pytest tests/conformance` — the shared pytest suite from
+#   2. `pytest tests/conformance/test_suite.py` — the shared pytest suite from
 #      `vgi_rpc.conformance._pytest_suite`, which covers the capability-gated
 #      HTTP groups the CLI runner has no way to reach: sticky sessions, proxy
 #      proof, CORS, standardized 401s, token introspection, compression
-#      negotiation, external locations, and the response caps.
+#      negotiation, external locations, and the response caps. Optional cloud
+#      backend tests run in their own explicitly skippable group.
 #
 # Prerequisites:
 #   - `vgi-rpc-test` on PATH  (pip install 'vgi-rpc[http,conformance]')
@@ -166,7 +167,25 @@ run_pytest_suite() {
     echo "WARNING: pytest or the shared suite is unavailable; skipping" >&2
   else
     VGI_RPC_CPP_WORKER="$WORKER" \
-      python3 -m pytest "$REPO_ROOT/tests/conformance" -q -p no:randomly || rc=1
+      python3 -m pytest \
+        "$REPO_ROOT/tests/conformance/test_suite.py" \
+        "$REPO_ROOT/tests/conformance/test_polymorphic_stream.py" \
+        -q -p no:randomly || rc=1
+  fi
+  echo "::endgroup::"
+}
+
+# Cloud backends are opt-in build profiles with intentionally heavyweight
+# dependencies. Keep their result visible but separate from the mandatory
+# portable suite above, whose expected skip count is zero.
+run_optional_cloud_suite() {
+  echo "::group::conformance: pytest suite (optional cloud backends)"
+  if ! python3 -c "import pytest, vgi_rpc.conformance._pytest_suite" 2>/dev/null; then
+    echo "WARNING: pytest or the shared suite is unavailable; skipping" >&2
+  else
+    VGI_RPC_CPP_WORKER="$WORKER" \
+      python3 -m pytest "$REPO_ROOT/tests/conformance/test_cloud_storage.py" \
+        -q -p no:randomly -rs || rc=1
   fi
   echo "::endgroup::"
 }
@@ -184,6 +203,7 @@ run_http "no-cap" ""
 # transports already cover it.
 run_http "capped" '!large_payload.echo_binary_4mib' --max-response-bytes 1048576
 run_pytest_suite
+run_optional_cloud_suite
 
 if [[ "$rc" -ne 0 ]]; then
   echo "CONFORMANCE FAILED" >&2

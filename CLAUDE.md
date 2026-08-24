@@ -4,7 +4,7 @@
 
 vgi-rpc-cpp is a C++20 RPC framework built on Apache Arrow IPC. It provides unary and streaming (producer/exchange) method patterns over four transports: pipe (stdin/stdout), Unix domain socket, TCP, and HTTP, plus a shared-memory side channel that rides alongside the raw-framing ones. Dispatch is single-threaded by design — the HTTP transport serializes requests under one mutex to preserve that.
 
-The HTTP transport additionally carries the optional features of the wire spec: capability discovery, response and externalization caps, external-location pointer batches, zstd response negotiation, CORS, sticky sessions, standardized 401s, proxy proof, and token introspection. All are off by default.
+The HTTP transport additionally carries the optional features of the wire spec: capability discovery, response and externalization caps, external-location pointer batches, bounded zstd/gzip request decoding and response negotiation, CORS, sticky sessions, standardized 401s, proxy proof, and token introspection. All are off by default except codec support, which is part of the HTTP wire baseline; `HttpConfig::compression = false` disables response compression without disabling request decoding.
 
 External storage picks its backend by URL scheme: `http(s)://` always works, while `s3://` and `gs://` need the opt-in vcpkg manifest features (`VCPKG_MANIFEST_FEATURES="s3;gcs"` plus `-DVGI_RPC_WITH_S3=ON -DVGI_RPC_WITH_GCS=ON`). Keep them opt-in — aws-sdk-cpp and google-cloud-cpp roughly triple the dependency build time.
 
@@ -27,7 +27,7 @@ Dependencies managed via vcpkg (Arrow, nlohmann-json, Catch2).
 Two conformance suites, both driven by `scripts/run_conformance.sh`:
 
 1. `vgi-rpc-test` — the CLI runner, over pipe, Unix socket, TCP, and HTTP, plus access-log validation.
-2. `pytest tests/conformance` — the shared suite re-exported from `vgi_rpc.conformance._pytest_suite`, which reaches the capability-gated HTTP groups the CLI runner cannot: sticky sessions, proxy proof, CORS, 401s, token introspection, compression negotiation, external locations, response caps. `tests/conformance/conftest.py` supplies the fixtures by spawning the worker with the matching flags.
+2. `pytest tests/conformance/test_suite.py tests/conformance/test_polymorphic_stream.py` — the mandatory, zero-skip shared suite re-exported from `vgi_rpc.conformance._pytest_suite`, which reaches the capability-gated HTTP groups the CLI runner cannot: sticky sessions, proxy proof, CORS, 401s, token introspection, zstd/gzip compression negotiation, external locations, response caps. `tests/conformance/conftest.py` supplies the fixtures by spawning the worker with the matching flags. `test_cloud_storage.py` runs separately because S3/GCS are opt-in build profiles.
 
 Prefer:
 - Conformance tests (Python) for protocol correctness and end-to-end validation

@@ -43,17 +43,31 @@ CONFORMANCE_CORS_ORIGIN = "https://conformance.example"
 
 
 def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
-    """Give the C++ HTTP soak enough time on slower CI architectures.
+    """Apply bounded timeouts to the C++ suite's deliberately heavier topologies.
 
     The portable suite's 50-second default is appropriate for most workers,
     but the C++ unary soak performs thousands of HTTP round trips and reaches
     that budget on both hosted x64 and ARM runners. Keep the larger allowance
     scoped to this resource test class rather than weakening other timeouts.
+    The externalize-always large-data leg similarly needs more than the shared
+    suite's ordinary five-second method deadline because every turn performs
+    an object-store upload and fetch.
 
     """
     for item in items:
         if item.cls is not None and item.cls.__name__ == "TestResourceSoak":
             item.add_marker(pytest.mark.timeout(120), append=False)
+        elif (
+            item.cls is not None
+            and item.cls.__name__ == "TestLargeData"
+            and hasattr(item, "callspec")
+            and item.callspec.params.get("conformance_conn") == "http_externalize_always"
+        ):
+            # This leg deliberately performs a separate object-store upload
+            # and fetch for every producer turn. The portable five-second
+            # per-test budget is too small for that topology on CI, while the
+            # same assertions still bound completion here.
+            item.add_marker(pytest.mark.timeout(30), append=False)
 
 
 def worker_path() -> str:
@@ -63,6 +77,18 @@ def worker_path() -> str:
     if not path.is_file() or not os.access(path, os.X_OK):
         pytest.skip(f"conformance worker not built: {path}")
     return str(path)
+
+
+@pytest.fixture(scope="session")
+def cpp_transport() -> Iterator[Any]:
+    """One long-lived stdio worker for the shared-subprocess matrix leg."""
+    from vgi_rpc.rpc import SubprocessTransport
+
+    transport = SubprocessTransport([worker_path()])
+    try:
+        yield transport
+    finally:
+        transport.close()
 
 
 def _free_port() -> int:
@@ -87,7 +113,7 @@ def _wait_for_http(port: int, timeout: float = 30.0) -> None:
         try:
             httpx2.get(f"http://127.0.0.1:{port}/health", timeout=1.0)
             return
-        except httpx2.TransportError as exc:  # noqa: PERF203
+        except httpx2.TransportError as exc:
             last = exc
             time.sleep(0.05)
     raise RuntimeError(f"HTTP server on port {port} never became ready: {last}")
@@ -101,7 +127,7 @@ def _wait_for_tcp(host: str, port: int, timeout: float = 30.0) -> None:
         try:
             with socket.create_connection((host, port), timeout=0.5):
                 return
-        except OSError as exc:  # noqa: PERF203
+        except OSError as exc:
             last = exc
             time.sleep(0.05)
     raise RuntimeError(f"TCP server on {host}:{port} never became ready: {last}")
@@ -198,6 +224,22 @@ def conformance_resource_soak_target() -> Iterator[Any]:
 def conformance_http_small_request_cap_port() -> Iterator[int]:
     """A worker with the shared suite's canonical 4 KiB request cap."""
     with spawn_http("--max-request-bytes", "4096") as port:
+        yield port
+
+
+@pytest.fixture(scope="session")
+def conformance_http_externalize_always_port(
+    conformance_fake_storage: str,
+) -> Iterator[int]:
+    """A worker that routes every non-empty response through fake storage."""
+    with spawn_http(
+        "--fake-storage",
+        conformance_fake_storage,
+        "--externalize-threshold",
+        "1",
+        "--max-request-bytes",
+        str(1024 * 1024),
+    ) as port:
         yield port
 
 
@@ -332,15 +374,47 @@ def conformance_transport_kind_probes() -> Iterator[
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+class _ShmAdapter:
+    """Expose a Python-owned SHM segment beside a subprocess pipe."""
+
+    __slots__ = ("_inner", "_shm")
+
+    def __init__(self, inner: Any, shm: Any) -> None:
+        self._inner = inner
+        self._shm = shm
+
+    @property
+    def reader(self) -> Any:
+        return self._inner.reader
+
+    @property
+    def writer(self) -> Any:
+        return self._inner.writer
+
+    @property
+    def shm(self) -> Any:
+        return self._shm
+
+    def close(self) -> None:
+        self._inner.close()
+
+
 @pytest.fixture(
     params=[
+        "pipe",
         "subprocess",
+        pytest.param("shm", marks=_SKIP_POSIX_ONLY),
         "http",
+        "http_externalize_always",
         pytest.param("unix", marks=_SKIP_POSIX_ONLY),
         pytest.param("tcp", marks=_SKIP_POSIX_ONLY),
     ]
 )
-def conformance_conn(request: pytest.FixtureRequest, conformance_http_port: int) -> Any:
+def conformance_conn(
+    request: pytest.FixtureRequest,
+    cpp_transport: Any,
+    conformance_http_port: int,
+) -> Any:
     """Connection factory over each transport the C++ worker implements.
 
     Overrides the reference runner's fixture of the same name, which
@@ -350,11 +424,53 @@ def conformance_conn(request: pytest.FixtureRequest, conformance_http_port: int)
     from vgi_rpc.conformance import ConformanceService
     from vgi_rpc.http import http_connect
     from vgi_rpc.log import Message
-    from vgi_rpc.rpc import connect, tcp_connect, unix_connect
+    from vgi_rpc.rpc import (
+        SubprocessTransport,
+        _RpcProxy,
+        connect,
+        tcp_connect,
+        unix_connect,
+    )
 
     def factory(on_log: Callable[[Message], None] | None = None) -> Any:
-        if request.param == "subprocess":
+        if request.param == "pipe":
             return connect(ConformanceService, [worker_path()], on_log=on_log)
+        if request.param == "subprocess":
+            @contextlib.contextmanager
+            def _shared_conn() -> Iterator[Any]:
+                yield _RpcProxy(ConformanceService, cpp_transport, on_log)
+
+            return _shared_conn()
+        if request.param == "shm":
+            from vgi_rpc.shm import ShmSegment
+
+            @contextlib.contextmanager
+            def _shm_conn() -> Iterator[Any]:
+                segment = ShmSegment.create(64 * 1024 * 1024)
+                transport = SubprocessTransport([worker_path()])
+                try:
+                    yield _RpcProxy(
+                        ConformanceService,
+                        _ShmAdapter(transport, segment),
+                        on_log,
+                    )
+                finally:
+                    transport.close()
+                    with contextlib.suppress(BufferError):
+                        segment.close()
+                    segment.unlink()
+
+            return _shm_conn()
+        if request.param == "http_externalize_always":
+            from vgi_rpc.external import ExternalLocationConfig
+
+            port: int = request.getfixturevalue("conformance_http_externalize_always_port")
+            return http_connect(
+                ConformanceService,
+                f"http://127.0.0.1:{port}",
+                on_log=on_log,
+                external_location=ExternalLocationConfig(url_validator=None),
+            )
         if request.param == "unix":
             path: str = request.getfixturevalue("conformance_unix_path")
             return unix_connect(ConformanceService, path, on_log=on_log)
@@ -368,8 +484,78 @@ def conformance_conn(request: pytest.FixtureRequest, conformance_http_port: int)
     return factory
 
 
-@pytest.fixture(params=["subprocess", "http"])
-def conformance_describe(request: pytest.FixtureRequest, conformance_http_port: int) -> Any:
+@pytest.fixture(
+    params=[
+        "pipe",
+        "subprocess",
+        pytest.param("shm", marks=_SKIP_POSIX_ONLY),
+        pytest.param("unix", marks=_SKIP_POSIX_ONLY),
+        pytest.param("tcp", marks=_SKIP_POSIX_ONLY),
+    ]
+)
+def conformance_raw_conn(request: pytest.FixtureRequest, cpp_transport: Any) -> Any:
+    """Connection factory restricted to persistent raw framing transports."""
+    from vgi_rpc.conformance import ConformanceService
+    from vgi_rpc.rpc import (
+        SubprocessTransport,
+        _RpcProxy,
+        connect,
+        tcp_connect,
+        unix_connect,
+    )
+
+    def factory(on_log: Callable[[Any], None] | None = None) -> Any:
+        if request.param == "pipe":
+            return connect(ConformanceService, [worker_path()], on_log=on_log)
+        if request.param == "subprocess":
+            @contextlib.contextmanager
+            def _shared_conn() -> Iterator[Any]:
+                yield _RpcProxy(ConformanceService, cpp_transport, on_log)
+
+            return _shared_conn()
+        if request.param == "shm":
+            from vgi_rpc.shm import ShmSegment
+
+            @contextlib.contextmanager
+            def _shm_conn() -> Iterator[Any]:
+                segment = ShmSegment.create(64 * 1024 * 1024)
+                transport = SubprocessTransport([worker_path()])
+                try:
+                    yield _RpcProxy(
+                        ConformanceService,
+                        _ShmAdapter(transport, segment),
+                        on_log,
+                    )
+                finally:
+                    transport.close()
+                    with contextlib.suppress(BufferError):
+                        segment.close()
+                    segment.unlink()
+
+            return _shm_conn()
+        if request.param == "unix":
+            path: str = request.getfixturevalue("conformance_unix_path")
+            return unix_connect(ConformanceService, path, on_log=on_log)
+        host, port = request.getfixturevalue("conformance_tcp_addr")
+        return tcp_connect(ConformanceService, host, port, on_log=on_log)
+
+    return factory
+
+
+@pytest.fixture(
+    params=[
+        "pipe",
+        "subprocess",
+        "http",
+        pytest.param("unix", marks=_SKIP_POSIX_ONLY),
+        pytest.param("tcp", marks=_SKIP_POSIX_ONLY),
+    ]
+)
+def conformance_describe(
+    request: pytest.FixtureRequest,
+    cpp_transport: Any,
+    conformance_http_port: int,
+) -> Any:
     """``ServiceDescription`` obtained by calling ``__describe__`` over the wire.
 
     Against the real worker rather than an in-process stand-in, which is the
@@ -377,10 +563,28 @@ def conformance_describe(request: pytest.FixtureRequest, conformance_http_port: 
     """
     from vgi_rpc.http import http_introspect
     from vgi_rpc.introspect import introspect
-    from vgi_rpc.rpc import SubprocessTransport
+    from vgi_rpc.rpc import SubprocessTransport, TcpTransport, UnixTransport
 
     if request.param == "http":
         return http_introspect(f"http://127.0.0.1:{conformance_http_port}")
+    if request.param == "subprocess":
+        return introspect(cpp_transport)
+    if request.param == "unix":
+        path: str = request.getfixturevalue("conformance_unix_path")
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.connect(path)
+        transport = UnixTransport(sock)
+        try:
+            return introspect(transport)
+        finally:
+            transport.close()
+    if request.param == "tcp":
+        host, port = request.getfixturevalue("conformance_tcp_addr")
+        transport = TcpTransport(socket.create_connection((host, port)))
+        try:
+            return introspect(transport)
+        finally:
+            transport.close()
     transport = SubprocessTransport([worker_path()])
     try:
         return introspect(transport)

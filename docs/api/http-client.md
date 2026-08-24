@@ -99,9 +99,10 @@ the local session. All three operations are idempotent.
 
 ## Producers and resumable streams
 
-`open_producer()` returns a move-only `HttpStreamSession`. `tick()` drains every
-application batch emitted during init before it sends a continuation request;
-a metadata-free zero-row batch is application data, not end-of-stream.
+`open_producer()` returns a move-only `HttpStreamSession`. Each `tick()` consumes
+at most one application batch from the current lock-step turn before it sends a
+continuation request; a metadata-free zero-row batch is application data, not
+end-of-stream.
 `open_stream_exchange()` provides the same generalized lifecycle for an
 exchange that may terminate without a final batch, while `open_exchange()`
 remains the strict one-input/one-output compatibility API.
@@ -109,12 +110,11 @@ remains the strict one-input/one-output compatibility API.
 `next_with_token()` pairs a producer batch with the opaque cursor/call-state
 blob that resumes *after* that batch. `resume_stream()` starts directly from a
 persisted token without replaying `/init`, and `seek_to_token()` repositions a
-fresh producer session. Responses that buffer more than one batch cannot expose
-a truthful per-batch resume point, so `next_with_token()` rejects them; consume
-such responses with `tick()` instead. Producer continuations use the
-`CallOptions` passed to `tick()` / `next_with_token()` and are retried only when
-the caller marks the turn idempotent. Exchange turns are never retried after
-dispatch ambiguity.
+fresh producer session. A response containing more than one data batch violates
+lock-step and is rejected by both `tick()` and `next_with_token()`. Producer
+continuations use the `CallOptions` passed to those methods and are retried only
+when the caller marks the turn idempotent. Exchange turns are never retried
+after dispatch ambiguity.
 
 Optional stream headers are parsed as their own IPC substream and returned by
 `header()`. Externalized headers and data are resolved before cursor metadata is

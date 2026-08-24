@@ -38,14 +38,18 @@
 
 #include <httplib.h>
 #include <nlohmann/json.hpp>
+#include <zlib.h>
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
-#include <functional>
 #include <ctime>
+#include <functional>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <string>
 #include <unordered_map>
@@ -151,51 +155,43 @@ std::shared_ptr<arrow::KeyValueMetadata> init_metadata(const std::string& cursor
     return md;
 }
 
-// Drive a producer into `writer` for one HTTP turn.  With no wire cap
-// (max_bytes < 0) this emits exactly one produce cycle then asks for a
-// continuation token, matching the Python reference's incremental default;
-// with a cap it buffers cycles until the body fills the cap.  Returns true
-// when the stream is terminal (finished or errored — no token needed), false
-// when the caller should append a continuation token.
+// Drive exactly one producer transition into `writer` for one HTTP tick.
+// Returns true when the stream is terminal (finished or errored — no token
+// needed), false when the caller should append a continuation token.
 // Given one output cycle, either return the pointer metadata that replaces it
 // or nullptr to write the batches inline.
 using CycleExternalizer = std::function<std::shared_ptr<arrow::KeyValueMetadata>(
     const std::vector<AnnotatedBatch>&, const std::shared_ptr<arrow::Schema>&)>;
 
 bool run_producer_turns(const std::shared_ptr<arrow::ipc::RecordBatchWriter>& writer,
-                        const std::shared_ptr<arrow::io::OutputStream>& out_stream,
                         const std::shared_ptr<StreamState>& state,
                         const std::shared_ptr<arrow::Schema>& schema, CallContext& ctx,
-                        const std::string& server_id, const std::string& request_id,
-                        int64_t max_bytes, bool* errored, const CycleExternalizer& externalize) {
-    while (true) {
-        OutputCollector oc(schema, /*producer=*/true, server_id, request_id);
-        try {
-            state->process(AnnotatedBatch::data(make_empty_batch(empty_schema())), oc, ctx);
-        } catch (const std::exception& e) {
-            auto md = make_error_metadata(exception_type_of(e), e.what(), server_id, request_id,
-                                          error_kind_of(e));
-            VGI_RPC_THROW_NOT_OK(writer->WriteRecordBatch(*make_empty_batch(schema), md));
-            if (errored) *errored = true;
-            return true;
-        }
-        // The pointer replaces the *whole* cycle — log batches included — so
-        // the client reads them back out of the fetched stream in order.
-        std::shared_ptr<arrow::KeyValueMetadata> pointer;
-        if (externalize) pointer = externalize(oc.batches(), schema);
-        if (pointer) {
-            VGI_RPC_THROW_NOT_OK(writer->WriteRecordBatch(*make_empty_batch(schema), pointer));
-        } else {
-            for (const auto& ab : oc.batches()) {
-                VGI_RPC_THROW_NOT_OK(ab.custom_metadata
-                                         ? writer->WriteRecordBatch(*ab.batch, ab.custom_metadata)
-                                         : writer->WriteRecordBatch(*ab.batch));
-            }
-        }
-        if (oc.is_finished()) return true;
-        bool should_continue = (max_bytes >= 0) && (unwrap(out_stream->Tell()) < max_bytes);
-        if (!should_continue) return false;
+                        const std::string& server_id, const std::string& request_id, bool* errored,
+                        const CycleExternalizer& externalize, const AnnotatedBatch& input) {
+    OutputCollector oc(schema, /*producer=*/true, server_id, request_id);
+    try {
+        state->process(input, oc, ctx);
+    } catch (const std::exception& e) {
+        auto md = make_error_metadata(exception_type_of(e), e.what(), server_id, request_id,
+                                      error_kind_of(e));
+        VGI_RPC_THROW_NOT_OK(writer->WriteRecordBatch(*make_empty_batch(schema), md));
+        if (errored) *errored = true;
+        return true;
     }
+    // The pointer replaces the *whole* transition — log batches included —
+    // so the client reads them back out of the fetched stream in order.
+    std::shared_ptr<arrow::KeyValueMetadata> pointer;
+    if (externalize) pointer = externalize(oc.batches(), schema);
+    if (pointer) {
+        VGI_RPC_THROW_NOT_OK(writer->WriteRecordBatch(*make_empty_batch(schema), pointer));
+    } else {
+        for (const auto& ab : oc.batches()) {
+            VGI_RPC_THROW_NOT_OK(ab.custom_metadata
+                                     ? writer->WriteRecordBatch(*ab.batch, ab.custom_metadata)
+                                     : writer->WriteRecordBatch(*ab.batch));
+        }
+    }
+    return oc.is_finished();
 }
 
 // --- Response codec negotiation -------------------------------------------
@@ -248,17 +244,62 @@ CodecChoice choose_codec(const httplib::Request& req, bool compression_enabled) 
 
     // `identity` is a first-class token, not the absence of a preference: a
     // client may explicitly demand an uncompressed body.
-    const auto& preferred = has_vgi ? vgi : standard;
-    if (preferred.empty()) return choice;
-    if (preferred.front() == "identity") return choice;
-    if (!accepts(preferred, "zstd")) return choice;
-
-    choice.codec = "zstd";
-    // A codec reachable only through the custom header goes on
-    // X-VGI-Content-Encoding: such a client's fetch layer would auto-decode or
-    // mangle a standard Content-Encoding it never asked for.
-    choice.standard_header = accepts(standard, "zstd");
+    std::vector<std::string> preferred = has_vgi ? vgi : standard;
+    if (has_vgi) {
+        for (const auto& token : standard) {
+            if (!accepts(preferred, token)) preferred.push_back(token);
+        }
+    }
+    for (const auto& token : preferred) {
+        if (token == "identity") return choice;
+        if (token != "zstd" && token != "gzip") continue;
+        choice.codec = token;
+        // A codec reachable only through the custom header goes on
+        // X-VGI-Content-Encoding: such a client's fetch layer would
+        // auto-decode or mangle a standard Content-Encoding it never asked
+        // for.
+        choice.standard_header = accepts(standard, token);
+        return choice;
+    }
     return choice;
+}
+
+std::optional<std::string> gzip_compress(const std::string& body) {
+    z_stream stream{};
+    if (deflateInit2(&stream, Z_DEFAULT_COMPRESSION, Z_DEFLATED, MAX_WBITS + 16, 8,
+                     Z_DEFAULT_STRATEGY) != Z_OK) {
+        return std::nullopt;
+    }
+
+    std::string compressed;
+    compressed.reserve(std::min<size_t>(body.size(), 64 * 1024));
+    std::array<unsigned char, 64 * 1024> chunk{};
+    size_t offset = 0;
+    int status = Z_OK;
+    do {
+        const size_t remaining = body.size() - offset;
+        const auto input_size =
+            static_cast<uInt>(std::min<size_t>(remaining, std::numeric_limits<uInt>::max()));
+        stream.next_in = reinterpret_cast<Bytef*>(const_cast<char*>(body.data() + offset));
+        stream.avail_in = input_size;
+        offset += input_size;
+        const int flush = offset == body.size() ? Z_FINISH : Z_NO_FLUSH;
+
+        do {
+            stream.next_out = chunk.data();
+            stream.avail_out = static_cast<uInt>(chunk.size());
+            status = deflate(&stream, flush);
+            if (status != Z_OK && status != Z_STREAM_END) {
+                deflateEnd(&stream);
+                return std::nullopt;
+            }
+            compressed.append(reinterpret_cast<const char*>(chunk.data()),
+                              chunk.size() - stream.avail_out);
+        } while (stream.avail_in > 0 || (flush == Z_FINISH && status != Z_STREAM_END));
+    } while (status != Z_STREAM_END);
+
+    deflateEnd(&stream);
+    return compressed;
 }
 
 // --- Worker threads -------------------------------------------------------
@@ -445,7 +486,7 @@ void HttpServer::stamp_capabilities(httplib::Response& res) const {
     // Present-but-empty is a server positively stating it speaks no
     // compression; absent would mean a server predating the header, for which
     // a client assumes zstd.  The two are not interchangeable.
-    res.set_header("VGI-Supported-Encodings", cfg_.compression ? "zstd" : "");
+    res.set_header("VGI-Supported-Encodings", cfg_.compression ? "zstd, gzip" : "");
     if (cfg_.sticky) {
         res.set_header("VGI-Sticky-Enabled", "true");
         res.set_header("VGI-Sticky-Default-TTL", std::to_string(cfg_.sticky_default_ttl));
@@ -513,6 +554,7 @@ void HttpServer::stamp_common(const httplib::Request& req, httplib::Response& re
 void HttpServer::set_arrow_content(const httplib::Request& req, httplib::Response& res,
                                    std::string body) const {
     const CodecChoice choice = choose_codec(req, cfg_.compression);
+    bool compressed_ok = false;
     if (choice.codec == "zstd" && !body.empty()) {
         const size_t bound = ZSTD_compressBound(body.size());
         std::string compressed(bound, '\0');
@@ -520,13 +562,20 @@ void HttpServer::set_arrow_content(const httplib::Request& req, httplib::Respons
         if (!ZSTD_isError(written)) {
             compressed.resize(written);
             body.swap(compressed);
-            res.set_header(choice.standard_header ? "Content-Encoding" : "X-VGI-Content-Encoding",
-                           "zstd");
+            compressed_ok = true;
         }
-        // A compression failure is not a request failure: fall through and
-        // send the body uncompressed rather than turning a slow response into
-        // a broken one.
+    } else if (choice.codec == "gzip" && !body.empty()) {
+        if (auto compressed = gzip_compress(body)) {
+            body = std::move(*compressed);
+            compressed_ok = true;
+        }
     }
+    if (compressed_ok) {
+        res.set_header(choice.standard_header ? "Content-Encoding" : "X-VGI-Content-Encoding",
+                       choice.codec);
+    }
+    // A compression failure is not a request failure: send the body
+    // uncompressed rather than turning a slow response into a broken one.
     // httplib does not auto-compress this content type, so the encoding
     // headers set above are the whole story.
     res.set_content(std::move(body), ARROW_CONTENT_TYPE);
@@ -1206,8 +1255,8 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
                     }
                 }
                 const bool finished = run_producer_turns(
-                    writer, out, stream.state, output_schema, ctx, rpc_.server_id(), request_id,
-                    cfg_.max_response_bytes, &errored, externalize);
+                    writer, stream.state, output_schema, ctx, rpc_.server_id(), request_id,
+                    &errored, externalize, AnnotatedBatch::data(make_empty_batch(empty_schema())));
                 if (!finished) {
                     VGI_RPC_THROW_NOT_OK(writer->WriteRecordBatch(
                         *make_empty_batch(output_schema), init_metadata(cursor, call_token)));
@@ -1380,9 +1429,9 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
             bool errored = false;
             std::string body = build_body([&](const std::shared_ptr<arrow::io::OutputStream>& out) {
                 auto writer = unwrap(arrow::ipc::MakeStreamWriter(out, output_schema));
-                finished = run_producer_turns(writer, out, sess.state, output_schema, ctx,
-                                              rpc_.server_id(), request_id, cfg_.max_response_bytes,
-                                              &errored, externalize);
+                finished = run_producer_turns(
+                    writer, sess.state, output_schema, ctx, rpc_.server_id(), request_id, &errored,
+                    externalize, AnnotatedBatch::with_metadata(batch, custom_metadata));
                 if (!finished) {
                     VGI_RPC_THROW_NOT_OK(writer->WriteRecordBatch(*make_empty_batch(output_schema),
                                                                   cursor_metadata(cursor)));

@@ -339,22 +339,21 @@ int main() {
                 "empty producer did not terminate during initialization");
 
         {
-            PythonWorker buffered_worker(16384);
-            require(buffered_worker.port() != 0,
-                    "buffered producer conformance worker is unavailable");
-            auto buffered_client =
-                HttpClient::builder("http://127.0.0.1:" + std::to_string(buffered_worker.port()))
+            PythonWorker capped_worker(16384);
+            require(capped_worker.port() != 0, "capped producer conformance worker is unavailable");
+            auto lockstep_client =
+                HttpClient::builder("http://127.0.0.1:" + std::to_string(capped_worker.port()))
                     .config(config)
                     .build();
-            auto buffered = buffered_client.open_producer(
+            auto lockstep = lockstep_client.open_producer(
                 "producer_sequence", producer_request(100, 1024), producer_output);
             for (int64_t expected = 0; expected < 100; ++expected) {
-                auto value = buffered.tick();
+                auto value = lockstep.tick();
                 require(value && producer_index(*value) == expected,
-                        "buffered producer dropped or reordered an init batch");
+                        "capped lock-step producer dropped or reordered a batch");
             }
-            require(!buffered.tick() && buffered.finished(),
-                    "buffered producer did not reach its terminal response");
+            require(!lockstep.tick() && lockstep.finished(),
+                    "capped lock-step producer did not reach its terminal response");
         }
 
         {

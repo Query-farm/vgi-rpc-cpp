@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "vgi_rpc/output_collector.h"
+#include "vgi_rpc/errors.h"
 #include "vgi_rpc/metadata.h"
 
 #include <arrow/util/key_value_metadata.h>
@@ -19,7 +20,7 @@ OutputCollector::OutputCollector(std::shared_ptr<arrow::Schema> output_schema, b
 
 void OutputCollector::emit_batch(std::shared_ptr<arrow::RecordBatch> batch) {
     if (data_batch_idx_) {
-        throw std::runtime_error("Only one data batch may be emitted per call");
+        throw ProtocolError("Only one data batch may be emitted per call");
     }
     if (!batch->schema()->Equals(*output_schema_)) {
         throw std::runtime_error("emit_batch: schema mismatch");

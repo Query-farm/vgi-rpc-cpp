@@ -123,6 +123,17 @@ jobs:
       - name: Test (unit)
         run: ctest --test-dir build --output-on-failure -E conformance
 
+      # Both HTTP wire codecs are mandatory for this port. Keep this focused
+      # failure ahead of the full matrix so a missing zlib feature or a codec
+      # negotiation regression names itself directly.
+      - name: Test (mandatory zstd + gzip HTTP codecs)
+        if: matrix.conformance
+        env:
+          VGI_RPC_CPP_WORKER: ${{ github.workspace }}/build/conformance/conformance_worker
+        run: >
+          python -m pytest tests/conformance/test_suite.py -q -p no:randomly
+          -k 'HttpCompressionNegotiation or CompressedHttpRequestCap'
+
       - name: Validate install
         if: runner.os == 'Linux'
         run: |

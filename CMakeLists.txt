@@ -22,6 +22,7 @@ find_package(Arrow CONFIG REQUIRED)
 find_package(nlohmann_json CONFIG REQUIRED)
 find_package(httplib CONFIG REQUIRED)
 find_package(zstd CONFIG REQUIRED)
+find_package(ZLIB REQUIRED)
 # libsodium supplies every primitive the wire needs: XChaCha20-Poly1305 (the
 # 24-byte-nonce AEAD the token envelopes use, which OpenSSL does not ship),
 # SHA-256, HMAC-SHA256, a CSPRNG and a constant-time compare. Audited code in
@@ -126,6 +127,11 @@ target_link_libraries(vgi_rpc PUBLIC
 # no sodium header and links no sodium symbol of its own.
 target_link_libraries(vgi_rpc PRIVATE unofficial-sodium::sodium)
 target_link_libraries(vgi_rpc PRIVATE zstd::libzstd)
+# Gzip is a mandatory HTTP wire codec. cpp-httplib uses zlib to stream
+# request decompression into our decoded-byte cap, and http_transport.cpp uses
+# it directly for negotiated response bodies.
+target_compile_definitions(vgi_rpc PRIVATE CPPHTTPLIB_ZLIB_SUPPORT)
+target_link_libraries(vgi_rpc PRIVATE ZLIB::ZLIB)
 
 # shm_open/shm_unlink moved from librt into libc in glibc 2.34.  Linking it
 # where it exists costs nothing (it is a stub on modern glibc) and is what

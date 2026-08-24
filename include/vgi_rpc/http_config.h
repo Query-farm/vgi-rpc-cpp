@@ -83,8 +83,9 @@ struct HttpConfig {
     int max_external_redirects = 5;
     std::function<void(const std::string&)> external_url_validator;
 
-    // Content codings this server will produce.  Empty means it positively
-    // states it speaks none, which is distinct from not advertising at all.
+    // Produce the mandatory zstd and gzip HTTP response codings. False means
+    // the server positively states it produces none, which is distinct from
+    // not advertising at all. Request decoding remains available either way.
     bool compression = true;
 
     // CORS.  Empty origin = off; a server with no CORS configured must emit

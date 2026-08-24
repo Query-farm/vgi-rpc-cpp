@@ -5,6 +5,7 @@ find_dependency(Arrow CONFIG)
 find_dependency(nlohmann_json CONFIG)
 find_dependency(httplib CONFIG)
 find_dependency(zstd CONFIG)
+find_dependency(ZLIB)
 # libsodium is linked PRIVATE, but a *static* vgi_rpc still names it in its
 # exported interface — CMake records private link libraries as
 # $<LINK_ONLY:...> — so the target has to exist for a consumer. This is the

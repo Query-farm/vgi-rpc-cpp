@@ -1,7 +1,7 @@
 // © Copyright 2025-2026, Query.Farm LLC - https://query.farm
 // SPDX-License-Identifier: Apache-2.0
 
-// Conformance worker implementing all 81 methods from ConformanceService.
+// Conformance worker implementing all 87 methods from ConformanceService.
 // Wire-compatible with the Python vgi_rpc conformance test suite.
 
 #include "vgi_rpc/server.h"
@@ -88,6 +88,28 @@ static std::shared_ptr<arrow::Schema> session_by_schema() {
     return s;
 }
 
+static std::shared_ptr<arrow::DataType> conformance_status_type() {
+    static auto t = arrow::dictionary(arrow::int16(), arrow::utf8());
+    return t;
+}
+
+static std::shared_ptr<arrow::DataType> conformance_status_list_type() {
+    static auto t = arrow::list(conformance_status_type());
+    return t;
+}
+
+static std::shared_ptr<arrow::DataType> conformance_point_list_type() {
+    static auto point = arrow::struct_(
+        {arrow::field("x", arrow::float64(), false), arrow::field("y", arrow::float64(), false)});
+    static auto t = arrow::list(point);
+    return t;
+}
+
+static std::shared_ptr<arrow::DataType> conformance_status_map_type() {
+    static auto t = arrow::map(arrow::utf8(), conformance_status_type());
+    return t;
+}
+
 // =========================================================================
 // Result schemas
 // =========================================================================
@@ -141,6 +163,18 @@ static std::shared_ptr<arrow::Schema> optional_str_result_schema() {
 }
 static std::shared_ptr<arrow::Schema> optional_int_result_schema() {
     static auto s = arrow::schema({arrow::field("result", arrow::int64(), true)});
+    return s;
+}
+static std::shared_ptr<arrow::Schema> optional_binary_result_schema() {
+    static auto s = arrow::schema({arrow::field("result", arrow::binary(), true)});
+    return s;
+}
+static std::shared_ptr<arrow::Schema> optional_int32_result_schema() {
+    static auto s = arrow::schema({arrow::field("result", arrow::int32(), true)});
+    return s;
+}
+static std::shared_ptr<arrow::Schema> required_int32_result_schema() {
+    static auto s = arrow::schema({arrow::field("result", arrow::int32(), false)});
     return s;
 }
 static std::shared_ptr<arrow::Schema> int32_result_schema() {
@@ -202,6 +236,15 @@ static std::shared_ptr<arrow::RecordBatch> deserialize_dataclass(const Request& 
     std::shared_ptr<arrow::RecordBatch> batch;
     VGI_RPC_THROW_NOT_OK(reader->ReadNext(&batch));
     return batch;
+}
+
+static std::string serialize_batch(const std::shared_ptr<arrow::RecordBatch>& batch) {
+    auto sink = unwrap(arrow::io::BufferOutputStream::Create());
+    auto writer = unwrap(arrow::ipc::MakeStreamWriter(sink, batch->schema()));
+    VGI_RPC_THROW_NOT_OK(writer->WriteRecordBatch(*batch));
+    VGI_RPC_THROW_NOT_OK(writer->Close());
+    auto buffer = unwrap(sink->Finish());
+    return std::string(reinterpret_cast<const char*>(buffer->data()), buffer->size());
 }
 
 static std::shared_ptr<arrow::RecordBatch> make_header_batch(int64_t total_expected,
@@ -504,6 +547,15 @@ static Result echo_optional_string_handler(const Request& req, CallContext&) {
 static Result echo_optional_int_handler(const Request& req, CallContext&) {
     return echo_column(req, "value", optional_int_result_schema());
 }
+static Result echo_optional_point_handler(const Request& req, CallContext&) {
+    return echo_column(req, "point", optional_binary_result_schema());
+}
+static Result echo_annotated_optional_int_handler(const Request& req, CallContext&) {
+    return echo_column(req, "value", optional_int32_result_schema());
+}
+static Result echo_outer_optional_non_null_handler(const Request& req, CallContext&) {
+    return echo_column(req, "value", required_int32_result_schema());
+}
 
 // =========================================================================
 // Unary handlers: dataclass round-trip (binary passthrough)
@@ -529,6 +581,55 @@ static Result echo_embedded_arrow_handler(const Request& req, CallContext&) {
 }
 static Result echo_deep_nested_handler(const Request& req, CallContext&) {
     return echo_column(req, "data", binary_result_schema());
+}
+
+static Result pack_nested_containers_handler(const Request& req, CallContext&) {
+    auto statuses = req.batch()->GetColumnByName("statuses");
+    auto points = req.batch()->GetColumnByName("points");
+    auto status_by_name = req.batch()->GetColumnByName("status_by_name");
+    auto status_list = std::dynamic_pointer_cast<arrow::ListArray>(statuses);
+    auto point_list = std::dynamic_pointer_cast<arrow::ListArray>(points);
+    if (!status_list || !point_list || status_list->value_length(0) == 0 ||
+        point_list->value_length(0) == 0) {
+        throw std::invalid_argument("statuses and points must be non-empty lists");
+    }
+
+    auto tagged_status = status_list->values()->Slice(status_list->value_offset(0), 1);
+    auto tagged_point = point_list->values()->Slice(point_list->value_offset(0), 1);
+
+    arrow::Int64Builder tagged_value_builder;
+    VGI_RPC_THROW_NOT_OK(tagged_value_builder.Append(1));
+    VGI_RPC_THROW_NOT_OK(tagged_value_builder.Append(2));
+    auto tagged_batch =
+        arrow::RecordBatch::Make(arrow::schema({arrow::field("value", arrow::int64())}), 2,
+                                 {unwrap(tagged_value_builder.Finish())});
+    auto tagged_bytes = serialize_batch(tagged_batch);
+    arrow::BinaryBuilder tagged_batch_builder;
+    VGI_RPC_THROW_NOT_OK(tagged_batch_builder.Append(tagged_bytes));
+
+    auto nested_schema = arrow::schema({
+        arrow::field("statuses", statuses->type(), false),
+        arrow::field("points", points->type(), false),
+        arrow::field("status_by_name", status_by_name->type(), false),
+        arrow::field("frozen_statuses", statuses->type(), false),
+        arrow::field("tagged_status", tagged_status->type(), true),
+        arrow::field("tagged_point", tagged_point->type(), true),
+        arrow::field("tagged_batch", arrow::binary(), true),
+    });
+    auto nested =
+        arrow::RecordBatch::Make(nested_schema, 1,
+                                 {statuses, points, status_by_name, statuses, tagged_status,
+                                  tagged_point, unwrap(tagged_batch_builder.Finish())});
+    auto nested_bytes = serialize_batch(nested);
+    arrow::BinaryBuilder result_builder;
+    VGI_RPC_THROW_NOT_OK(result_builder.Append(nested_bytes));
+    return Result::value(binary_result_schema(), {unwrap(result_builder.Finish())});
+}
+
+static Result echo_status_list_handler(const Request& req, CallContext&) {
+    auto statuses = req.batch()->GetColumnByName("statuses");
+    auto schema = arrow::schema({arrow::field("result", statuses->type(), false)});
+    return echo_column(req, "statuses", schema);
 }
 
 // =========================================================================
@@ -783,6 +884,29 @@ public:
         VGI_RPC_THROW_NOT_OK(val.Append(current_ * 10));
         out.emit_arrays({unwrap(idx.Finish()), unwrap(val.Finish())});
         ++current_;
+    }
+
+private:
+    int64_t count_, current_ = 0;
+};
+
+class TickMetadataState : public StreamState {
+public:
+    explicit TickMetadataState(int64_t count) : count_(count) {}
+
+    void process(const AnnotatedBatch& input, OutputCollector& out, CallContext&) override {
+        std::string seen;
+        if (input.custom_metadata) {
+            auto index = input.custom_metadata->FindKey("vgi.conformance.tick");
+            if (index >= 0) seen = input.custom_metadata->value(index);
+        }
+        arrow::Int64Builder index_builder;
+        arrow::StringBuilder seen_builder;
+        VGI_RPC_THROW_NOT_OK(index_builder.Append(current_));
+        VGI_RPC_THROW_NOT_OK(seen_builder.Append(seen));
+        out.emit_arrays({unwrap(index_builder.Finish()), unwrap(seen_builder.Finish())});
+        ++current_;
+        if (current_ >= count_) out.finish();
     }
 
 private:
@@ -1124,6 +1248,12 @@ public:
 static Stream make_produce_n(const Request& req, CallContext&) {
     return {counter_schema(), empty_schema(),
             std::make_shared<CounterState>(req.get<int64_t>("count")), nullptr};
+}
+static Stream make_produce_tick_metadata(const Request& req, CallContext&) {
+    auto output = arrow::schema(
+        {arrow::field("index", arrow::int64(), false), arrow::field("seen", arrow::utf8(), false)});
+    return {output, empty_schema(), std::make_shared<TickMetadataState>(req.get<int64_t>("count")),
+            nullptr};
 }
 static Stream make_produce_empty(const Request&, CallContext&) {
     return {counter_schema(), empty_schema(), std::make_shared<EmptyProducerState>(), nullptr};
@@ -1510,7 +1640,19 @@ int main(int argc, char** argv) {
         .add_unary("echo_optional_int",
                    arrow::schema({arrow::field("value", arrow::int64(), true)}),
                    optional_int_result_schema(), echo_optional_int_handler,
-                   "Echo an optional int (may be None).");
+                   "Echo an optional int (may be None).")
+        .add_unary("echo_optional_point",
+                   arrow::schema({arrow::field("point", arrow::binary(), true)}),
+                   optional_binary_result_schema(), echo_optional_point_handler,
+                   "Echo an optional structured value.")
+        .add_unary("echo_annotated_optional_int",
+                   arrow::schema({arrow::field("value", arrow::int32(), true)}),
+                   optional_int32_result_schema(), echo_annotated_optional_int_handler,
+                   "Echo an Annotated optional int32 value.")
+        .add_unary("echo_outer_optional_non_null",
+                   arrow::schema({arrow::field("value", arrow::int32(), false)}),
+                   required_int32_result_schema(), echo_outer_optional_non_null_handler,
+                   "Echo an Optional-wrapped explicitly non-null int32 value.");
 
     // --- Dataclass Round-trip ---
     builder
@@ -1593,6 +1735,17 @@ int main(int argc, char** argv) {
                    binary_result_schema(), echo_deep_nested_handler,
                    "Round-trip multi-level nested containers and dictionary-encoded strings.")
         .add_unary(
+            "pack_nested_containers",
+            arrow::schema({arrow::field("statuses", conformance_status_list_type(), false),
+                           arrow::field("points", conformance_point_list_type(), false),
+                           arrow::field("status_by_name", conformance_status_map_type(), false)}),
+            binary_result_schema(), pack_nested_containers_handler,
+            "Exercise recursive parameter conversion and nested reconstruction.")
+        .add_unary("echo_status_list",
+                   arrow::schema({arrow::field("statuses", conformance_status_list_type(), false)}),
+                   arrow::schema({arrow::field("result", conformance_status_list_type(), false)}),
+                   echo_status_list_handler, "Echo enum members nested in a top-level list.")
+        .add_unary(
             "echo_dict_encoded_string",
             params({arrow::field("value", arrow::dictionary(arrow::int16(), arrow::utf8()))}),
             result_schema_of(arrow::dictionary(arrow::int16(), arrow::utf8())),
@@ -1668,6 +1821,11 @@ int main(int argc, char** argv) {
         .add_producer("produce_n", params({arrow::field("count", arrow::int64())}),
                       counter_schema(), make_produce_n,
                       "Produce count batches with {index, value}.")
+        .add_producer("produce_tick_metadata", params({arrow::field("count", arrow::int64())}),
+                      arrow::schema({arrow::field("index", arrow::int64(), false),
+                                     arrow::field("seen", arrow::utf8(), false)}),
+                      make_produce_tick_metadata,
+                      "Report application metadata attached to each producer tick.")
         .add_producer("produce_empty", empty_schema(), counter_schema(), make_produce_empty,
                       "Produce zero batches (finish immediately).")
         .add_producer("produce_single", empty_schema(), counter_schema(), make_produce_single,
@@ -1780,7 +1938,7 @@ int main(int argc, char** argv) {
         http_cfg.sticky_echo_headers["x-vgi-conformance-echo"] = "conformance-fixed-marker";
     }
 
-    if (!transport_kind_probe && !polymorphic_stream_probe) builder.protocol_version("1.0.0");
+    if (!transport_kind_probe && !polymorphic_stream_probe) builder.protocol_version("2.0.0");
     builder.enable_describe("ConformanceService");
     // We implement SHM, so we must answer the handshake: a worker that stays
     // silent is treated as "no SHM" and clients never negotiate it.

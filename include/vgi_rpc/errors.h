@@ -41,6 +41,12 @@ VGI_RPC_EXPORT std::string exception_type_of(const std::exception& e);
 // The machine-readable error_kind, or "" for an ordinary exception.
 VGI_RPC_EXPORT std::string error_kind_of(const std::exception& e);
 
+// The worker violated or received an invalid wire-level RPC contract.
+class VGI_RPC_EXPORT ProtocolError : public KindedError {
+public:
+    explicit ProtocolError(const std::string& what) : KindedError("", "ProtocolError", what) {}
+};
+
 // A sticky session could not be resolved.  Every cause — a token that will not
 // decrypt, one sealed for another principal, one minted by another worker, an
 // entry that aged out — raises this same error with this same message, so the

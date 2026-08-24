@@ -2240,6 +2240,11 @@ std::unique_ptr<HttpStreamSession::Impl> make_http_stream_impl(
         throw HttpClientError(
             schema_mismatch("stream init response", output_schema, decoded.schema));
     }
+    if (kind == HttpStreamKind::PRODUCER && decoded.data.size() > 1) {
+        throw HttpClientError(HttpClientErrorKind::PROTOCOL,
+                              "producer init response contains multiple data batches", 0, method,
+                              {});
+    }
     auto impl = std::make_unique<HttpStreamSession::Impl>();
     impl->state = state;
     impl->sticky_session = sticky_session;
@@ -2392,6 +2397,11 @@ std::optional<AnnotatedBatch> HttpStreamSession::tick(const CallOptions& options
         if (!schema_equals(decoded.schema, impl_->output_schema)) {
             throw HttpClientError(
                 schema_mismatch("producer response", impl_->output_schema, decoded.schema));
+        }
+        if (decoded.data.size() > 1) {
+            throw HttpClientError(HttpClientErrorKind::PROTOCOL,
+                                  "producer response contains multiple data batches", 0,
+                                  impl_->method, request_id);
         }
         for (auto& batch : decoded.data) {
             batch.custom_metadata = strip_transport_metadata(batch.custom_metadata);

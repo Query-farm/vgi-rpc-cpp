@@ -68,7 +68,7 @@ the wire to one built before any of them existed.
 | Capability discovery (`GET`/`OPTIONS {prefix}/health`) | always on |
 | Response caps, strict-fail | `max_response_bytes`, `max_externalized_response_bytes` |
 | External locations (pointer batches) | `external_storage_url`, `externalize_threshold` |
-| Response codec negotiation (zstd) | `compression` |
+| Bounded request decoding and response negotiation (zstd + gzip) | `compression` |
 | CORS, including `Cross-Origin-Resource-Policy` | `cors_origin` |
 | Sticky sessions (AEAD-sealed tokens, TTL, drain) | `sticky`, `sticky_default_ttl`, `sticky_echo_headers` |
 | Standardized 401s with `VGI-Auth-Reason` | `reject_all` |

@@ -4,6 +4,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "vgi_rpc/output_collector.h"
+#include "vgi_rpc/errors.h"
 #include "vgi_rpc/metadata.h"
 #include "vgi_rpc/wire.h"
 
@@ -46,7 +47,12 @@ TEST_CASE("emit_batch throws on second data batch", "[output_collector]") {
     REQUIRE(b2.Append(2).ok());
     auto arr2 = *b2.Finish();
     auto batch2 = arrow::RecordBatch::Make(test_schema(), 1, {arr2});
-    REQUIRE_THROWS_AS(out.emit_batch(batch2), std::runtime_error);
+    try {
+        out.emit_batch(batch2);
+        FAIL("second data batch was accepted");
+    } catch (const ProtocolError& error) {
+        REQUIRE(exception_type_of(error) == "ProtocolError");
+    }
 }
 
 TEST_CASE("emit_arrays builds batch from arrays", "[output_collector]") {
