@@ -196,9 +196,42 @@ AnnotatedBatch upload_url_request(int64_t count) {
         arrow::RecordBatch::Make(upload_url_request_schema(), 1, {unwrap(builder.Finish())}));
 }
 
+// Deliberately narrower than arrow::Schema::Equals(): compares field
+// count, names, and DataTypes (recursively, so a nested list/struct
+// mismatch still fails) - NOT metadata, and NOT nullability. Both were
+// found, against the same real deployed worker (open-meteo, a Cloudflare
+// Worker), to be documentation-level annotations this client can't rely
+// on round-tripping consistently between bind()'s declared output schema
+// and what an actual data connection returns for the "same" logical
+// schema:
+//   - Metadata: bind()'s response carried rich per-field `comment` doc
+//     strings; the init-response header for the SAME schema came back
+//     bare, yet the very first real exchange-response batch right after
+//     was metadata-rich again - i.e. metadata presence isn't even
+//     consistent within one worker's own responses across call sites, so
+//     no client-side "expected" schema construction could reliably
+//     predict it.
+//   - Nullability: bind() declared several fields (e.g. `time`,
+//     `latitude`, `longitude`) NOT NULL; the actual init-response schema
+//     for the same fields came back nullable. arrow::Field::Equals treats
+//     nullability as part of core field identity with no way to opt out
+//     short of comparing DataTypes directly (a DataType, unlike a Field,
+//     doesn't carry nullability at all) - hence this hand-rolled
+//     comparison instead of Schema::Equals(check_metadata=false).
+// A genuine wire-shape mismatch (a missing/extra/renamed/retyped field,
+// or a nested type actually differing) still fails loudly either way -
+// only the two provably-non-structural properties above are ignored.
 bool schema_equals(const std::shared_ptr<arrow::Schema>& actual,
                    const std::shared_ptr<arrow::Schema>& expected) {
-    return actual && expected && actual->Equals(*expected, /*check_metadata=*/true);
+    if (!actual || !expected) return false;
+    if (actual->num_fields() != expected->num_fields()) return false;
+    for (int i = 0; i < actual->num_fields(); ++i) {
+        const auto& a = actual->field(i);
+        const auto& e = expected->field(i);
+        if (a->name() != e->name()) return false;
+        if (!a->type()->Equals(*e->type())) return false;
+    }
+    return true;
 }
 
 std::string schema_mismatch(const char* direction, const std::shared_ptr<arrow::Schema>& expected,
