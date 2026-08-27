@@ -558,6 +558,11 @@ RpcClient RpcClient::connect_unix(const std::string& path, const RpcClientOption
     return RpcClient(ClientTransport::connect_unix(path, transport_options), options);
 }
 
+RpcClient RpcClient::connect_pipe(const std::string& pipe_name, const RpcClientOptions& options,
+                                  const SocketTransportOptions& transport_options) {
+    return RpcClient(ClientTransport::connect_pipe(pipe_name, transport_options), options);
+}
+
 RpcClient RpcClient::connect_tcp(const std::string& host, uint16_t port,
                                  const RpcClientOptions& options,
                                  const SocketTransportOptions& transport_options) {

@@ -490,6 +490,59 @@ SOCKET connect_unix_socket(const std::string& path, const SocketTransportOptions
     return sock;
 }
 
+// Opens an existing Windows named pipe (\\.\pipe\<name>) as a client and
+// converts the resulting HANDLE into a CRT file descriptor via
+// _open_osfhandle - the exact same bridge WindowsChildState (above) already
+// uses for a spawned child's own stdin/stdout HANDLEs, letting this reuse
+// FdInputStream/FdOutputStream directly instead of needing yet another
+// stream-class pair (unlike AF_UNIX's SOCKET, a named-pipe HANDLE opened
+// GENERIC_READ|GENERIC_WRITE is _read()/_write()-compatible once bridged
+// this way). One handle serves both directions, same as a socket fd - no
+// separate read/write handles needed.
+int connect_pipe_fd(const std::string& pipe_name, const SocketTransportOptions& options) {
+    if (pipe_name.empty()) throw std::invalid_argument("pipe name must not be empty");
+    const auto deadline = options.connect_timeout
+                              ? std::chrono::steady_clock::now() + *options.connect_timeout
+                              : std::chrono::steady_clock::time_point::max();
+    HANDLE handle = INVALID_HANDLE_VALUE;
+    for (;;) {
+        handle = ::CreateFileA(pipe_name.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
+                               OPEN_EXISTING, 0, nullptr);
+        if (handle != INVALID_HANDLE_VALUE) break;
+        const DWORD err = ::GetLastError();
+        if (err != ERROR_PIPE_BUSY) {
+            throw std::runtime_error("cannot connect named pipe " + pipe_name +
+                                     " (GetLastError=" + std::to_string(err) + ")");
+        }
+        // Every instance is momentarily busy - wait for one to free up, per
+        // the standard Windows named-pipe client retry pattern (the server
+        // side creates with PIPE_UNLIMITED_INSTANCES per docs/launcher-
+        // protocol.md, so this is just a transient race, not a capacity
+        // limit).
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) {
+            throw std::runtime_error("timed out connecting named pipe " + pipe_name +
+                                     " (all instances busy)");
+        }
+        const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
+        const DWORD wait_ms = options.connect_timeout
+                                  ? static_cast<DWORD>(std::min<int64_t>(remaining.count(),
+                                                                          std::numeric_limits<int32_t>::max()))
+                                  : NMPWAIT_WAIT_FOREVER;
+        if (!::WaitNamedPipeA(pipe_name.c_str(), wait_ms)) {
+            throw std::runtime_error("cannot connect named pipe " + pipe_name +
+                                     " (WaitNamedPipe GetLastError=" +
+                                     std::to_string(::GetLastError()) + ")");
+        }
+    }
+    const int fd = ::_open_osfhandle(reinterpret_cast<intptr_t>(handle), _O_BINARY);
+    if (fd < 0) {
+        close_handle(handle);
+        throw std::runtime_error("cannot convert named pipe handle to a file descriptor");
+    }
+    return fd;
+}
+
 struct WindowsChildState {
     HANDLE process = nullptr;
     int stdin_fd = -1;
@@ -782,6 +835,25 @@ ClientTransport ClientTransport::connect_unix(const std::string& path,
         if (*fd >= 0) (void)::shutdown(*fd, SHUT_RDWR);
         close_fd(*fd);
     }));
+#endif
+}
+
+ClientTransport ClientTransport::connect_pipe(const std::string& pipe_name,
+                                              const SocketTransportOptions& options) {
+#ifdef _WIN32
+    auto fd = std::make_shared<int>(connect_pipe_fd(pipe_name, options));
+    auto input = std::make_shared<FdInputStream>(*fd);
+    auto output = std::make_shared<FdOutputStream>(*fd);
+    return ClientTransport(std::make_unique<Impl>(input, output, [fd]() {
+        if (*fd >= 0) (void)::_close(*fd);
+        *fd = -1;
+    }));
+#else
+    (void)pipe_name;
+    (void)options;
+    throw std::runtime_error(
+        "Named-pipe client transport is Windows-only - connect_unix (genuine AF_UNIX) "
+        "already covers the equivalent need on POSIX");
 #endif
 }
 

@@ -67,8 +67,22 @@ public:
                                         std::shared_ptr<arrow::io::OutputStream> output);
     static ClientTransport spawn(const std::vector<std::string>& argv,
                                  const SubprocessTransportOptions& options = {});
-    // Unix sockets are POSIX-only.
+    // Genuine AF_UNIX on both POSIX and Windows (Windows 10 1803+ has real
+    // kernel AF_UNIX support, via afunix.h) - NOT the same thing as
+    // connect_pipe below. Use this for an explicit unix:// location
+    // against a worker that binds a real AF_UNIX socket (confirmed
+    // working: vgi-go's --unix flag does this on Windows too).
     static ClientTransport connect_unix(const std::string& path,
+                                        const SocketTransportOptions& options = {});
+    // Windows named pipe (\\.\pipe\<name>) - the AF_UNIX worker launcher
+    // protocol's actual Windows rendezvous mechanism (docs/launcher-
+    // protocol.md's own "Platform: Windows" section: CPython has no
+    // socket.AF_UNIX on Windows, so vgi_rpc's own worker CLI serves a
+    // named pipe there, not an AF_UNIX socket, despite --unix's name).
+    // POSIX-only builds throw - AF_UNIX (connect_unix above) already
+    // covers the equivalent need there, a named pipe has no POSIX
+    // analog worth adding one for.
+    static ClientTransport connect_pipe(const std::string& pipe_name,
                                         const SocketTransportOptions& options = {});
     // Raw TCP currently follows the server and is POSIX-only. It has no TLS or
     // authentication and must be limited to a trusted network.
@@ -182,6 +196,8 @@ public:
                            const RpcClientOptions& client_options = {},
                            const SubprocessTransportOptions& transport_options = {});
     static RpcClient connect_unix(const std::string& path, const RpcClientOptions& options = {},
+                                  const SocketTransportOptions& transport_options = {});
+    static RpcClient connect_pipe(const std::string& pipe_name, const RpcClientOptions& options = {},
                                   const SocketTransportOptions& transport_options = {});
     static RpcClient connect_tcp(const std::string& host, uint16_t port,
                                  const RpcClientOptions& options = {},
