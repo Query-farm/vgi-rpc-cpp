@@ -2119,10 +2119,12 @@ HttpExchangeSession HttpClient::open_exchange(const std::string& method,
                      options, true, sticky_session_);
     auto decoded = state_->decode(response, ResponseShape::EXCHANGE_INIT, false, state_->external(),
                                   sticky_session_);
-    if (!schema_equals(decoded.schema, output_schema)) {
-        throw HttpClientError(
-            schema_mismatch("exchange init response", output_schema, decoded.schema));
-    }
+    // Adopt the actual response schema rather than reject a legitimate
+    // divergence from the caller's prediction - same reasoning as
+    // make_http_stream_impl's identical adoption for stream init (see its
+    // own comment for the full "the caller cannot know in advance whether
+    // a worker honors optional pushdown" rationale).
+    if (decoded.schema) output_schema = decoded.schema;
 
     auto impl = std::make_unique<HttpExchangeSession::Impl>();
     impl->state = state_;
@@ -2288,10 +2290,28 @@ std::unique_ptr<HttpStreamSession::Impl> make_http_stream_impl(
     std::shared_ptr<arrow::Schema> input_schema, std::shared_ptr<arrow::Schema> output_schema,
     DecodedResponse decoded,
     const std::shared_ptr<HttpStickySessionState>& sticky_session = nullptr) {
-    if (!schema_equals(decoded.schema, output_schema)) {
-        throw HttpClientError(
-            schema_mismatch("stream init response", output_schema, decoded.schema));
-    }
+    // The caller's `output_schema` is a PREDICTION, not a guarantee - a
+    // worker that honors optional pushdown (projection_pushdown, e.g.) can
+    // legitimately answer this stream's very first response with a
+    // narrower shape than what bind() advertised for the whole table,
+    // exactly like a worker that DOESN'T honor it legitimately answers
+    // with the full shape instead; the caller genuinely cannot know in
+    // advance which one a given worker will do (confirmed against a real
+    // deployed worker, found building vgi-sqlite's projection-pushdown
+    // path over HTTP for the first time - the raw/subprocess transport
+    // has never had this problem, since it does no such pre-validation at
+    // all, trusting the caller to read each batch's own actual width
+    // instead). Rejecting a legitimate narrower-than-predicted response
+    // outright would make projection pushdown unusable over HTTP for any
+    // worker that actually implements it. So: adopt whatever this FIRST
+    // response's own decoded schema actually is as the real
+    // impl->output_schema going forward, rather than failing when it
+    // differs from the caller's prediction - every LATER tick on this
+    // same stream is still checked for self-consistency against that
+    // real, wire-established schema (schema_equals() below, per-tick),
+    // catching a genuine mid-stream protocol violation (the worker
+    // changing shape after its own first answer) exactly as before.
+    if (decoded.schema) output_schema = decoded.schema;
     if (kind == HttpStreamKind::PRODUCER && decoded.data.size() > 1) {
         throw HttpClientError(HttpClientErrorKind::PROTOCOL,
                               "producer init response contains multiple data batches", 0, method,
