@@ -146,6 +146,13 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     endif()
 endif()
 
+if(WIN32)
+    # client_transport.cpp's Windows AF_UNIX client (connect_unix) and
+    # wire.cpp's Socket{Input,Output}Stream both talk Winsock directly
+    # (WSAStartup/socket/connect/send/recv/closesocket).
+    target_link_libraries(vgi_rpc PUBLIC ws2_32)
+endif()
+
 # PRIVATE: the SDKs are an implementation detail of src/external.cpp, and the
 # compile definitions gate only that file's backends.  A consumer of the
 # installed library links neither.

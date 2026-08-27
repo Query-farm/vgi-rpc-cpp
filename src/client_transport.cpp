@@ -41,6 +41,14 @@ extern char** environ;
 #define NOMINMAX
 #endif
 #include <windows.h>
+// winsock2.h/afunix.h after windows.h is safe here because
+// WIN32_LEAN_AND_MEAN above already excludes windows.h's own legacy
+// winsock.h. Needed for connect_unix's real Windows implementation
+// (genuine AF_UNIX, matching the canonical vgi_rpc Python launcher's
+// behavior on Windows - see vgi-sqlite's launcher.h for the research).
+#include <winsock2.h>
+
+#include <afunix.h>
 #include <fcntl.h>
 #include <io.h>
 #endif
@@ -338,6 +346,150 @@ DWORD wait_milliseconds(std::chrono::milliseconds duration) noexcept {
     return count >= static_cast<int64_t>(INFINITE - 1) ? INFINITE - 1 : static_cast<DWORD>(count);
 }
 
+// Winsock must be initialized once per process before any socket() call.
+// Reference-counted by the OS, so a redundant call from elsewhere in the
+// process (e.g. vgi-sqlite's own launcher.cpp, which needs Winsock too for
+// its own AF_UNIX liveness probe) is harmless - deliberately never paired
+// with WSACleanup, since a library can't know whether something else in
+// the process still needs sockets when it's done with its own.
+void ensure_winsock_initialized() {
+    static bool inited = [] {
+        WSADATA data;
+        const int rc = ::WSAStartup(MAKEWORD(2, 2), &data);
+        if (rc != 0) {
+            throw std::runtime_error("cannot initialize Winsock (WSAStartup returned " +
+                                     std::to_string(rc) + ")");
+        }
+        return true;
+    }();
+    (void)inited;
+}
+
+// The Windows counterpart to set_socket_timeout (POSIX branch, above) -
+// SO_RCVTIMEO/SO_SNDTIMEO take a DWORD count of milliseconds directly on
+// Windows, not a timeval struct.
+void set_socket_timeout_win(SOCKET sock, int option, std::optional<std::chrono::milliseconds> timeout) {
+    if (!timeout) return;
+    if (*timeout <= std::chrono::milliseconds::zero()) {
+        throw std::invalid_argument("socket I/O timeout must be positive");
+    }
+    const DWORD millis = static_cast<DWORD>(timeout->count());
+    if (::setsockopt(sock, SOL_SOCKET, option, reinterpret_cast<const char*>(&millis), sizeof(millis)) ==
+        SOCKET_ERROR) {
+        throw std::runtime_error("cannot set socket I/O timeout (WSAGetLastError=" +
+                                 std::to_string(::WSAGetLastError()) + ")");
+    }
+}
+
+// The Windows counterpart to connect_with_timeout (POSIX branch, above) -
+// same shape (nonblocking connect, then wait for writability with a
+// deadline), but ioctlsocket(FIONBIO)/WSAPoll/WSAEWOULDBLOCK/
+// WSAGetLastError instead of fcntl/poll/EINPROGRESS/errno. WSAPoll (Vista+)
+// is deliberately used over select() - it mirrors POSIX poll()'s pollfd
+// shape almost exactly, keeping this close to its POSIX counterpart
+// instead of diverging into select()'s fd_set-based API.
+bool connect_with_timeout_win(SOCKET sock, const sockaddr* address, int address_length,
+                              std::optional<std::chrono::milliseconds> timeout, int* out_error) {
+    if (!timeout) {
+        if (::connect(sock, address, address_length) == 0) return true;
+        *out_error = ::WSAGetLastError();
+        return false;
+    }
+    if (*timeout <= std::chrono::milliseconds::zero()) {
+        throw std::invalid_argument("socket connect timeout must be positive");
+    }
+    u_long mode = 1;
+    if (::ioctlsocket(sock, FIONBIO, &mode) != 0) {
+        throw std::runtime_error("cannot make connecting socket nonblocking (WSAGetLastError=" +
+                                 std::to_string(::WSAGetLastError()) + ")");
+    }
+    if (::connect(sock, address, address_length) == 0) {
+        mode = 0;
+        (void)::ioctlsocket(sock, FIONBIO, &mode);
+        return true;
+    }
+    int err = ::WSAGetLastError();
+    if (err != WSAEWOULDBLOCK) {
+        *out_error = err;
+        mode = 0;
+        (void)::ioctlsocket(sock, FIONBIO, &mode);
+        return false;
+    }
+
+    const auto deadline = std::chrono::steady_clock::now() + *timeout;
+    WSAPOLLFD descriptor{};
+    descriptor.fd = sock;
+    descriptor.events = POLLOUT;
+    int poll_result = 0;
+    do {
+        const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+            deadline - std::chrono::steady_clock::now());
+        if (remaining <= std::chrono::milliseconds::zero()) {
+            *out_error = WSAETIMEDOUT;
+            mode = 0;
+            (void)::ioctlsocket(sock, FIONBIO, &mode);
+            return false;
+        }
+        const auto bounded = std::min<int64_t>(remaining.count(), std::numeric_limits<int>::max());
+        poll_result = ::WSAPoll(&descriptor, 1, static_cast<int>(bounded));
+    } while (poll_result == SOCKET_ERROR && ::WSAGetLastError() == WSAEINTR);
+
+    int socket_error = 0;
+    int error_size = sizeof(socket_error);
+    if (poll_result <= 0 ||
+        ::getsockopt(sock, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&socket_error), &error_size) ==
+            SOCKET_ERROR ||
+        socket_error != 0) {
+        *out_error = poll_result == 0 ? WSAETIMEDOUT : (socket_error != 0 ? socket_error : ::WSAGetLastError());
+        mode = 0;
+        (void)::ioctlsocket(sock, FIONBIO, &mode);
+        return false;
+    }
+    mode = 0;
+    if (::ioctlsocket(sock, FIONBIO, &mode) != 0) {
+        throw std::runtime_error("cannot restore connected socket to blocking mode (WSAGetLastError=" +
+                                 std::to_string(::WSAGetLastError()) + ")");
+    }
+    return true;
+}
+
+// The Windows counterpart to connect_unix_fd (POSIX branch, above) - real
+// AF_UNIX (afunix.h), not a named pipe. See vgi-sqlite's launcher.h for
+// why AF_UNIX is the right Windows transport here: it's what the
+// canonical vgi_rpc Python launcher actually uses on Windows, confirmed
+// directly in its source, not a named pipe as vgi (the DuckDB C++
+// extension)'s own Windows launcher uses.
+SOCKET connect_unix_socket(const std::string& path, const SocketTransportOptions& options) {
+    ensure_winsock_initialized();
+    if (path.empty()) throw std::invalid_argument("Unix socket path must not be empty");
+    sockaddr_un address{};
+    address.sun_family = AF_UNIX;
+    if (path.size() >= sizeof(address.sun_path)) {
+        throw std::invalid_argument("Unix socket path is too long: " + path);
+    }
+    std::memcpy(address.sun_path, path.c_str(), path.size() + 1);
+
+    SOCKET sock = ::socket(AF_UNIX, SOCK_STREAM, 0);
+    if (sock == INVALID_SOCKET) {
+        throw std::runtime_error("cannot create Unix socket (WSAGetLastError=" +
+                                 std::to_string(::WSAGetLastError()) + ")");
+    }
+    try {
+        int connect_error = 0;
+        if (!connect_with_timeout_win(sock, reinterpret_cast<const sockaddr*>(&address), sizeof(address),
+                                      options.connect_timeout, &connect_error)) {
+            throw std::runtime_error("cannot connect Unix socket " + path + " (WSAGetLastError=" +
+                                     std::to_string(connect_error) + ")");
+        }
+        set_socket_timeout_win(sock, SO_RCVTIMEO, options.read_timeout);
+        set_socket_timeout_win(sock, SO_SNDTIMEO, options.write_timeout);
+    } catch (...) {
+        ::closesocket(sock);
+        throw;
+    }
+    return sock;
+}
+
 struct WindowsChildState {
     HANDLE process = nullptr;
     int stdin_fd = -1;
@@ -612,9 +764,16 @@ ClientTransport ClientTransport::spawn(const std::vector<std::string>& argv,
 ClientTransport ClientTransport::connect_unix(const std::string& path,
                                               const SocketTransportOptions& options) {
 #ifdef _WIN32
-    (void)path;
-    (void)options;
-    throw std::runtime_error("Unix socket client transport is not available on Windows");
+    auto sock = std::make_shared<SOCKET>(connect_unix_socket(path, options));
+    auto input = std::make_shared<SocketInputStream>(static_cast<std::uintptr_t>(*sock));
+    auto output = std::make_shared<SocketOutputStream>(static_cast<std::uintptr_t>(*sock));
+    return ClientTransport(std::make_unique<Impl>(input, output, [sock]() {
+        if (*sock != INVALID_SOCKET) {
+            (void)::shutdown(*sock, SD_BOTH);
+            ::closesocket(*sock);
+            *sock = INVALID_SOCKET;
+        }
+    }));
 #else
     auto fd = std::make_shared<int>(connect_unix_fd(path, options));
     auto input = std::make_shared<FdInputStream>(*fd);

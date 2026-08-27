@@ -114,6 +114,52 @@ private:
     int64_t position_ = 0;
 };
 
+#if defined(_WIN32)
+// InputStream/OutputStream over a Windows Winsock SOCKET (a Unix-domain
+// or TCP client socket) - NOT the same as FdInputStream/FdOutputStream
+// above despite the similar shape: a Windows SOCKET is a distinct kernel
+// handle namespace from a CRT file descriptor, and cannot be read/written
+// via _read()/_write() (what FdInputStream/FdOutputStream use on Windows)
+// - recv()/send() are required. Stored as std::uintptr_t rather than
+// SOCKET to avoid requiring <winsock2.h> in this public header (SOCKET is
+// itself typedef'd as UINT_PTR, so this is the identical underlying type
+// on both 32- and 64-bit Windows) - callers cast to/from SOCKET only in
+// the .cpp that actually creates one.
+class VGI_RPC_EXPORT SocketInputStream : public arrow::io::InputStream {
+public:
+    explicit SocketInputStream(std::uintptr_t socket_handle) : socket_(socket_handle) {}
+    ~SocketInputStream() override = default;
+
+    arrow::Status Close() override;
+    bool closed() const override { return closed_; }
+    arrow::Result<int64_t> Tell() const override { return position_; }
+    arrow::Result<int64_t> Read(int64_t nbytes, void* out) override;
+    arrow::Result<std::shared_ptr<arrow::Buffer>> Read(int64_t nbytes) override;
+
+private:
+    std::uintptr_t socket_;
+    bool closed_ = false;
+    int64_t position_ = 0;
+};
+
+class VGI_RPC_EXPORT SocketOutputStream : public arrow::io::OutputStream {
+public:
+    explicit SocketOutputStream(std::uintptr_t socket_handle) : socket_(socket_handle) {}
+    ~SocketOutputStream() override = default;
+
+    arrow::Status Close() override;
+    bool closed() const override { return closed_; }
+    arrow::Result<int64_t> Tell() const override { return position_; }
+    arrow::Status Write(const void* data, int64_t nbytes) override;
+    arrow::Status Flush() override;
+
+private:
+    std::uintptr_t socket_;
+    bool closed_ = false;
+    int64_t position_ = 0;
+};
+#endif  // defined(_WIN32)
+
 // StdoutStream — thin OutputStream adapter for stdout
 class VGI_RPC_EXPORT StdoutStream : public arrow::io::OutputStream {
 public:

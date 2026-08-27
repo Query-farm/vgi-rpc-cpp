@@ -23,6 +23,14 @@
 #define NOMINMAX
 #define NOGDI
 #include <windows.h>
+// winsock2.h after windows.h is safe here because WIN32_LEAN_AND_MEAN
+// above already excludes windows.h's own legacy winsock.h. afunix.h
+// (Windows 10 SDK 17063+) declares AF_UNIX/sockaddr_un - genuine AF_UNIX,
+// the same one the canonical vgi_rpc Python launcher uses on Windows too
+// (see vgi-sqlite's launcher.h for the cross-SDK research this matches).
+#include <winsock2.h>
+
+#include <afunix.h>
 #else
 #include <unistd.h>
 #endif
@@ -232,6 +240,93 @@ arrow::Status FdOutputStream::Flush() {
     // redundant or an EINVAL.
     return arrow::Status::OK();
 }
+
+#if defined(_WIN32)
+// Clamped, looping Winsock primitives - the SOCKET-handle counterpart to
+// write_all_fd/read_full_fd above. A Windows SOCKET cannot be passed to
+// _write()/_read() (those want a CRT file descriptor, a different handle
+// namespace entirely) - send()/recv() are the real API, hence a separate
+// pair of helpers rather than branching write_all_fd/read_full_fd
+// themselves. send()/recv() take an `int` length on Windows, not
+// size_t/ssize_t - kMaxIoChunk (1 GiB) already fits comfortably under
+// INT_MAX so the existing clamp is reused unchanged.
+arrow::Status write_all_socket(std::uintptr_t socket_handle, const void* data, int64_t nbytes) {
+    const auto sock = static_cast<SOCKET>(socket_handle);
+    const auto* bytes = static_cast<const uint8_t*>(data);
+    int64_t written = 0;
+    while (written < nbytes) {
+        const int64_t chunk = std::min<int64_t>(nbytes - written, kMaxIoChunk);
+        auto n = ::send(sock, reinterpret_cast<const char*>(bytes + written), static_cast<int>(chunk), 0);
+        if (n == SOCKET_ERROR) {
+            const int err = ::WSAGetLastError();
+            if (err == WSAEINTR) continue;
+            return arrow::Status::IOError("Socket send failed (WSAGetLastError=", err, ")");
+        }
+        if (n == 0) return arrow::Status::IOError("Socket send made no progress");
+        written += n;
+    }
+    return arrow::Status::OK();
+}
+
+arrow::Result<int64_t> read_full_socket(std::uintptr_t socket_handle, void* out, int64_t nbytes) {
+    const auto sock = static_cast<SOCKET>(socket_handle);
+    auto* bytes = static_cast<uint8_t*>(out);
+    int64_t total = 0;
+    while (total < nbytes) {
+        const int64_t chunk = std::min<int64_t>(nbytes - total, kMaxIoChunk);
+        auto n = ::recv(sock, reinterpret_cast<char*>(bytes + total), static_cast<int>(chunk), 0);
+        if (n == SOCKET_ERROR) {
+            const int err = ::WSAGetLastError();
+            if (err == WSAEINTR) continue;
+            return arrow::Status::IOError("Socket recv failed (WSAGetLastError=", err, ")");
+        }
+        if (n == 0) break;  // EOF (peer closed)
+        total += n;
+    }
+    return total;
+}
+
+// SocketInputStream implementation
+arrow::Status SocketInputStream::Close() {
+    closed_ = true;
+    return arrow::Status::OK();
+}
+
+arrow::Result<int64_t> SocketInputStream::Read(int64_t nbytes, void* out) {
+    if (closed_) return arrow::Status::IOError("SocketInputStream is closed");
+    ARROW_ASSIGN_OR_RAISE(int64_t n, read_full_socket(socket_, out, nbytes));
+    position_ += n;
+    return n;
+}
+
+arrow::Result<std::shared_ptr<arrow::Buffer>> SocketInputStream::Read(int64_t nbytes) {
+    ARROW_ASSIGN_OR_RAISE(auto buf, arrow::AllocateResizableBuffer(nbytes));
+    ARROW_ASSIGN_OR_RAISE(int64_t n, Read(nbytes, buf->mutable_data()));
+    if (n < nbytes) {
+        RETURN_NOT_OK(buf->Resize(n, /*shrink_to_fit=*/false));
+    }
+    return std::shared_ptr<arrow::Buffer>(std::move(buf));
+}
+
+// SocketOutputStream implementation
+arrow::Status SocketOutputStream::Close() {
+    closed_ = true;
+    return arrow::Status::OK();
+}
+
+arrow::Status SocketOutputStream::Write(const void* data, int64_t nbytes) {
+    if (closed_) return arrow::Status::IOError("SocketOutputStream is closed");
+    RETURN_NOT_OK(write_all_socket(socket_, data, nbytes));
+    position_ += nbytes;
+    return arrow::Status::OK();
+}
+
+arrow::Status SocketOutputStream::Flush() {
+    // Same reasoning as FdOutputStream::Flush() - no userspace buffer to
+    // flush for a socket.
+    return arrow::Status::OK();
+}
+#endif  // defined(_WIN32)
 
 // StdoutStream implementation
 arrow::Status StdoutStream::Close() {
