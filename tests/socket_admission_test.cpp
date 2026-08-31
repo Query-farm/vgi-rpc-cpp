@@ -34,7 +34,7 @@ TEST_CASE("socket first-frame deadline is absolute across a slow byte stream",
           "[socket][admission]") {
     auto pair = socket_pair();
     DeadlineFdInputStream input(pair[0], std::chrono::steady_clock::now() + 80ms, 1s);
-    std::jthread writer([fd = pair[1]] {
+    std::thread writer([fd = pair[1]] {
         for (uint8_t value = 0; value < 4; ++value) {
             std::this_thread::sleep_for(30ms);
             (void)::send(fd, &value, 1, 0);

@@ -474,8 +474,7 @@ TEST_CASE("SOCKS5h sends unresolved target names to the proxy with partial I/O",
             std::array<uint8_t, 2> port{};
             recv_exact_test(client, port.data(), port.size());
             observed_port = static_cast<uint16_t>((port[0] << 8) | port[1]);
-            send_fragmented_test(client,
-                                 {0x05, 0x00, 0x00, 0x03, 3, 'f', 'o', 'o', 0x20, 0x00});
+            send_fragmented_test(client, {0x05, 0x00, 0x00, 0x03, 3, 'f', 'o', 'o', 0x20, 0x00});
         } catch (...) {
             server_error = std::current_exception();
         }
@@ -516,9 +515,9 @@ TEST_CASE("SOCKS5h rejects unsafe or non-A-label target names before dialing",
           "[client][transport][socks5h]") {
     SocketTransportOptions options;
     options.proxy = "socks5h://127.0.0.1:1";
-    REQUIRE_THROWS_AS(ClientTransport::connect_tcp(std::string("safe.example\0hidden", 19), 9400,
-                                                   options),
-                      std::invalid_argument);
+    REQUIRE_THROWS_AS(
+        ClientTransport::connect_tcp(std::string("safe.example\0hidden", 19), 9400, options),
+        std::invalid_argument);
     REQUIRE_THROWS_AS(ClientTransport::connect_tcp("caf\xc3\xa9.example", 9400, options),
                       std::invalid_argument);
     REQUIRE_THROWS_AS(ClientTransport::connect_tcp("bad label.example", 9400, options),

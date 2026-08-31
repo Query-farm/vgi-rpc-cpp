@@ -128,15 +128,18 @@ public:
         server_.Get("/localapi/v0/whois", std::move(handler));
         port_ = server_.bind_to_any_port("127.0.0.1");
         REQUIRE(port_ > 0);
-        thread_ = std::jthread([this] { server_.listen_after_bind(); });
+        thread_ = std::thread([this] { server_.listen_after_bind(); });
     }
-    ~TestHttpServer() { server_.stop(); }
+    ~TestHttpServer() {
+        server_.stop();
+        if (thread_.joinable()) thread_.join();
+    }
     std::string endpoint() const { return "http://127.0.0.1:" + std::to_string(port_); }
 
 private:
     httplib::Server server_;
     int port_ = 0;
-    std::jthread thread_;
+    std::thread thread_;
 };
 
 std::string whois_json(bool tagged = false) {
@@ -348,7 +351,7 @@ TEST_CASE("Tailscale LocalAPI supports direct Unix-socket WhoIs") {
     std::memcpy(address.sun_path, path.c_str(), path.size() + 1);
     REQUIRE(::bind(listener, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0);
     REQUIRE(::listen(listener, 1) == 0);
-    std::jthread server([&] {
+    std::thread server([&] {
         const int client = ::accept(listener, nullptr, nullptr);
         if (client < 0) return;
         std::array<char, 4096> request{};
@@ -369,6 +372,7 @@ TEST_CASE("Tailscale LocalAPI supports direct Unix-socket WhoIs") {
     REQUIRE(available.identities.front().subject_kind() == PeerSubjectKind::TAGGED_NODE);
     REQUIRE(available.identities.front().subject_key() ==
             std::optional<std::string>("node:n123CNTRL"));
+    server.join();
     ::close(listener);
     ::unlink(path.c_str());
 }

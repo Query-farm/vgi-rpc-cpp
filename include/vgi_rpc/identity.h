@@ -17,7 +17,13 @@
 namespace vgi_rpc {
 
 enum class PeerIdentityStatus {
-    OFF, NOT_APPLICABLE, AVAILABLE, UNAVAILABLE, PERMISSION_DENIED, NO_MATCH, INVALID,
+    OFF,
+    NOT_APPLICABLE,
+    AVAILABLE,
+    UNAVAILABLE,
+    PERMISSION_DENIED,
+    NO_MATCH,
+    INVALID,
     UNTRUSTED_PROXY,
 };
 enum class IdentityAssurance { CRYPTOGRAPHIC_PEER, LOCAL_DAEMON, CONFIGURED_PROXY };
@@ -143,8 +149,8 @@ VGI_RPC_EXPORT AuthContext observe_peer_identity(const PeerEvidenceSet&, const A
 VGI_RPC_EXPORT PeerAuthenticationPolicy require_peer_identity(std::string provider);
 VGI_RPC_EXPORT PeerAuthenticationPolicy peer_identity_primary(std::string provider);
 VGI_RPC_EXPORT PeerAuthenticationPolicy any_of_peer_identities(std::vector<std::string> providers);
-VGI_RPC_EXPORT PeerAuthenticationPolicy all_of_peer_identities(
-    std::vector<std::string> providers, PeerIdentityLinker linker,
-    std::optional<std::string> principal_provider = std::nullopt);
+VGI_RPC_EXPORT PeerAuthenticationPolicy
+all_of_peer_identities(std::vector<std::string> providers, PeerIdentityLinker linker,
+                       std::optional<std::string> principal_provider = std::nullopt);
 
 }  // namespace vgi_rpc

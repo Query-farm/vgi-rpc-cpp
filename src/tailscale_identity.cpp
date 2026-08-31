@@ -743,63 +743,62 @@ PeerIdentityProvider tailscale_localapi_identity_provider(TailscaleLocalAPIOptio
     if (options.endpoint.empty() && !options.password.empty())
         throw std::invalid_argument("LocalAPI password requires an explicit HTTP endpoint");
     const auto endpoint = make_endpoint(options);
-    return
-        [issuer = std::move(options.issuer), endpoint, timeout = options.timeout,
-         body_limit = options.max_response_bytes,
-         header_limit = options.max_response_header_bytes](const PeerResolutionContext& context) {
-            try {
-                context.validate();
-                const auto source = context.asserted_peer
-                                        ? context.asserted_peer
-                                        : (context.source_endpoint ? context.source_endpoint
-                                                                   : context.immediate_peer);
-                if (!source) return result(kProvider, PeerIdentityStatus::NOT_APPLICABLE);
-                if (source->size() > 4096 || !valid_utf8(*source) || has_control(*source))
-                    return result(kProvider, PeerIdentityStatus::INVALID);
-                std::string query = "addr=" + url_encode(*source) + "&proto=tcp";
-                nlohmann::json target = {{"kind", "node"}};
-                if (context.service_name) {
-                    static const std::regex service(
-                        R"(^svc:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$)");
-                    if (!std::regex_match(*context.service_name, service))
-                        return result(kProvider, PeerIdentityStatus::INVALID);
-                    query += "&svc_name=" + url_encode(*context.service_name);
-                    target = {{"kind", "service"}, {"value", *context.service_name}};
-                } else if (context.destination_address) {
-                    const auto destination = destination_ip(*context.destination_address);
-                    query += "&dst_ip=" + url_encode(destination);
-                    target = {{"kind", "destination_ip"}, {"value", destination}};
-                }
-                auto deadline = Clock::now() + timeout;
-                if (context.deadline != Clock::time_point{} && context.deadline < deadline)
-                    deadline = context.deadline;
-                if (deadline <= Clock::now())
-                    return result(kProvider, PeerIdentityStatus::UNAVAILABLE);
-                const auto response = request_whois(endpoint, "/localapi/v0/whois?" + query,
-                                                    deadline, header_limit, body_limit);
-                if (response.status == 401 || response.status == 403)
-                    return result(kProvider, PeerIdentityStatus::PERMISSION_DENIED);
-                if (response.status == 404) return result(kProvider, PeerIdentityStatus::NO_MATCH);
-                if (response.status >= 500 && response.status <= 599)
-                    return result(kProvider, PeerIdentityStatus::UNAVAILABLE);
-                if (response.status != 200) return result(kProvider, PeerIdentityStatus::INVALID);
-                const auto content_type = response.headers.find("content-type");
-                if (content_type == response.headers.end() || content_type->second.size() != 1)
-                    return result(kProvider, PeerIdentityStatus::INVALID);
-                auto media_type = lower_ascii(trim_ascii(content_type->second.front()));
-                if (const auto semicolon = media_type.find(';'); semicolon != std::string::npos)
-                    media_type = trim_ascii(media_type.substr(0, semicolon));
-                if (media_type != "application/json")
-                    return result(kProvider, PeerIdentityStatus::INVALID);
-                const auto payload = parse_bounded_json(response.body, body_limit);
-                return PeerIdentityResult::available(
-                    whois_identity(payload, issuer, context, *source, std::move(target)));
-            } catch (const Unavailable&) {
-                return result(kProvider, PeerIdentityStatus::UNAVAILABLE);
-            } catch (const std::exception&) {
+    return [issuer = std::move(options.issuer), endpoint, timeout = options.timeout,
+            body_limit = options.max_response_bytes,
+            header_limit =
+                options.max_response_header_bytes](const PeerResolutionContext& context) {
+        try {
+            context.validate();
+            const auto source =
+                context.asserted_peer
+                    ? context.asserted_peer
+                    : (context.source_endpoint ? context.source_endpoint : context.immediate_peer);
+            if (!source) return result(kProvider, PeerIdentityStatus::NOT_APPLICABLE);
+            if (source->size() > 4096 || !valid_utf8(*source) || has_control(*source))
                 return result(kProvider, PeerIdentityStatus::INVALID);
+            std::string query = "addr=" + url_encode(*source) + "&proto=tcp";
+            nlohmann::json target = {{"kind", "node"}};
+            if (context.service_name) {
+                static const std::regex service(
+                    R"(^svc:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$)");
+                if (!std::regex_match(*context.service_name, service))
+                    return result(kProvider, PeerIdentityStatus::INVALID);
+                query += "&svc_name=" + url_encode(*context.service_name);
+                target = {{"kind", "service"}, {"value", *context.service_name}};
+            } else if (context.destination_address) {
+                const auto destination = destination_ip(*context.destination_address);
+                query += "&dst_ip=" + url_encode(destination);
+                target = {{"kind", "destination_ip"}, {"value", destination}};
             }
-        };
+            auto deadline = Clock::now() + timeout;
+            if (context.deadline != Clock::time_point{} && context.deadline < deadline)
+                deadline = context.deadline;
+            if (deadline <= Clock::now()) return result(kProvider, PeerIdentityStatus::UNAVAILABLE);
+            const auto response = request_whois(endpoint, "/localapi/v0/whois?" + query, deadline,
+                                                header_limit, body_limit);
+            if (response.status == 401 || response.status == 403)
+                return result(kProvider, PeerIdentityStatus::PERMISSION_DENIED);
+            if (response.status == 404) return result(kProvider, PeerIdentityStatus::NO_MATCH);
+            if (response.status >= 500 && response.status <= 599)
+                return result(kProvider, PeerIdentityStatus::UNAVAILABLE);
+            if (response.status != 200) return result(kProvider, PeerIdentityStatus::INVALID);
+            const auto content_type = response.headers.find("content-type");
+            if (content_type == response.headers.end() || content_type->second.size() != 1)
+                return result(kProvider, PeerIdentityStatus::INVALID);
+            auto media_type = lower_ascii(trim_ascii(content_type->second.front()));
+            if (const auto semicolon = media_type.find(';'); semicolon != std::string::npos)
+                media_type = trim_ascii(media_type.substr(0, semicolon));
+            if (media_type != "application/json")
+                return result(kProvider, PeerIdentityStatus::INVALID);
+            const auto payload = parse_bounded_json(response.body, body_limit);
+            return PeerIdentityResult::available(
+                whois_identity(payload, issuer, context, *source, std::move(target)));
+        } catch (const Unavailable&) {
+            return result(kProvider, PeerIdentityStatus::UNAVAILABLE);
+        } catch (const std::exception&) {
+            return result(kProvider, PeerIdentityStatus::INVALID);
+        }
+    };
 }
 
 }  // namespace vgi_rpc

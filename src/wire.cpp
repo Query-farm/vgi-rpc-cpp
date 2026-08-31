@@ -256,7 +256,8 @@ arrow::Status write_all_socket(std::uintptr_t socket_handle, const void* data, i
     int64_t written = 0;
     while (written < nbytes) {
         const int64_t chunk = std::min<int64_t>(nbytes - written, kMaxIoChunk);
-        auto n = ::send(sock, reinterpret_cast<const char*>(bytes + written), static_cast<int>(chunk), 0);
+        auto n = ::send(sock, reinterpret_cast<const char*>(bytes + written),
+                        static_cast<int>(chunk), 0);
         if (n == SOCKET_ERROR) {
             const int err = ::WSAGetLastError();
             if (err == WSAEINTR) continue;

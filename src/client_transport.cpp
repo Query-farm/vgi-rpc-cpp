@@ -62,14 +62,14 @@ namespace {
 
 void validate_ascii_dns_name(const std::string& host) {
     if (host.empty() || host.size() > 253) {
-        throw std::invalid_argument("SOCKS5h target must be a non-empty DNS name of at most 253 bytes");
+        throw std::invalid_argument(
+            "SOCKS5h target must be a non-empty DNS name of at most 253 bytes");
     }
     size_t label_start = 0;
     for (size_t i = 0; i <= host.size(); ++i) {
         if (i != host.size() && host[i] != '.') {
             const auto byte = static_cast<unsigned char>(host[i]);
-            const bool ascii_alnum = (byte >= 'a' && byte <= 'z') ||
-                                     (byte >= 'A' && byte <= 'Z') ||
+            const bool ascii_alnum = (byte >= 'a' && byte <= 'z') || (byte >= 'A' && byte <= 'Z') ||
                                      (byte >= '0' && byte <= '9');
             if (!(ascii_alnum || byte == '-')) {
                 throw std::invalid_argument(
@@ -738,8 +738,8 @@ SOCKET connect_tcp_socket_win(const std::string& host, uint16_t port,
     const std::string service = std::to_string(port);
     const int resolve_error = ::getaddrinfo(host.c_str(), service.c_str(), &hints, &addresses);
     if (resolve_error != 0) {
-        throw std::runtime_error("cannot resolve TCP host '" + host + "' (getaddrinfo=" +
-                                 std::to_string(resolve_error) + ")");
+        throw std::runtime_error("cannot resolve TCP host '" + host +
+                                 "' (getaddrinfo=" + std::to_string(resolve_error) + ")");
     }
     SOCKET sock = INVALID_SOCKET;
     int last_error = 0;
@@ -872,8 +872,10 @@ SOCKET connect_socks5h_socket_win(const std::string& target_host, uint16_t targe
                                      std::to_string(reply[1]) + ")");
         }
         size_t address_size = 0;
-        if (reply[3] == 1) address_size = 4;
-        else if (reply[3] == 4) address_size = 16;
+        if (reply[3] == 1)
+            address_size = 4;
+        else if (reply[3] == 4)
+            address_size = 16;
         else if (reply[3] == 3) {
             uint8_t length = 0;
             read_exact_win(sock, &length, 1, deadline);
@@ -1374,8 +1376,9 @@ ClientTransport ClientTransport::connect_pipe(const std::string& pipe_name,
 ClientTransport ClientTransport::connect_tcp(const std::string& host, uint16_t port,
                                              const SocketTransportOptions& options) {
 #ifdef _WIN32
-    auto sock = std::make_shared<SOCKET>(options.proxy ? connect_socks5h_socket_win(host, port, options)
-                                                       : connect_tcp_socket_win(host, port, options));
+    auto sock =
+        std::make_shared<SOCKET>(options.proxy ? connect_socks5h_socket_win(host, port, options)
+                                               : connect_tcp_socket_win(host, port, options));
     auto input = std::make_shared<SocketInputStream>(static_cast<std::uintptr_t>(*sock));
     auto output = std::make_shared<SocketOutputStream>(static_cast<std::uintptr_t>(*sock));
     return ClientTransport(std::make_unique<Impl>(input, output, [sock]() {
