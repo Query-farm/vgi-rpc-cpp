@@ -432,7 +432,9 @@ void run_http_client(int argc, char** argv) {
                    "--expect-proxy"});
     const auto spoof_login = options.require("--spoof-login");
     auto builder = HttpClient::builder(options.require("--url"));
-    builder.protocol_version("2.0.0").header("Tailscale-User-Login", spoof_login);
+    builder.prefix("")
+        .protocol_version("2.0.0")
+        .header("Tailscale-User-Login", spoof_login);
     auto client = builder.build();
     const auto expected = client_expectation(options, "http");
     const auto request = AnnotatedBatch::data(empty_batch());
