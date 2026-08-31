@@ -23,6 +23,7 @@ find_package(nlohmann_json CONFIG REQUIRED)
 find_package(httplib CONFIG REQUIRED)
 find_package(zstd CONFIG REQUIRED)
 find_package(ZLIB REQUIRED)
+find_package(OpenSSL REQUIRED COMPONENTS Crypto)
 # libsodium supplies every primitive the wire needs: XChaCha20-Poly1305 (the
 # 24-byte-nonce AEAD the token envelopes use, which OpenSSL does not ship),
 # SHA-256, HMAC-SHA256, a CSPRNG and a constant-time compare. Audited code in
@@ -47,6 +48,10 @@ if(VGI_RPC_WITH_GCS)
 endif()
 
 add_library(vgi_rpc
+    src/identity.cpp
+    src/tailscale_identity.cpp
+    src/spiffe_proxy_identity.cpp
+    src/proxy_protocol_v2.cpp
     src/crypto.cpp
     src/errors.cpp
     src/external.cpp
@@ -126,6 +131,7 @@ target_link_libraries(vgi_rpc PUBLIC
 # PRIVATE: libsodium is entirely behind `vgi_rpc::crypto`, so a consumer sees
 # no sodium header and links no sodium symbol of its own.
 target_link_libraries(vgi_rpc PRIVATE unofficial-sodium::sodium)
+target_link_libraries(vgi_rpc PRIVATE OpenSSL::Crypto)
 target_link_libraries(vgi_rpc PRIVATE zstd::libzstd)
 # Gzip is a mandatory HTTP wire codec. cpp-httplib uses zlib to stream
 # request decompression into our decoded-byte cap, and http_transport.cpp uses

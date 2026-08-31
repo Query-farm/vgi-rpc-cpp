@@ -16,15 +16,19 @@
 #include <arrow/io/memory.h>
 #include <arrow/type.h>
 
-#include <chrono>
+#include <array>
 #include <atomic>
+#include <chrono>
 #include <cstring>
 #include <exception>
 #include <memory>
 #include <string>
 #include <thread>
+#include <vector>
 
 #ifndef _WIN32
+#include <arpa/inet.h>
+#include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
 #endif
@@ -125,6 +129,26 @@ public:
 private:
     std::shared_ptr<SocketOwner> owner_;
 };
+
+void recv_exact_test(int fd, void* data, size_t size) {
+    auto* bytes = static_cast<uint8_t*>(data);
+    size_t offset = 0;
+    while (offset < size) {
+        const ssize_t received = ::recv(fd, bytes + offset, size - offset, 0);
+        if (received <= 0)
+            throw std::runtime_error("fake SOCKS proxy received a truncated request");
+        offset += static_cast<size_t>(received);
+    }
+}
+
+void send_fragmented_test(int fd, const std::vector<uint8_t>& bytes) {
+    for (uint8_t byte : bytes) {
+        if (::send(fd, &byte, 1, 0) != 1) {
+            throw std::runtime_error("fake SOCKS proxy could not send reply");
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+}
 #endif
 
 int64_t value_of(const AnnotatedBatch& response) {
@@ -407,5 +431,126 @@ TEST_CASE("socket transport rejects a non-positive connect deadline", "[client][
     options.connect_timeout = std::chrono::milliseconds::zero();
     REQUIRE_THROWS_AS(ClientTransport::connect_unix("/vgi-rpc-does-not-exist", options),
                       std::invalid_argument);
+}
+
+TEST_CASE("SOCKS5h sends unresolved target names to the proxy with partial I/O",
+          "[client][transport][socks5h]") {
+    int listener = ::socket(AF_INET, SOCK_STREAM, 0);
+    REQUIRE(listener >= 0);
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port = 0;
+    REQUIRE(::bind(listener, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0);
+    REQUIRE(::listen(listener, 1) == 0);
+    socklen_t address_size = sizeof(address);
+    REQUIRE(::getsockname(listener, reinterpret_cast<sockaddr*>(&address), &address_size) == 0);
+    const uint16_t proxy_port = ntohs(address.sin_port);
+
+    std::string observed_host;
+    uint16_t observed_port = 0;
+    std::exception_ptr server_error;
+    std::thread proxy([&] {
+        int client = -1;
+        try {
+            client = ::accept(listener, nullptr, nullptr);
+            if (client < 0) throw std::runtime_error("fake SOCKS proxy accept failed");
+            std::array<uint8_t, 3> greeting{};
+            recv_exact_test(client, greeting.data(), greeting.size());
+            if (greeting != std::array<uint8_t, 3>{0x05, 0x01, 0x00}) {
+                throw std::runtime_error("unexpected SOCKS greeting");
+            }
+            send_fragmented_test(client, {0x05, 0x00});
+
+            std::array<uint8_t, 5> request{};
+            recv_exact_test(client, request.data(), request.size());
+            if (request[0] != 0x05 || request[1] != 0x01 || request[2] != 0x00 ||
+                request[3] != 0x03) {
+                throw std::runtime_error("target was not encoded as a SOCKS domain name");
+            }
+            std::vector<uint8_t> hostname(request[4]);
+            recv_exact_test(client, hostname.data(), hostname.size());
+            observed_host.assign(hostname.begin(), hostname.end());
+            std::array<uint8_t, 2> port{};
+            recv_exact_test(client, port.data(), port.size());
+            observed_port = static_cast<uint16_t>((port[0] << 8) | port[1]);
+            send_fragmented_test(client,
+                                 {0x05, 0x00, 0x00, 0x03, 3, 'f', 'o', 'o', 0x20, 0x00});
+        } catch (...) {
+            server_error = std::current_exception();
+        }
+        if (client >= 0) (void)::close(client);
+    });
+
+    SocketTransportOptions options;
+    options.connect_timeout = std::chrono::seconds(2);
+    options.proxy = "socks5h://127.0.0.1:" + std::to_string(proxy_port);
+    try {
+        auto transport = ClientTransport::connect_tcp("must-not-resolve.invalid", 9400, options);
+        transport.close();
+    } catch (...) {
+        (void)::shutdown(listener, SHUT_RDWR);
+        (void)::close(listener);
+        proxy.join();
+        throw;
+    }
+    proxy.join();
+    (void)::close(listener);
+    if (server_error) std::rethrow_exception(server_error);
+    REQUIRE(observed_host == "must-not-resolve.invalid");
+    REQUIRE(observed_port == 9400);
+}
+
+TEST_CASE("SOCKS5h rejects userinfo and never attempts a direct fallback",
+          "[client][transport][socks5h]") {
+    SocketTransportOptions options;
+    options.proxy = "socks5h://user@127.0.0.1:1080";
+    REQUIRE_THROWS_AS(ClientTransport::connect_tcp("127.0.0.1", 9400, options),
+                      std::invalid_argument);
+
+    options.proxy = "socks5h://127.0.0.1:1";
+    REQUIRE_THROWS(ClientTransport::connect_tcp("127.0.0.1", 9400, options));
+}
+
+TEST_CASE("SOCKS5h rejects unsafe or non-A-label target names before dialing",
+          "[client][transport][socks5h]") {
+    SocketTransportOptions options;
+    options.proxy = "socks5h://127.0.0.1:1";
+    REQUIRE_THROWS_AS(ClientTransport::connect_tcp(std::string("safe.example\0hidden", 19), 9400,
+                                                   options),
+                      std::invalid_argument);
+    REQUIRE_THROWS_AS(ClientTransport::connect_tcp("caf\xc3\xa9.example", 9400, options),
+                      std::invalid_argument);
+    REQUIRE_THROWS_AS(ClientTransport::connect_tcp("bad label.example", 9400, options),
+                      std::invalid_argument);
+}
+
+TEST_CASE("SOCKS5h uses one deadline while waiting for proxy negotiation",
+          "[client][transport][socks5h]") {
+    int listener = ::socket(AF_INET, SOCK_STREAM, 0);
+    REQUIRE(listener >= 0);
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    REQUIRE(::bind(listener, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0);
+    REQUIRE(::listen(listener, 1) == 0);
+    socklen_t address_size = sizeof(address);
+    REQUIRE(::getsockname(listener, reinterpret_cast<sockaddr*>(&address), &address_size) == 0);
+
+    std::thread proxy([&] {
+        const int client = ::accept(listener, nullptr, nullptr);
+        if (client >= 0) {
+            std::array<uint8_t, 3> greeting{};
+            recv_exact_test(client, greeting.data(), greeting.size());
+            std::this_thread::sleep_for(std::chrono::milliseconds(150));
+            (void)::close(client);
+        }
+    });
+    SocketTransportOptions options;
+    options.connect_timeout = std::chrono::milliseconds(40);
+    options.proxy = "socks5h://127.0.0.1:" + std::to_string(ntohs(address.sin_port));
+    REQUIRE_THROWS(ClientTransport::connect_tcp("target.example", 9400, options));
+    proxy.join();
+    (void)::close(listener);
 }
 #endif

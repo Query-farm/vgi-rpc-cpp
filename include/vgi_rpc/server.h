@@ -17,6 +17,7 @@
 #include "vgi_rpc/call_context.h"
 #include "vgi_rpc/export.h"
 #include "vgi_rpc/http_config.h"
+#include "vgi_rpc/proxy_protocol_v2.h"
 #include "vgi_rpc/request.h"
 #include "vgi_rpc/result.h"
 #include "vgi_rpc/shm.h"
@@ -164,6 +165,10 @@ public:
     // auth or TLS — trusted networks only.
     void serve_tcp(const std::string& host, int port);
 
+    // Raw TCP behind a trusted PROXY v2 sender. The original overload remains
+    // unchanged and consumes VGI framing immediately.
+    void serve_tcp(const std::string& host, int port, const TcpServerOptions& options);
+
     const std::string& server_id() const noexcept { return server_id_; }
     const std::string& protocol_name() const noexcept { return protocol_name_; }
     const std::unordered_map<std::string, MethodInfo>& methods() const noexcept { return methods_; }
@@ -188,6 +193,15 @@ public:
     bool serve_one(const std::shared_ptr<arrow::io::InputStream>& input,
                    const std::shared_ptr<arrow::io::OutputStream>& output,
                    TransportKind transport_kind);
+
+    // Identity-aware overload for custom connection transports (for example
+    // Iroh or a trusted proxy adapter). The adapter resolves/authenticates the
+    // peer once and supplies the immutable connection snapshot here; every
+    // handler and stream turn then observes the same values.
+    bool serve_one(const std::shared_ptr<arrow::io::InputStream>& input,
+                   const std::shared_ptr<arrow::io::OutputStream>& output,
+                   TransportKind transport_kind, const AuthContext& auth,
+                   const PeerEvidenceSet& peer_evidence);
 
     // Notify the lifecycle hook for a transport.  Public for custom transport
     // adapters; normal users call one of the serve_* entry points instead.
@@ -217,7 +231,8 @@ private:
     void serve_unary(const MethodInfo& method_info, const Request& request,
                      const std::string& request_id,
                      const std::shared_ptr<arrow::io::OutputStream>& output,
-                     TransportKind transport_kind, const std::shared_ptr<ShmSegment>& call_shm);
+                     TransportKind transport_kind, const std::shared_ptr<ShmSegment>& call_shm,
+                     const AuthContext& auth, const PeerEvidenceSet& peer_evidence);
 
     bool serve_unary_impl(const MethodInfo& method_info, const Request& request,
                           const std::string& request_id,
@@ -228,13 +243,23 @@ private:
                       const std::string& request_id,
                       const std::shared_ptr<arrow::io::InputStream>& input,
                       const std::shared_ptr<arrow::io::OutputStream>& output,
-                      TransportKind transport_kind, ConnectionState& connection);
+                      TransportKind transport_kind, ConnectionState& connection,
+                      const AuthContext& auth, const PeerEvidenceSet& peer_evidence);
 
     bool serve_one_with_state(const std::shared_ptr<arrow::io::InputStream>& input,
                               const std::shared_ptr<arrow::io::OutputStream>& output,
-                              TransportKind transport_kind, ConnectionState& connection);
+                              TransportKind transport_kind, ConnectionState& connection,
+                              const AuthContext& auth = AuthContext::anonymous(),
+                              const PeerEvidenceSet& peer_evidence = PeerEvidenceSet(),
+                              std::function<void()> first_frame_complete = {});
 
-    void serve_socket_fd(int fd, TransportKind transport_kind);
+    void serve_socket_fd(
+        int fd, TransportKind transport_kind, const AuthContext& auth = AuthContext::anonymous(),
+        const PeerEvidenceSet& peer_evidence = PeerEvidenceSet(),
+        std::chrono::steady_clock::time_point first_frame_deadline =
+            std::chrono::steady_clock::time_point::max(),
+        std::chrono::milliseconds idle_read_timeout = std::chrono::milliseconds::max(),
+        std::chrono::milliseconds write_timeout = std::chrono::milliseconds::max());
 
     // Attach (or reuse) the peer-owned segment this request advertises.
     // Cached per connection because a segment is process-level, not per-call.

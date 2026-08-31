@@ -161,15 +161,26 @@ bool Server::serve_one(const std::shared_ptr<arrow::io::InputStream>& input,
 bool Server::serve_one(const std::shared_ptr<arrow::io::InputStream>& input,
                        const std::shared_ptr<arrow::io::OutputStream>& output,
                        TransportKind transport_kind) {
-    return serve_one_with_state(input, output, transport_kind, default_connection_state_);
+    return serve_one(input, output, transport_kind, AuthContext::anonymous(), PeerEvidenceSet());
+}
+
+bool Server::serve_one(const std::shared_ptr<arrow::io::InputStream>& input,
+                       const std::shared_ptr<arrow::io::OutputStream>& output,
+                       TransportKind transport_kind, const AuthContext& auth,
+                       const PeerEvidenceSet& peer_evidence) {
+    return serve_one_with_state(input, output, transport_kind, default_connection_state_, auth,
+                                peer_evidence);
 }
 
 bool Server::serve_one_with_state(const std::shared_ptr<arrow::io::InputStream>& input,
                                   const std::shared_ptr<arrow::io::OutputStream>& output,
-                                  TransportKind transport_kind, ConnectionState& connection) {
+                                  TransportKind transport_kind, ConnectionState& connection,
+                                  const AuthContext& auth, const PeerEvidenceSet& peer_evidence,
+                                  std::function<void()> first_frame_complete) {
     notify_serve_start(transport_kind);
     // 1. Read request IPC stream
     auto contents_opt = read_ipc_stream(input);
+    if (contents_opt && first_frame_complete) first_frame_complete();
     if (!contents_opt || contents_opt->batches.empty()) {
         return false;  // Clean EOF — no more requests
     }
@@ -299,9 +310,11 @@ bool Server::serve_one_with_state(const std::shared_ptr<arrow::io::InputStream>&
     Request request(batch, custom_metadata);
 
     if (method_info.method_type == MethodType::UNARY) {
-        serve_unary(method_info, request, request_id, output, transport_kind, connection.call_shm);
+        serve_unary(method_info, request, request_id, output, transport_kind, connection.call_shm,
+                    auth, peer_evidence);
     } else {
-        serve_stream(method_info, request, request_id, input, output, transport_kind, connection);
+        serve_stream(method_info, request, request_id, input, output, transport_kind, connection,
+                     auth, peer_evidence);
     }
 
     // The region is dead once the handler has read its columns out.
@@ -390,10 +403,11 @@ bool Server::serve_unary_impl(const MethodInfo& method_info, const Request& requ
 void Server::serve_unary(const MethodInfo& method_info, const Request& request,
                          const std::string& request_id,
                          const std::shared_ptr<arrow::io::OutputStream>& output,
-                         TransportKind transport_kind,
-                         const std::shared_ptr<ShmSegment>& call_shm) {
+                         TransportKind transport_kind, const std::shared_ptr<ShmSegment>& call_shm,
+                         const AuthContext& auth, const PeerEvidenceSet& peer_evidence) {
     auto log_sink = std::make_shared<LogSink>(server_id_, request_id);
     CallContext ctx(log_sink, server_id_, request_id, transport_kind);
+    ctx.set_identity(auth, peer_evidence);
     serve_unary_impl(method_info, request, request_id, output, ctx, call_shm);
 }
 
@@ -401,10 +415,12 @@ void Server::serve_stream(const MethodInfo& method_info, const Request& request,
                           const std::string& request_id,
                           const std::shared_ptr<arrow::io::InputStream>& input,
                           const std::shared_ptr<arrow::io::OutputStream>& output,
-                          TransportKind transport_kind, ConnectionState& connection) {
+                          TransportKind transport_kind, ConnectionState& connection,
+                          const AuthContext& auth, const PeerEvidenceSet& peer_evidence) {
     auto t0 = std::chrono::steady_clock::now();
     auto log_sink = std::make_shared<LogSink>(server_id_, request_id);
     CallContext ctx(log_sink, server_id_, request_id, transport_kind);
+    ctx.set_identity(auth, peer_evidence);
 
     // Access-log state for the (single) record emitted at the normal end of the
     // stream.  Factory-init failures return early and are not logged.
@@ -528,6 +544,7 @@ void Server::serve_stream(const MethodInfo& method_info, const Request& request,
                 batch_with_md.custom_metadata->FindKey(keys::CANCEL) >= 0) {
                 cancelled_flag = true;
                 CallContext cancel_ctx(log_sink, server_id_, request_id, transport_kind);
+                cancel_ctx.set_identity(auth, peer_evidence);
                 try {
                     state->on_cancel(cancel_ctx);
                 } catch (const std::exception& e) {
@@ -563,6 +580,7 @@ void Server::serve_stream(const MethodInfo& method_info, const Request& request,
 
             OutputCollector out(output_schema, is_producer, server_id_, request_id);
             CallContext stream_ctx(log_sink, server_id_, request_id, transport_kind);
+            stream_ctx.set_identity(auth, peer_evidence);
 
             state->process(input_ab, out, stream_ctx);
 

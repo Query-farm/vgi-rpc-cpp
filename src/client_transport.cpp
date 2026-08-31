@@ -8,6 +8,7 @@
 #include <arrow/status.h>
 
 #include <algorithm>
+#include <array>
 #include <cerrno>
 #include <chrono>
 #include <cstring>
@@ -19,6 +20,7 @@
 #include <utility>
 
 #ifndef _WIN32
+#include <arpa/inet.h>
 #include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
@@ -47,6 +49,7 @@ extern char** environ;
 // (genuine AF_UNIX, matching the canonical vgi_rpc Python launcher's
 // behavior on Windows - see vgi-sqlite's launcher.h for the research).
 #include <winsock2.h>
+#include <ws2tcpip.h>
 
 #include <afunix.h>
 #include <fcntl.h>
@@ -56,6 +59,40 @@ extern char** environ;
 namespace vgi_rpc {
 
 namespace {
+
+void validate_ascii_dns_name(const std::string& host) {
+    if (host.empty() || host.size() > 253) {
+        throw std::invalid_argument("SOCKS5h target must be a non-empty DNS name of at most 253 bytes");
+    }
+    size_t label_start = 0;
+    for (size_t i = 0; i <= host.size(); ++i) {
+        if (i != host.size() && host[i] != '.') {
+            const auto byte = static_cast<unsigned char>(host[i]);
+            const bool ascii_alnum = (byte >= 'a' && byte <= 'z') ||
+                                     (byte >= 'A' && byte <= 'Z') ||
+                                     (byte >= '0' && byte <= '9');
+            if (!(ascii_alnum || byte == '-')) {
+                throw std::invalid_argument(
+                    "SOCKS5h target must be an ASCII DNS A-label; encode Unicode with IDNA first");
+            }
+            continue;
+        }
+        const size_t label_size = i - label_start;
+        if (label_size == 0 || label_size > 63 || host[label_start] == '-' || host[i - 1] == '-') {
+            throw std::invalid_argument("SOCKS5h target contains an invalid DNS label");
+        }
+        label_start = i + 1;
+    }
+}
+
+void validate_socks_target_text(const std::string& host) {
+    if (host.empty()) throw std::invalid_argument("TCP host must not be empty");
+    for (unsigned char byte : host) {
+        if (byte < 0x20 || byte == 0x7f) {
+            throw std::invalid_argument("SOCKS5h target contains a control character");
+        }
+    }
+}
 
 void require_ok(const arrow::Status& status, const char* operation) {
     if (!status.ok()) throw std::runtime_error(std::string(operation) + ": " + status.ToString());
@@ -207,6 +244,15 @@ bool connect_with_timeout(int fd, const sockaddr* address, socklen_t address_len
 
 int connect_tcp_fd(const std::string& host, uint16_t port, const SocketTransportOptions& options) {
     if (host.empty()) throw std::invalid_argument("TCP host must not be empty");
+    if (options.connect_timeout && *options.connect_timeout <= std::chrono::milliseconds::zero()) {
+        throw std::invalid_argument("socket connect timeout must be positive");
+    }
+    const auto deadline =
+        options.connect_timeout
+            ? std::optional<
+                  std::chrono::steady_clock::time_point>{std::chrono::steady_clock::now() +
+                                                         *options.connect_timeout}
+            : std::nullopt;
 
     addrinfo hints{};
     hints.ai_family = AF_UNSPEC;
@@ -223,12 +269,22 @@ int connect_tcp_fd(const std::string& host, uint16_t port, const SocketTransport
     int fd = -1;
     int last_error = 0;
     for (const addrinfo* address = addresses; address; address = address->ai_next) {
+        std::optional<std::chrono::milliseconds> attempt_timeout;
+        if (deadline) {
+            const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+                *deadline - std::chrono::steady_clock::now());
+            if (remaining <= std::chrono::milliseconds::zero()) {
+                last_error = ETIMEDOUT;
+                break;
+            }
+            attempt_timeout = std::max(remaining, std::chrono::milliseconds{1});
+        }
         fd = ::socket(address->ai_family, address->ai_socktype, address->ai_protocol);
         if (fd < 0) {
             last_error = errno;
             continue;
         }
-        if (connect_with_timeout(fd, address->ai_addr, address->ai_addrlen, options.connect_timeout,
+        if (connect_with_timeout(fd, address->ai_addr, address->ai_addrlen, attempt_timeout,
                                  &last_error)) {
             break;
         }
@@ -251,6 +307,226 @@ int connect_tcp_fd(const std::string& host, uint16_t port, const SocketTransport
     const int one = 1;
     (void)::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
     return fd;
+}
+
+struct SocksProxyEndpoint {
+    std::string host;
+    uint16_t port;
+};
+
+SocksProxyEndpoint parse_socks5h_proxy(const std::string& uri) {
+    constexpr const char* scheme = "socks5h://";
+    if (uri.rfind(scheme, 0) != 0) {
+        throw std::invalid_argument("TCP proxy must use socks5h://");
+    }
+    const std::string authority = uri.substr(std::strlen(scheme));
+    if (authority.empty() || authority.find_first_of("/?#") != std::string::npos) {
+        throw std::invalid_argument("SOCKS5h proxy URI must contain only host and port");
+    }
+    if (authority.find('@') != std::string::npos) {
+        throw std::invalid_argument("SOCKS5h proxy credentials are not supported");
+    }
+
+    std::string host;
+    std::string port_text;
+    if (authority.front() == '[') {
+        const size_t closing = authority.find(']');
+        if (closing == std::string::npos || closing == 1 || closing + 1 >= authority.size() ||
+            authority[closing + 1] != ':') {
+            throw std::invalid_argument("invalid bracketed IPv6 SOCKS5h proxy URI");
+        }
+        host = authority.substr(1, closing - 1);
+        port_text = authority.substr(closing + 2);
+    } else {
+        const size_t colon = authority.rfind(':');
+        if (colon == std::string::npos || colon == 0 || authority.find(':') != colon) {
+            throw std::invalid_argument("SOCKS5h proxy URI must be socks5h://host:port");
+        }
+        host = authority.substr(0, colon);
+        port_text = authority.substr(colon + 1);
+    }
+    size_t consumed = 0;
+    unsigned long parsed = 0;
+    try {
+        parsed = std::stoul(port_text, &consumed, 10);
+    } catch (const std::exception&) {
+        throw std::invalid_argument("SOCKS5h proxy port must be numeric");
+    }
+    if (consumed != port_text.size() || parsed == 0 || parsed > 65535) {
+        throw std::invalid_argument("SOCKS5h proxy port is out of range");
+    }
+    return {std::move(host), static_cast<uint16_t>(parsed)};
+}
+
+using OptionalDeadline = std::optional<std::chrono::steady_clock::time_point>;
+
+std::optional<std::chrono::milliseconds> remaining_timeout(const OptionalDeadline& deadline) {
+    if (!deadline) return std::nullopt;
+    const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+        *deadline - std::chrono::steady_clock::now());
+    if (remaining <= std::chrono::milliseconds::zero()) {
+        throw std::runtime_error("SOCKS5h connection timed out");
+    }
+    return std::max(remaining, std::chrono::milliseconds{1});
+}
+
+void wait_socket(int fd, short events, const OptionalDeadline& deadline) {
+    for (;;) {
+        int timeout_ms = -1;
+        if (deadline) {
+            const auto remaining = remaining_timeout(deadline);
+            timeout_ms = static_cast<int>(
+                std::min<int64_t>(remaining->count(), std::numeric_limits<int>::max()));
+        }
+        pollfd descriptor{fd, events, 0};
+        const int result = ::poll(&descriptor, 1, timeout_ms);
+        if (result < 0 && errno == EINTR) continue;
+        if (result == 0) throw std::runtime_error("SOCKS5h connection timed out");
+        if (result < 0) {
+            throw std::runtime_error(std::string("SOCKS5h socket wait failed: ") +
+                                     std::strerror(errno));
+        }
+        if ((descriptor.revents & events) != 0) return;
+        if ((descriptor.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
+            int socket_error = 0;
+            socklen_t error_size = sizeof(socket_error);
+            (void)::getsockopt(fd, SOL_SOCKET, SO_ERROR, &socket_error, &error_size);
+            throw std::runtime_error(std::string("SOCKS5h socket closed: ") +
+                                     std::strerror(socket_error != 0 ? socket_error : ECONNRESET));
+        }
+    }
+}
+
+void write_all(int fd, const uint8_t* bytes, size_t size, const OptionalDeadline& deadline) {
+    size_t offset = 0;
+    while (offset < size) {
+        wait_socket(fd, POLLOUT, deadline);
+#ifdef MSG_NOSIGNAL
+        const ssize_t written = ::send(fd, bytes + offset, size - offset, MSG_NOSIGNAL);
+#else
+        const ssize_t written = ::send(fd, bytes + offset, size - offset, 0);
+#endif
+        if (written > 0) {
+            offset += static_cast<size_t>(written);
+        } else if (written < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) {
+            continue;
+        } else {
+            throw std::runtime_error(std::string("SOCKS5h write failed: ") +
+                                     std::strerror(written == 0 ? EPIPE : errno));
+        }
+    }
+}
+
+void read_exact(int fd, uint8_t* bytes, size_t size, const OptionalDeadline& deadline) {
+    size_t offset = 0;
+    while (offset < size) {
+        wait_socket(fd, POLLIN, deadline);
+        const ssize_t received = ::recv(fd, bytes + offset, size - offset, 0);
+        if (received > 0) {
+            offset += static_cast<size_t>(received);
+        } else if (received < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) {
+            continue;
+        } else {
+            throw std::runtime_error(std::string("SOCKS5h reply was truncated: ") +
+                                     std::strerror(received == 0 ? ECONNRESET : errno));
+        }
+    }
+}
+
+int connect_socks5h_fd(const std::string& target_host, uint16_t target_port,
+                       const SocketTransportOptions& options) {
+    if (!options.proxy) throw std::invalid_argument("SOCKS5h proxy URI is required");
+    validate_socks_target_text(target_host);
+    if (target_port == 0) throw std::invalid_argument("TCP port must not be zero");
+    std::array<uint8_t, 16> validated_address{};
+    if (::inet_pton(AF_INET, target_host.c_str(), validated_address.data()) != 1 &&
+        ::inet_pton(AF_INET6, target_host.c_str(), validated_address.data()) != 1) {
+        validate_ascii_dns_name(target_host);
+    }
+    if (options.connect_timeout && *options.connect_timeout <= std::chrono::milliseconds::zero()) {
+        throw std::invalid_argument("socket connect timeout must be positive");
+    }
+    const OptionalDeadline deadline =
+        options.connect_timeout
+            ? OptionalDeadline{std::chrono::steady_clock::now() + *options.connect_timeout}
+            : std::nullopt;
+    const auto proxy = parse_socks5h_proxy(*options.proxy);
+
+    // Resolve only the configured proxy. The target hostname is deliberately
+    // encoded verbatim in the SOCKS request and never passed to getaddrinfo.
+    SocketTransportOptions proxy_options = options;
+    proxy_options.proxy.reset();
+    proxy_options.connect_timeout = remaining_timeout(deadline);
+    int fd = connect_tcp_fd(proxy.host, proxy.port, proxy_options);
+    try {
+        const int original_flags = ::fcntl(fd, F_GETFL);
+        if (original_flags < 0 || ::fcntl(fd, F_SETFL, original_flags | O_NONBLOCK) < 0) {
+            throw std::runtime_error(std::string("cannot make SOCKS5h socket nonblocking: ") +
+                                     std::strerror(errno));
+        }
+
+        const std::array<uint8_t, 3> greeting{0x05, 0x01, 0x00};
+        write_all(fd, greeting.data(), greeting.size(), deadline);
+        std::array<uint8_t, 2> greeting_reply{};
+        read_exact(fd, greeting_reply.data(), greeting_reply.size(), deadline);
+        if (greeting_reply[0] != 0x05 || greeting_reply[1] != 0x00) {
+            throw std::runtime_error("SOCKS5h proxy did not accept NO AUTH");
+        }
+
+        std::vector<uint8_t> request{0x05, 0x01, 0x00};
+        std::array<uint8_t, 16> address{};
+        if (::inet_pton(AF_INET, target_host.c_str(), address.data()) == 1) {
+            request.push_back(0x01);
+            request.insert(request.end(), address.begin(), address.begin() + 4);
+        } else if (::inet_pton(AF_INET6, target_host.c_str(), address.data()) == 1) {
+            request.push_back(0x04);
+            request.insert(request.end(), address.begin(), address.end());
+        } else {
+            validate_ascii_dns_name(target_host);
+            request.push_back(0x03);
+            request.push_back(static_cast<uint8_t>(target_host.size()));
+            request.insert(request.end(), target_host.begin(), target_host.end());
+        }
+        request.push_back(static_cast<uint8_t>(target_port >> 8));
+        request.push_back(static_cast<uint8_t>(target_port & 0xff));
+        write_all(fd, request.data(), request.size(), deadline);
+
+        std::array<uint8_t, 4> reply{};
+        read_exact(fd, reply.data(), reply.size(), deadline);
+        if (reply[0] != 0x05 || reply[2] != 0x00) {
+            throw std::runtime_error("malformed SOCKS5h connect reply");
+        }
+        if (reply[1] != 0x00) {
+            throw std::runtime_error("SOCKS5h proxy rejected target (reply " +
+                                     std::to_string(reply[1]) + ")");
+        }
+        size_t address_length = 0;
+        if (reply[3] == 0x01) {
+            address_length = 4;
+        } else if (reply[3] == 0x04) {
+            address_length = 16;
+        } else if (reply[3] == 0x03) {
+            uint8_t length = 0;
+            read_exact(fd, &length, 1, deadline);
+            address_length = length;
+        } else {
+            throw std::runtime_error("SOCKS5h reply used an unknown address type");
+        }
+        std::vector<uint8_t> reply_tail(address_length + 2);
+        read_exact(fd, reply_tail.data(), reply_tail.size(), deadline);
+        if (::fcntl(fd, F_SETFL, original_flags) < 0) {
+            throw std::runtime_error(std::string("cannot restore SOCKS5h socket flags: ") +
+                                     std::strerror(errno));
+        }
+        set_socket_timeout(fd, SO_RCVTIMEO, options.read_timeout);
+        set_socket_timeout(fd, SO_SNDTIMEO, options.write_timeout);
+        const int one = 1;
+        (void)::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+        return fd;
+    } catch (...) {
+        close_fd(fd);
+        throw;
+    }
 }
 
 int connect_unix_fd(const std::string& path, const SocketTransportOptions& options) {
@@ -368,16 +644,251 @@ void ensure_winsock_initialized() {
 // The Windows counterpart to set_socket_timeout (POSIX branch, above) -
 // SO_RCVTIMEO/SO_SNDTIMEO take a DWORD count of milliseconds directly on
 // Windows, not a timeval struct.
-void set_socket_timeout_win(SOCKET sock, int option, std::optional<std::chrono::milliseconds> timeout) {
-    if (!timeout) return;
-    if (*timeout <= std::chrono::milliseconds::zero()) {
+void set_socket_timeout_win(SOCKET sock, int option,
+                            std::optional<std::chrono::milliseconds> timeout) {
+    if (timeout && *timeout <= std::chrono::milliseconds::zero()) {
         throw std::invalid_argument("socket I/O timeout must be positive");
     }
-    const DWORD millis = static_cast<DWORD>(timeout->count());
-    if (::setsockopt(sock, SOL_SOCKET, option, reinterpret_cast<const char*>(&millis), sizeof(millis)) ==
-        SOCKET_ERROR) {
+    const DWORD millis = timeout ? static_cast<DWORD>(std::max<int64_t>(timeout->count(), 1)) : 0;
+    if (::setsockopt(sock, SOL_SOCKET, option, reinterpret_cast<const char*>(&millis),
+                     sizeof(millis)) == SOCKET_ERROR) {
         throw std::runtime_error("cannot set socket I/O timeout (WSAGetLastError=" +
                                  std::to_string(::WSAGetLastError()) + ")");
+    }
+}
+
+using WindowsDeadline = std::optional<std::chrono::steady_clock::time_point>;
+
+bool connect_with_timeout_win(SOCKET sock, const sockaddr* address, int address_length,
+                              std::optional<std::chrono::milliseconds> timeout, int* out_error);
+
+std::optional<std::chrono::milliseconds> remaining_timeout_win(const WindowsDeadline& deadline) {
+    if (!deadline) return std::nullopt;
+    const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+        *deadline - std::chrono::steady_clock::now());
+    if (remaining <= std::chrono::milliseconds::zero()) {
+        throw std::runtime_error("SOCKS5h connection timed out");
+    }
+    return std::max(remaining, std::chrono::milliseconds{1});
+}
+
+struct WindowsSocksProxyEndpoint {
+    std::string host;
+    uint16_t port;
+};
+
+WindowsSocksProxyEndpoint parse_socks5h_proxy_win(const std::string& uri) {
+    constexpr const char* scheme = "socks5h://";
+    if (uri.rfind(scheme, 0) != 0) throw std::invalid_argument("TCP proxy must use socks5h://");
+    const std::string authority = uri.substr(std::strlen(scheme));
+    if (authority.empty() || authority.find_first_of("/?#") != std::string::npos) {
+        throw std::invalid_argument("SOCKS5h proxy URI must contain only host and port");
+    }
+    if (authority.find('@') != std::string::npos) {
+        throw std::invalid_argument("SOCKS5h proxy credentials are not supported");
+    }
+    std::string host;
+    std::string port_text;
+    if (authority.front() == '[') {
+        const size_t closing = authority.find(']');
+        if (closing == std::string::npos || closing == 1 || closing + 1 >= authority.size() ||
+            authority[closing + 1] != ':') {
+            throw std::invalid_argument("invalid bracketed IPv6 SOCKS5h proxy URI");
+        }
+        host = authority.substr(1, closing - 1);
+        port_text = authority.substr(closing + 2);
+    } else {
+        const size_t colon = authority.rfind(':');
+        if (colon == std::string::npos || colon == 0 || authority.find(':') != colon) {
+            throw std::invalid_argument("SOCKS5h proxy URI must be socks5h://host:port");
+        }
+        host = authority.substr(0, colon);
+        port_text = authority.substr(colon + 1);
+    }
+    size_t consumed = 0;
+    unsigned long parsed = 0;
+    try {
+        parsed = std::stoul(port_text, &consumed, 10);
+    } catch (const std::exception&) {
+        throw std::invalid_argument("SOCKS5h proxy port must be numeric");
+    }
+    if (consumed != port_text.size() || parsed == 0 || parsed > 65535) {
+        throw std::invalid_argument("SOCKS5h proxy port is out of range");
+    }
+    return {std::move(host), static_cast<uint16_t>(parsed)};
+}
+
+SOCKET connect_tcp_socket_win(const std::string& host, uint16_t port,
+                              const SocketTransportOptions& options) {
+    ensure_winsock_initialized();
+    if (host.empty()) throw std::invalid_argument("TCP host must not be empty");
+    if (port == 0) throw std::invalid_argument("TCP port must not be zero");
+    if (options.connect_timeout && *options.connect_timeout <= std::chrono::milliseconds::zero()) {
+        throw std::invalid_argument("socket connect timeout must be positive");
+    }
+    const WindowsDeadline deadline =
+        options.connect_timeout
+            ? WindowsDeadline{std::chrono::steady_clock::now() + *options.connect_timeout}
+            : std::nullopt;
+    addrinfo hints{};
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_protocol = IPPROTO_TCP;
+    addrinfo* addresses = nullptr;
+    const std::string service = std::to_string(port);
+    const int resolve_error = ::getaddrinfo(host.c_str(), service.c_str(), &hints, &addresses);
+    if (resolve_error != 0) {
+        throw std::runtime_error("cannot resolve TCP host '" + host + "' (getaddrinfo=" +
+                                 std::to_string(resolve_error) + ")");
+    }
+    SOCKET sock = INVALID_SOCKET;
+    int last_error = 0;
+    try {
+        for (const addrinfo* address = addresses; address; address = address->ai_next) {
+            if (address->ai_family != AF_INET && address->ai_family != AF_INET6) continue;
+            auto attempt_timeout = remaining_timeout_win(deadline);
+            sock = ::socket(address->ai_family, address->ai_socktype, address->ai_protocol);
+            if (sock == INVALID_SOCKET) {
+                last_error = ::WSAGetLastError();
+                continue;
+            }
+            if (connect_with_timeout_win(sock, address->ai_addr,
+                                         static_cast<int>(address->ai_addrlen), attempt_timeout,
+                                         &last_error)) {
+                break;
+            }
+            ::closesocket(sock);
+            sock = INVALID_SOCKET;
+        }
+    } catch (...) {
+        if (sock != INVALID_SOCKET) ::closesocket(sock);
+        ::freeaddrinfo(addresses);
+        throw;
+    }
+    ::freeaddrinfo(addresses);
+    if (sock == INVALID_SOCKET) {
+        throw std::runtime_error("cannot connect TCP socket " + host + ":" + std::to_string(port) +
+                                 " (WSAGetLastError=" + std::to_string(last_error) + ")");
+    }
+    try {
+        set_socket_timeout_win(sock, SO_RCVTIMEO, options.read_timeout);
+        set_socket_timeout_win(sock, SO_SNDTIMEO, options.write_timeout);
+        const BOOL one = TRUE;
+        (void)::setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&one),
+                           sizeof(one));
+    } catch (...) {
+        ::closesocket(sock);
+        throw;
+    }
+    return sock;
+}
+
+void send_all_win(SOCKET sock, const uint8_t* data, size_t size, const WindowsDeadline& deadline) {
+    size_t offset = 0;
+    while (offset < size) {
+        set_socket_timeout_win(sock, SO_SNDTIMEO, remaining_timeout_win(deadline));
+        const int chunk = static_cast<int>(
+            std::min<size_t>(size - offset, static_cast<size_t>(std::numeric_limits<int>::max())));
+        const int sent = ::send(sock, reinterpret_cast<const char*>(data + offset), chunk, 0);
+        if (sent == SOCKET_ERROR) {
+            throw std::runtime_error("SOCKS5h write failed (WSAGetLastError=" +
+                                     std::to_string(::WSAGetLastError()) + ")");
+        }
+        if (sent == 0) throw std::runtime_error("SOCKS5h proxy closed while reading request");
+        offset += static_cast<size_t>(sent);
+    }
+}
+
+void read_exact_win(SOCKET sock, uint8_t* data, size_t size, const WindowsDeadline& deadline) {
+    size_t offset = 0;
+    while (offset < size) {
+        set_socket_timeout_win(sock, SO_RCVTIMEO, remaining_timeout_win(deadline));
+        const int chunk = static_cast<int>(
+            std::min<size_t>(size - offset, static_cast<size_t>(std::numeric_limits<int>::max())));
+        const int received = ::recv(sock, reinterpret_cast<char*>(data + offset), chunk, 0);
+        if (received == SOCKET_ERROR) {
+            throw std::runtime_error("SOCKS5h read failed (WSAGetLastError=" +
+                                     std::to_string(::WSAGetLastError()) + ")");
+        }
+        if (received == 0) throw std::runtime_error("SOCKS5h proxy returned a truncated reply");
+        offset += static_cast<size_t>(received);
+    }
+}
+
+SOCKET connect_socks5h_socket_win(const std::string& target_host, uint16_t target_port,
+                                  const SocketTransportOptions& options) {
+    if (!options.proxy) throw std::invalid_argument("SOCKS5h proxy URI is required");
+    validate_socks_target_text(target_host);
+    if (target_port == 0) throw std::invalid_argument("TCP port must not be zero");
+    std::array<uint8_t, 16> validated_address{};
+    if (::InetPtonA(AF_INET, target_host.c_str(), validated_address.data()) != 1 &&
+        ::InetPtonA(AF_INET6, target_host.c_str(), validated_address.data()) != 1) {
+        validate_ascii_dns_name(target_host);
+    }
+    if (options.connect_timeout && *options.connect_timeout <= std::chrono::milliseconds::zero()) {
+        throw std::invalid_argument("socket connect timeout must be positive");
+    }
+    const WindowsDeadline deadline =
+        options.connect_timeout
+            ? WindowsDeadline{std::chrono::steady_clock::now() + *options.connect_timeout}
+            : std::nullopt;
+    const auto proxy = parse_socks5h_proxy_win(*options.proxy);
+    SocketTransportOptions proxy_options = options;
+    proxy_options.proxy.reset();
+    proxy_options.connect_timeout = remaining_timeout_win(deadline);
+    SOCKET sock = connect_tcp_socket_win(proxy.host, proxy.port, proxy_options);
+    try {
+        const std::array<uint8_t, 3> greeting{5, 1, 0};
+        send_all_win(sock, greeting.data(), greeting.size(), deadline);
+        std::array<uint8_t, 2> greeting_reply{};
+        read_exact_win(sock, greeting_reply.data(), greeting_reply.size(), deadline);
+        if (greeting_reply != std::array<uint8_t, 2>{5, 0}) {
+            throw std::runtime_error("SOCKS5h proxy did not accept NO AUTH");
+        }
+        std::vector<uint8_t> request{5, 1, 0};
+        std::array<uint8_t, 16> address{};
+        if (::InetPtonA(AF_INET, target_host.c_str(), address.data()) == 1) {
+            request.push_back(1);
+            request.insert(request.end(), address.begin(), address.begin() + 4);
+        } else if (::InetPtonA(AF_INET6, target_host.c_str(), address.data()) == 1) {
+            request.push_back(4);
+            request.insert(request.end(), address.begin(), address.end());
+        } else {
+            validate_ascii_dns_name(target_host);
+            request.push_back(3);
+            request.push_back(static_cast<uint8_t>(target_host.size()));
+            request.insert(request.end(), target_host.begin(), target_host.end());
+        }
+        request.push_back(static_cast<uint8_t>(target_port >> 8));
+        request.push_back(static_cast<uint8_t>(target_port));
+        send_all_win(sock, request.data(), request.size(), deadline);
+        std::array<uint8_t, 4> reply{};
+        read_exact_win(sock, reply.data(), reply.size(), deadline);
+        if (reply[0] != 5 || reply[2] != 0) {
+            throw std::runtime_error("malformed SOCKS5h connect reply");
+        }
+        if (reply[1] != 0) {
+            throw std::runtime_error("SOCKS5h proxy rejected target (reply " +
+                                     std::to_string(reply[1]) + ")");
+        }
+        size_t address_size = 0;
+        if (reply[3] == 1) address_size = 4;
+        else if (reply[3] == 4) address_size = 16;
+        else if (reply[3] == 3) {
+            uint8_t length = 0;
+            read_exact_win(sock, &length, 1, deadline);
+            address_size = length;
+        } else {
+            throw std::runtime_error("SOCKS5h reply used an unknown address type");
+        }
+        std::vector<uint8_t> tail(address_size + 2);
+        read_exact_win(sock, tail.data(), tail.size(), deadline);
+        set_socket_timeout_win(sock, SO_RCVTIMEO, options.read_timeout);
+        set_socket_timeout_win(sock, SO_SNDTIMEO, options.write_timeout);
+        return sock;
+    } catch (...) {
+        ::closesocket(sock);
+        throw;
     }
 }
 
@@ -437,18 +948,20 @@ bool connect_with_timeout_win(SOCKET sock, const sockaddr* address, int address_
     int socket_error = 0;
     int error_size = sizeof(socket_error);
     if (poll_result <= 0 ||
-        ::getsockopt(sock, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&socket_error), &error_size) ==
-            SOCKET_ERROR ||
+        ::getsockopt(sock, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&socket_error),
+                     &error_size) == SOCKET_ERROR ||
         socket_error != 0) {
-        *out_error = poll_result == 0 ? WSAETIMEDOUT : (socket_error != 0 ? socket_error : ::WSAGetLastError());
+        *out_error = poll_result == 0 ? WSAETIMEDOUT
+                                      : (socket_error != 0 ? socket_error : ::WSAGetLastError());
         mode = 0;
         (void)::ioctlsocket(sock, FIONBIO, &mode);
         return false;
     }
     mode = 0;
     if (::ioctlsocket(sock, FIONBIO, &mode) != 0) {
-        throw std::runtime_error("cannot restore connected socket to blocking mode (WSAGetLastError=" +
-                                 std::to_string(::WSAGetLastError()) + ")");
+        throw std::runtime_error(
+            "cannot restore connected socket to blocking mode (WSAGetLastError=" +
+            std::to_string(::WSAGetLastError()) + ")");
     }
     return true;
 }
@@ -476,10 +989,10 @@ SOCKET connect_unix_socket(const std::string& path, const SocketTransportOptions
     }
     try {
         int connect_error = 0;
-        if (!connect_with_timeout_win(sock, reinterpret_cast<const sockaddr*>(&address), sizeof(address),
-                                      options.connect_timeout, &connect_error)) {
-            throw std::runtime_error("cannot connect Unix socket " + path + " (WSAGetLastError=" +
-                                     std::to_string(connect_error) + ")");
+        if (!connect_with_timeout_win(sock, reinterpret_cast<const sockaddr*>(&address),
+                                      sizeof(address), options.connect_timeout, &connect_error)) {
+            throw std::runtime_error("cannot connect Unix socket " + path +
+                                     " (WSAGetLastError=" + std::to_string(connect_error) + ")");
         }
         set_socket_timeout_win(sock, SO_RCVTIMEO, options.read_timeout);
         set_socket_timeout_win(sock, SO_SNDTIMEO, options.write_timeout);
@@ -524,15 +1037,16 @@ int connect_pipe_fd(const std::string& pipe_name, const SocketTransportOptions& 
             throw std::runtime_error("timed out connecting named pipe " + pipe_name +
                                      " (all instances busy)");
         }
-        const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
+        const auto remaining =
+            std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
         const DWORD wait_ms = options.connect_timeout
-                                  ? static_cast<DWORD>(std::min<int64_t>(remaining.count(),
-                                                                          std::numeric_limits<int32_t>::max()))
+                                  ? static_cast<DWORD>(std::min<int64_t>(
+                                        remaining.count(), std::numeric_limits<int32_t>::max()))
                                   : NMPWAIT_WAIT_FOREVER;
         if (!::WaitNamedPipeA(pipe_name.c_str(), wait_ms)) {
-            throw std::runtime_error("cannot connect named pipe " + pipe_name +
-                                     " (WaitNamedPipe GetLastError=" +
-                                     std::to_string(::GetLastError()) + ")");
+            throw std::runtime_error(
+                "cannot connect named pipe " + pipe_name +
+                " (WaitNamedPipe GetLastError=" + std::to_string(::GetLastError()) + ")");
         }
     }
     const int fd = ::_open_osfhandle(reinterpret_cast<intptr_t>(handle), _O_BINARY);
@@ -860,12 +1374,20 @@ ClientTransport ClientTransport::connect_pipe(const std::string& pipe_name,
 ClientTransport ClientTransport::connect_tcp(const std::string& host, uint16_t port,
                                              const SocketTransportOptions& options) {
 #ifdef _WIN32
-    (void)host;
-    (void)port;
-    (void)options;
-    throw std::runtime_error("TCP client transport is not yet available on Windows");
+    auto sock = std::make_shared<SOCKET>(options.proxy ? connect_socks5h_socket_win(host, port, options)
+                                                       : connect_tcp_socket_win(host, port, options));
+    auto input = std::make_shared<SocketInputStream>(static_cast<std::uintptr_t>(*sock));
+    auto output = std::make_shared<SocketOutputStream>(static_cast<std::uintptr_t>(*sock));
+    return ClientTransport(std::make_unique<Impl>(input, output, [sock]() {
+        if (*sock != INVALID_SOCKET) {
+            (void)::shutdown(*sock, SD_BOTH);
+            ::closesocket(*sock);
+            *sock = INVALID_SOCKET;
+        }
+    }));
 #else
-    auto fd = std::make_shared<int>(connect_tcp_fd(host, port, options));
+    auto fd = std::make_shared<int>(options.proxy ? connect_socks5h_fd(host, port, options)
+                                                  : connect_tcp_fd(host, port, options));
     auto input = std::make_shared<FdInputStream>(*fd);
     auto output = std::make_shared<FdOutputStream>(*fd);
     return ClientTransport(std::make_unique<Impl>(input, output, [fd]() {

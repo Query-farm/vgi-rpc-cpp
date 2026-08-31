@@ -88,7 +88,9 @@ Build and return the server. Can only be called once.
 
 ## Server
 
-Single-threaded RPC server. Not thread-safe — designed for pipe-based operation (one request at a time on stdin/stdout).
+Pipe dispatch is single-threaded. HTTP and raw socket listeners can dispatch
+unrelated calls concurrently; handlers that share mutable application state
+must synchronize it.
 
 ### Methods
 
@@ -109,6 +111,21 @@ bool serve_one(
 ```
 
 Process a single request. Returns `true` if a request was served, `false` on EOF (clean shutdown). Useful for testing with custom I/O streams.
+
+#### `serve_tcp`
+
+```cpp
+void serve_tcp(const std::string& host, int port);
+void serve_tcp(const std::string& host, int port,
+               const TcpServerOptions& options);
+```
+
+Serve persistent raw Arrow-IPC connections. `TcpServerOptions` configures
+finite active/pending admission, complete-setup and idle-read deadlines,
+bounded response writes, trusted PROXY v2 parsing, and an optional
+connection-snapshot identity resolver. Excess connections are rejected
+without blocking the accept loop. See [Trusted PROXY protocol v2
+listeners](../proxy-protocol-v2.md) for the trust and availability model.
 
 #### `server_id`
 

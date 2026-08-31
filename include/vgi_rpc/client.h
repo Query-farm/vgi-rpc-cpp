@@ -43,12 +43,18 @@ struct SubprocessTransportOptions {
 
 struct SocketTransportOptions {
     // A finite default prevents a dead peer/address from pinning construction.
-    // It applies to each resolved address attempted by connect_tcp.
-    // DNS resolution follows the platform resolver and is outside this timer;
-    // nullopt deliberately requests an unbounded socket connect.
+    // One monotonic budget covers every address attempted by connect_tcp plus
+    // SOCKS negotiation when proxy is set. Elapsed blocking system-resolver
+    // time is charged to that budget, but getaddrinfo itself is not preemptible.
+    // nullopt deliberately requests an unbounded connection setup.
     std::optional<std::chrono::milliseconds> connect_timeout{std::chrono::milliseconds{5000}};
     std::optional<std::chrono::milliseconds> read_timeout;
     std::optional<std::chrono::milliseconds> write_timeout;
+    // Optional SOCKS5 proxy URI, e.g. socks5h://127.0.0.1:1055. Only
+    // proxy-side hostname resolution and the NO AUTH method are supported;
+    // URI userinfo is rejected. C++ callers must supply Unicode target names as
+    // pre-encoded ASCII IDNA A-labels. A proxy failure never falls back direct.
+    std::optional<std::string> proxy;
 };
 
 /// Owning, move-only pair of raw input/output streams.
@@ -197,7 +203,8 @@ public:
                            const SubprocessTransportOptions& transport_options = {});
     static RpcClient connect_unix(const std::string& path, const RpcClientOptions& options = {},
                                   const SocketTransportOptions& transport_options = {});
-    static RpcClient connect_pipe(const std::string& pipe_name, const RpcClientOptions& options = {},
+    static RpcClient connect_pipe(const std::string& pipe_name,
+                                  const RpcClientOptions& options = {},
                                   const SocketTransportOptions& transport_options = {});
     static RpcClient connect_tcp(const std::string& host, uint16_t port,
                                  const RpcClientOptions& options = {},

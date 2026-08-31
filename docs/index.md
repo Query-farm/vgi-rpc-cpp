@@ -15,6 +15,9 @@ hide:
 
 C++ implementation of the [vgi_rpc](https://vgi-rpc.query.farm/) framework — Apache Arrow IPC-based RPC for high-performance data services.
 
+See [Tailscale and trusted HTTP proxy identity](peer-identity-providers.md) for
+the peer-evidence adapters and their deployment trust boundaries.
+
 <p class="built-by">Built by <a href="https://query.farm">Query.Farm</a></p>
 
 </div>
@@ -39,6 +42,7 @@ Define RPC methods with typed C++20 handlers using Arrow schemas. The framework 
 | Pipe (stdin/stdout) | `Server::run()` | — |
 | Unix domain socket | `Server::serve_unix(path)` | `UNIX:<path>` |
 | TCP (trusted networks; no auth or TLS) | `Server::serve_tcp(host, port)` | `TCP:<host>:<port>` |
+| TCP behind a trusted L4 proxy | `Server::serve_tcp(host, port, TcpServerOptions)` | Required PROXY v2 + connection identity snapshot |
 | HTTP | `Server::serve_http(HttpConfig)` | `PORT:<port>` |
 
 Pipe, Unix, and TCP share the same raw Arrow IPC framing and differ only in

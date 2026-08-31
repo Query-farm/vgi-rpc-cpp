@@ -5,24 +5,29 @@
 // IPC framing with no HTTP envelope; they differ only in the listening socket,
 // so the serve loop is shared and the two entry points just build the address.
 //
-// TCP carries no authentication and no TLS.  It is for trusted networks; the
-// host defaults to loopback so a misread flag cannot bind the world.
+// TCP carries no TLS. It is for trusted networks or a separately secured
+// channel; TcpServerOptions can attach a connection-snapshot identity resolved
+// directly or from a trusted PROXY v2 assertion. The host defaults to loopback
+// so a misread flag cannot bind the world.
 
 #include "vgi_rpc/server.h"
+#include "vgi_rpc/proxy_protocol_v2.h"
 #include "vgi_rpc/wire.h"
+#include "socket_transport_internal.h"
 
-#include <cerrno>
 #include <algorithm>
-#include <condition_variable>
+#include <array>
+#include <cerrno>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
-#include <deque>
 #include <functional>
 #include <iostream>
-#include <mutex>
+#include <limits>
+#include <span>
 #include <stdexcept>
 #include <string>
-#include <thread>
+#include <string_view>
 #include <unordered_set>
 #include <vector>
 
@@ -30,6 +35,7 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
@@ -43,23 +49,177 @@ namespace vgi_rpc {
 // Serve one accepted connection to completion: request after request over the
 // same socket, exactly as the pipe transport does over stdin/stdout, until the
 // peer closes or the framing breaks.
-void Server::serve_socket_fd(int fd, TransportKind transport_kind) {
-    auto input = std::make_shared<FdInputStream>(fd);
-    auto output = std::make_shared<FdOutputStream>(fd);
+void Server::serve_socket_fd(int fd, TransportKind transport_kind, const AuthContext& auth,
+                             const PeerEvidenceSet& peer_evidence,
+                             std::chrono::steady_clock::time_point first_frame_deadline,
+                             std::chrono::milliseconds idle_read_timeout,
+                             std::chrono::milliseconds write_timeout) {
+    std::shared_ptr<arrow::io::InputStream> input;
+    std::shared_ptr<socket_detail::DeadlineFdInputStream> deadline_input;
+    if (first_frame_deadline == std::chrono::steady_clock::time_point::max()) {
+        input = std::make_shared<FdInputStream>(fd);
+    } else {
+        deadline_input = std::make_shared<socket_detail::DeadlineFdInputStream>(
+            fd, first_frame_deadline, idle_read_timeout);
+        input = deadline_input;
+    }
+    std::shared_ptr<arrow::io::OutputStream> output;
+    if (write_timeout == std::chrono::milliseconds::max())
+        output = std::make_shared<FdOutputStream>(fd);
+    else
+        output = std::make_shared<socket_detail::DeadlineFdOutputStream>(fd, write_timeout);
     ConnectionState connection;
     while (true) {
         try {
-            if (!serve_one_with_state(input, output, transport_kind, connection)) break;
-        } catch (const std::exception& e) {
-            // One bad connection must not take the listener down; say what
-            // happened and move on to the next peer.
-            std::fprintf(stderr, "vgi_rpc: connection closed after error: %s\n", e.what());
+            if (!serve_one_with_state(input, output, transport_kind, connection, auth,
+                                      peer_evidence,
+                                      deadline_input ? std::function<void()>([deadline_input] {
+                                          deadline_input->mark_first_frame_complete();
+                                      })
+                                                     : std::function<void()>{}))
+                break;
+        } catch (const std::exception&) {
+            // Provider, callback, and framing errors may contain credentials
+            // or peer-controlled bytes. Keep the operational event while
+            // deliberately omitting exception text from normal logs.
+            std::fprintf(stderr, "vgi_rpc: connection closed after transport error\n");
             break;
         }
     }
 }
 
 namespace {
+
+using socket_detail::AcceptedPeer;
+
+std::string socket_endpoint(const std::string& address, uint16_t port) {
+    return address.find(':') == std::string::npos ? address + ":" + std::to_string(port)
+                                                  : "[" + address + "]:" + std::to_string(port);
+}
+
+AcceptedPeer accepted_peer(const sockaddr_storage& storage) {
+    std::array<char, INET6_ADDRSTRLEN> buffer{};
+    uint16_t port = 0;
+    const void* address = nullptr;
+    if (storage.ss_family == AF_INET) {
+        const auto& value = reinterpret_cast<const sockaddr_in&>(storage);
+        address = &value.sin_addr;
+        port = ntohs(value.sin_port);
+    } else if (storage.ss_family == AF_INET6) {
+        const auto& value = reinterpret_cast<const sockaddr_in6&>(storage);
+        address = &value.sin6_addr;
+        port = ntohs(value.sin6_port);
+    } else {
+        return {};
+    }
+    if (::inet_ntop(storage.ss_family, address, buffer.data(), buffer.size()) == nullptr) return {};
+    std::string text(buffer.data());
+    constexpr std::string_view mapped = "::ffff:";
+    if (text.rfind(mapped, 0) == 0) text.erase(0, mapped.size());
+    return {text, socket_endpoint(text, port), std::chrono::steady_clock::now()};
+}
+
+std::string local_endpoint(int fd) {
+    sockaddr_storage storage{};
+    socklen_t size = sizeof(storage);
+    if (::getsockname(fd, reinterpret_cast<sockaddr*>(&storage), &size) != 0) return {};
+    return accepted_peer(storage).endpoint;
+}
+
+std::string normalize_ip(const std::string& value) {
+    std::array<uint8_t, 16> bytes{};
+    std::array<char, INET6_ADDRSTRLEN> output{};
+    if (::inet_pton(AF_INET, value.c_str(), bytes.data()) == 1) {
+        if (::inet_ntop(AF_INET, bytes.data(), output.data(), output.size()) == nullptr) return {};
+        return output.data();
+    }
+    if (::inet_pton(AF_INET6, value.c_str(), bytes.data()) == 1) {
+        if (::inet_ntop(AF_INET6, bytes.data(), output.data(), output.size()) == nullptr) return {};
+        std::string result(output.data());
+        constexpr std::string_view mapped = "::ffff:";
+        if (result.rfind(mapped, 0) == 0) result.erase(0, mapped.size());
+        return result;
+    }
+    return {};
+}
+
+void read_exact_until(int fd, std::span<uint8_t> output,
+                      std::chrono::steady_clock::time_point deadline) {
+    size_t offset = 0;
+    while (offset < output.size()) {
+        const auto remaining = deadline - std::chrono::steady_clock::now();
+        if (remaining <= std::chrono::steady_clock::duration::zero())
+            throw ProxyProtocolV2Error("PROXY v2 preamble timed out");
+        const auto millis = std::chrono::duration_cast<std::chrono::milliseconds>(remaining);
+        pollfd ready{fd, POLLIN, 0};
+        int status;
+        do {
+            const int timeout = static_cast<int>(
+                std::clamp<int64_t>(millis.count(), 1, std::numeric_limits<int>::max()));
+            status = ::poll(&ready, 1, timeout);
+        } while (status < 0 && errno == EINTR);
+        if (status == 0) throw ProxyProtocolV2Error("PROXY v2 preamble timed out");
+        if (status < 0)
+            throw ProxyProtocolV2Error(std::string("cannot read PROXY v2 preamble: ") +
+                                       std::strerror(errno));
+        ssize_t count;
+        do {
+            count = ::recv(fd, output.data() + offset, output.size() - offset, 0);
+        } while (count < 0 && errno == EINTR);
+        if (count <= 0) throw ProxyProtocolV2Error("truncated PROXY v2 preamble");
+        offset += static_cast<size_t>(count);
+    }
+}
+
+ProxyProtocolV2Address read_proxy_protocol_v2(
+    int fd, const TcpServerOptions& options,
+    std::chrono::steady_clock::time_point connection_setup_deadline) {
+    const auto deadline = std::min(socket_detail::deadline_after(std::chrono::steady_clock::now(),
+                                                                 options.proxy_preamble_timeout),
+                                   connection_setup_deadline);
+    std::array<uint8_t, 16> prefix{};
+    read_exact_until(fd, prefix, deadline);
+    const size_t total = proxy_protocol_v2_size(prefix, options.maximum_proxy_preamble_bytes);
+    std::vector<uint8_t> preamble(total);
+    std::copy(prefix.begin(), prefix.end(), preamble.begin());
+    read_exact_until(fd, std::span<uint8_t>(preamble).subspan(prefix.size()), deadline);
+    return parse_proxy_protocol_v2(preamble, options.maximum_proxy_preamble_bytes);
+}
+
+TcpServerOptions::ResolvedIdentity resolve_tcp_identity(
+    int fd, const AcceptedPeer& peer, const TcpServerOptions& options,
+    std::chrono::steady_clock::time_point connection_setup_deadline) {
+    PeerResolutionContext context;
+    context.transport = "tcp";
+    if (!peer.address.empty()) context.immediate_peer = normalize_ip(peer.address);
+    if (!peer.endpoint.empty()) context.source_endpoint = peer.endpoint;
+    context.destination_address = local_endpoint(fd);
+    if (!options.service_name.empty()) context.service_name = options.service_name;
+
+    if (options.proxy_protocol_v2_required) {
+        const std::string normalized_peer = normalize_ip(peer.address);
+        const bool trusted =
+            std::any_of(options.trusted_proxy_addresses.begin(),
+                        options.trusted_proxy_addresses.end(), [&](const std::string& configured) {
+                            return normalize_ip(configured) == normalized_peer;
+                        });
+        if (normalized_peer.empty() || !trusted)
+            throw ProxyProtocolV2Error("immediate peer is not a trusted PROXY v2 sender");
+        const auto asserted = read_proxy_protocol_v2(fd, options, connection_setup_deadline);
+        context.asserted_peer = socket_endpoint(asserted.source_address, asserted.source_port);
+        context.destination_address =
+            socket_endpoint(asserted.destination_address, asserted.destination_port);
+    }
+
+    context.deadline = std::min(socket_detail::deadline_after(std::chrono::steady_clock::now(),
+                                                              options.identity_resolution_timeout),
+                                connection_setup_deadline);
+    context.validate();
+    if (context.remaining_budget() <= std::chrono::steady_clock::duration::zero())
+        throw PeerIdentityUnavailable("connection setup budget exhausted");
+    return options.resolve_identity ? options.resolve_identity(context)
+                                    : TcpServerOptions::ResolvedIdentity{};
+}
 
 // Socket buffer asked for on an accepted Unix domain socket.  macOS gives one
 // 8192 bytes by default — against ~64 KiB for a pipe — so a megabyte of Arrow
@@ -78,100 +238,23 @@ void widen_socket_buffers(int fd) {
     ::setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &size, sizeof(size));
 }
 
-// Persistent raw connections need dedicated execution slots: serving an
-// accepted fd inline would prevent accept() from ever reaching the other
-// clients until that first connection closed.  Bound both the workers and the
-// pending queue so an unreachable or malicious peer cannot create an
-// unbounded number of threads or retained descriptors.
-class SocketConnectionPool {
-public:
-    explicit SocketConnectionPool(std::function<void(int)> serve) : serve_(std::move(serve)) {
-        const unsigned detected = std::thread::hardware_concurrency();
-        worker_count_ = detected == 0 ? 8u : std::max(2u, detected);
-        max_pending_ = worker_count_ * 4;
-        workers_.reserve(worker_count_);
-        for (unsigned i = 0; i < worker_count_; ++i) {
-            workers_.emplace_back([this] { worker_loop(); });
-        }
-    }
-
-    SocketConnectionPool(const SocketConnectionPool&) = delete;
-    SocketConnectionPool& operator=(const SocketConnectionPool&) = delete;
-
-    ~SocketConnectionPool() { stop(); }
-
-    bool submit(int fd) {
-        std::unique_lock lock(mutex_);
-        space_available_.wait(lock, [this] { return stopping_ || pending_.size() < max_pending_; });
-        if (stopping_) return false;
-        pending_.push_back(fd);
-        work_available_.notify_one();
-        return true;
-    }
-
-private:
-    void worker_loop() {
-        while (true) {
-            int fd;
-            {
-                std::unique_lock lock(mutex_);
-                work_available_.wait(lock, [this] { return stopping_ || !pending_.empty(); });
-                if (stopping_ && pending_.empty()) return;
-                fd = pending_.front();
-                pending_.pop_front();
-                active_.insert(fd);
-                space_available_.notify_one();
-            }
-
-            serve_(fd);
-            ::close(fd);
-
-            {
-                std::lock_guard lock(mutex_);
-                active_.erase(fd);
-            }
-        }
-    }
-
-    void stop() {
-        std::vector<int> queued;
-        std::vector<int> active;
-        {
-            std::lock_guard lock(mutex_);
-            if (stopping_) return;
-            stopping_ = true;
-            queued.assign(pending_.begin(), pending_.end());
-            pending_.clear();
-            active.assign(active_.begin(), active_.end());
-        }
-        for (int fd : queued) ::close(fd);
-        for (int fd : active) ::shutdown(fd, SHUT_RDWR);
-        work_available_.notify_all();
-        space_available_.notify_all();
-        for (auto& worker : workers_) {
-            if (worker.joinable()) worker.join();
-        }
-    }
-
-    std::function<void(int)> serve_;
-    unsigned worker_count_ = 0;
-    size_t max_pending_ = 0;
-    std::mutex mutex_;
-    std::condition_variable work_available_;
-    std::condition_variable space_available_;
-    std::deque<int> pending_;
-    std::unordered_set<int> active_;
-    bool stopping_ = false;
-    std::vector<std::thread> workers_;
-};
-
 // `is_tcp` picks the per-socket tuning: Nagle off for TCP, wider buffers for a
 // Unix socket.  Neither setting means anything on the other family.
-void accept_loop(int listen_fd, TransportKind transport_kind, std::function<void(int)> serve) {
+void accept_loop(int listen_fd, TransportKind transport_kind, size_t maximum_active_connections,
+                 size_t maximum_pending_connections,
+                 std::function<void(int, const AcceptedPeer&)> serve) {
     const bool is_tcp = transport_kind == TransportKind::TCP;
-    SocketConnectionPool connections(std::move(serve));
+    socket_detail::SocketConnectionPool connections(
+        maximum_active_connections, maximum_pending_connections, std::move(serve),
+        [](socket_detail::ConnectionFailure) {
+            // Never include callback/provider/framing exception text here: it
+            // may contain credentials or attacker-controlled bytes.
+            std::fprintf(stderr, "vgi_rpc: connection rejected\n");
+        });
     while (true) {
-        int fd = ::accept(listen_fd, nullptr, nullptr);
+        sockaddr_storage peer_storage{};
+        socklen_t peer_size = sizeof(peer_storage);
+        int fd = ::accept(listen_fd, reinterpret_cast<sockaddr*>(&peer_storage), &peer_size);
         if (fd < 0) {
             if (errno == EINTR) continue;
             std::fprintf(stderr, "vgi_rpc: accept failed: %s\n", std::strerror(errno));
@@ -195,9 +278,12 @@ void accept_loop(int listen_fd, TransportKind transport_kind, std::function<void
             int one = 1;
             ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
         }
-        if (!connections.submit(fd)) {
+        const auto peer = accepted_peer(peer_storage);
+        if (!connections.submit(fd, peer)) {
             ::close(fd);
-            break;
+            // Saturation is connection-local. Keep accepting so a peer that
+            // arrives after a permit is released can make progress.
+            continue;
         }
     }
     ::close(listen_fd);
@@ -243,12 +329,38 @@ void Server::serve_unix(const std::string& path) {
     // Discovery line, then flush: a launcher blocks on this to learn the
     // socket is ready, so buffering it would look like a hung worker.
     std::cout << "UNIX:" << path << std::endl;
-    accept_loop(listen_fd, TransportKind::UNIX,
-                [this](int fd) { serve_socket_fd(fd, TransportKind::UNIX); });
+    accept_loop(listen_fd, TransportKind::UNIX, 32, 128,
+                [this](int fd, const AcceptedPeer&) { serve_socket_fd(fd, TransportKind::UNIX); });
     ::unlink(path.c_str());
 }
 
 void Server::serve_tcp(const std::string& host, int port) {
+    serve_tcp(host, port, TcpServerOptions{});
+}
+
+void Server::serve_tcp(const std::string& host, int port, const TcpServerOptions& options) {
+    if (options.maximum_active_connections == 0 || options.maximum_pending_connections == 0 ||
+        options.maximum_active_connections >
+            std::numeric_limits<size_t>::max() - options.maximum_pending_connections ||
+        options.connection_setup_timeout <= std::chrono::milliseconds::zero() ||
+        options.idle_read_timeout <= std::chrono::milliseconds::zero() ||
+        options.write_timeout <= std::chrono::milliseconds::zero() ||
+        options.proxy_preamble_timeout <= std::chrono::milliseconds::zero() ||
+        options.identity_resolution_timeout <= std::chrono::milliseconds::zero() ||
+        options.maximum_proxy_preamble_bytes < 16)
+        throw std::invalid_argument("TCP admission, timeout, and framing limits must be positive");
+    if (options.proxy_protocol_v2_required && options.trusted_proxy_addresses.empty())
+        throw std::invalid_argument("PROXY v2 requires at least one exact trusted proxy address");
+    std::unordered_set<std::string> normalized_proxies;
+    for (const auto& address : options.trusted_proxy_addresses) {
+        const auto normalized = normalize_ip(address);
+        if (normalized.empty())
+            throw std::invalid_argument(
+                "trusted proxy address is not an exact IPv4 or IPv6 address");
+        if (!normalized_proxies.insert(normalized).second)
+            throw std::invalid_argument("duplicate trusted proxy address");
+    }
+
     int listen_fd = ::socket(AF_INET, SOCK_STREAM, 0);
     if (listen_fd < 0) {
         throw std::runtime_error(std::string("cannot create tcp socket: ") + std::strerror(errno));
@@ -270,7 +382,11 @@ void Server::serve_tcp(const std::string& host, int port) {
         throw std::runtime_error("cannot bind " + bind_host + ":" + std::to_string(port) + ": " +
                                  std::strerror(errno));
     }
-    if (::listen(listen_fd, 16) < 0) {
+    const size_t admission_capacity =
+        options.maximum_active_connections + options.maximum_pending_connections;
+    const int listen_backlog =
+        static_cast<int>(std::min<size_t>(admission_capacity, static_cast<size_t>(SOMAXCONN)));
+    if (::listen(listen_fd, listen_backlog) < 0) {
         ::close(listen_fd);
         throw std::runtime_error(std::string("cannot listen: ") + std::strerror(errno));
     }
@@ -291,8 +407,15 @@ void Server::serve_tcp(const std::string& host, int port) {
     }
 
     std::cout << "TCP:" << bind_host << ":" << bound_port << std::endl;
-    accept_loop(listen_fd, TransportKind::TCP,
-                [this](int fd) { serve_socket_fd(fd, TransportKind::TCP); });
+    accept_loop(
+        listen_fd, TransportKind::TCP, options.maximum_active_connections,
+        options.maximum_pending_connections, [this, options](int fd, const AcceptedPeer& peer) {
+            const auto setup_deadline =
+                socket_detail::deadline_after(peer.accepted_at, options.connection_setup_timeout);
+            const auto identity = resolve_tcp_identity(fd, peer, options, setup_deadline);
+            serve_socket_fd(fd, TransportKind::TCP, identity.auth, identity.evidence,
+                            setup_deadline, options.idle_read_timeout, options.write_timeout);
+        });
 }
 
 #else  // _WIN32
@@ -302,6 +425,10 @@ void Server::serve_unix(const std::string&) {
 }
 
 void Server::serve_tcp(const std::string&, int) {
+    throw std::runtime_error("tcp transport is not available on Windows");
+}
+
+void Server::serve_tcp(const std::string&, int, const TcpServerOptions&) {
     throw std::runtime_error("tcp transport is not available on Windows");
 }
 

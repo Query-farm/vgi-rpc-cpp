@@ -9,6 +9,7 @@
     },
     "libsodium",
     "nlohmann-json",
+    "openssl",
     {
       "name": "cpp-httplib",
       "features": ["zstd", "zlib", "brotli", "openssl"]

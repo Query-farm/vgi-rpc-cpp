@@ -19,6 +19,7 @@
 #include "vgi_rpc/log_sink.h"
 #include "vgi_rpc/errors.h"
 #include "vgi_rpc/session.h"
+#include "vgi_rpc/identity.h"
 
 namespace vgi_rpc {
 
@@ -66,6 +67,12 @@ public:
     const std::string& server_id() const noexcept { return server_id_; }
     const std::string& request_id() const noexcept { return request_id_; }
     TransportKind transport_kind() const noexcept { return transport_kind_; }
+    const AuthContext& auth() const noexcept { return auth_; }
+    const PeerEvidenceSet& peer_evidence() const noexcept { return peer_evidence_; }
+    void set_identity(AuthContext auth, PeerEvidenceSet evidence) {
+        auth_ = std::move(auth);
+        peer_evidence_ = std::move(evidence);
+    }
 
     std::shared_ptr<LogSink> log_sink() const noexcept { return sink_; }
 
@@ -96,6 +103,8 @@ private:
     std::string request_id_;
     TransportKind transport_kind_ = TransportKind::PIPE;
     StickySlot* sticky_ = nullptr;
+    AuthContext auth_ = AuthContext::anonymous();
+    PeerEvidenceSet peer_evidence_;
 };
 
 }  // namespace vgi_rpc

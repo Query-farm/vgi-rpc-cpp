@@ -13,6 +13,14 @@ function(vgi_rpc_add_test name)
 endfunction()
 
 vgi_rpc_add_test(crypto_test)
+vgi_rpc_add_test(identity_test)
+vgi_rpc_add_test(identity_providers_test)
+target_link_libraries(identity_providers_test PRIVATE OpenSSL::Crypto)
+target_compile_definitions(identity_providers_test PRIVATE
+    VGI_RPC_IDENTITY_VECTORS="${CMAKE_CURRENT_SOURCE_DIR}/data/transport_identity_vectors.json"
+)
+vgi_rpc_add_test(proxy_protocol_v2_test)
+vgi_rpc_add_test(socket_admission_test)
 vgi_rpc_add_test(metadata_test)
 vgi_rpc_add_test(wire_test)
 vgi_rpc_add_test(request_test)

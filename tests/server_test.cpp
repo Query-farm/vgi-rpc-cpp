@@ -255,6 +255,66 @@ TEST_CASE("serve_one: CallContext reports the explicit transport kind", "[server
     REQUIRE(observed == TransportKind::TCP);
 }
 
+TEST_CASE("serve_one: custom transport identity is snapshotted into CallContext", "[server]") {
+    AuthContext observed_auth;
+    std::string observed_principal;
+    ServerBuilder builder;
+    builder.add_void("observe", empty_schema(), [&](const Request&, CallContext& ctx) {
+        observed_auth = ctx.auth();
+        observed_principal =
+            ctx.peer_evidence().unique_verified_subject("iroh").canonical_principal();
+    });
+    auto server = builder.build();
+    auto request_buf =
+        make_valid_request("observe", empty_schema(), make_empty_batch(empty_schema()));
+    auto input = std::make_shared<arrow::io::BufferReader>(request_buf);
+    auto output = arrow::io::BufferOutputStream::Create().ValueUnsafe();
+
+    AuthContext auth{"iroh", true, "node-7", {{"role", "worker"}}};
+    PeerIdentity peer("iroh", "endpoint", IdentityAssurance::CRYPTOGRAPHIC_PEER, "iroh:test",
+                      "iroh", PeerSubjectKind::ENDPOINT, "node-7", SubjectStability::STABLE, true);
+    PeerEvidenceSet evidence({PeerIdentityResult::available(std::move(peer))});
+
+    REQUIRE(server->serve_one(input, output, TransportKind::TCP, auth, evidence));
+    REQUIRE(observed_auth.authenticated);
+    REQUIRE(observed_auth.domain == "iroh");
+    REQUIRE(observed_auth.principal == std::optional<std::string>("node-7"));
+    REQUIRE(observed_auth.claims == nlohmann::json{{"role", "worker"}});
+    REQUIRE(observed_principal == "peer/iroh/iroh%3Atest/node-7");
+}
+
+TEST_CASE("serve_tcp: PROXY v2 configuration fails closed before binding", "[server]") {
+    auto server = make_echo_server();
+    TcpServerOptions missing_trust;
+    missing_trust.proxy_protocol_v2_required = true;
+    REQUIRE_THROWS_AS(server->serve_tcp("127.0.0.1", 0, missing_trust), std::invalid_argument);
+
+    TcpServerOptions hostname_trust;
+    hostname_trust.proxy_protocol_v2_required = true;
+    hostname_trust.trusted_proxy_addresses = {"localhost"};
+    REQUIRE_THROWS_AS(server->serve_tcp("127.0.0.1", 0, hostname_trust), std::invalid_argument);
+
+    TcpServerOptions invalid_timeout;
+    invalid_timeout.proxy_preamble_timeout = std::chrono::milliseconds::zero();
+    REQUIRE_THROWS_AS(server->serve_tcp("127.0.0.1", 0, invalid_timeout), std::invalid_argument);
+
+    TcpServerOptions invalid_setup;
+    invalid_setup.connection_setup_timeout = std::chrono::milliseconds::zero();
+    REQUIRE_THROWS_AS(server->serve_tcp("127.0.0.1", 0, invalid_setup), std::invalid_argument);
+
+    TcpServerOptions invalid_idle;
+    invalid_idle.idle_read_timeout = std::chrono::milliseconds::zero();
+    REQUIRE_THROWS_AS(server->serve_tcp("127.0.0.1", 0, invalid_idle), std::invalid_argument);
+
+    TcpServerOptions invalid_write;
+    invalid_write.write_timeout = std::chrono::milliseconds::zero();
+    REQUIRE_THROWS_AS(server->serve_tcp("127.0.0.1", 0, invalid_write), std::invalid_argument);
+
+    TcpServerOptions invalid_admission;
+    invalid_admission.maximum_active_connections = 0;
+    REQUIRE_THROWS_AS(server->serve_tcp("127.0.0.1", 0, invalid_admission), std::invalid_argument);
+}
+
 TEST_CASE("on_serve_start serializes concurrent callers and fires once after success",
           "[server][lifecycle]") {
     std::atomic<int> attempts = 0;

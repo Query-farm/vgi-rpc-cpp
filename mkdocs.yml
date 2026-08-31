@@ -79,6 +79,7 @@ nav:
   - Home: index.md
   - Getting Started: getting-started.md
   - Benchmarks: benchmarks.md
+  - Peer identity providers: peer-identity-providers.md
   - Examples:
       - examples/index.md
       - Hello World: examples/hello-world.md
