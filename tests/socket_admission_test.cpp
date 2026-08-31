@@ -77,6 +77,9 @@ TEST_CASE("socket write deadline releases a worker when the peer stops reading",
     const int small_buffer = 4096;
     REQUIRE(::setsockopt(pair[0], SOL_SOCKET, SO_SNDBUF, &small_buffer, sizeof(small_buffer)) == 0);
     DeadlineFdOutputStream output(pair[0], 60ms);
+    const int flags = ::fcntl(pair[0], F_GETFL);
+    REQUIRE(flags >= 0);
+    REQUIRE((flags & O_NONBLOCK) != 0);
     std::vector<uint8_t> payload(8 * 1024 * 1024, 0x5a);
 
     const auto started = std::chrono::steady_clock::now();

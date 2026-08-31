@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <cstring>
 #include <deque>
+#include <fcntl.h>
 #include <functional>
 #include <limits>
 #include <memory>
@@ -35,6 +36,25 @@
 #include "vgi_rpc/wire.h"
 
 namespace vgi_rpc::socket_detail {
+
+inline void ensure_nonblocking(int fd) {
+    int flags;
+    do {
+        flags = ::fcntl(fd, F_GETFL);
+    } while (flags < 0 && errno == EINTR);
+    if (flags < 0)
+        throw std::runtime_error(std::string("cannot inspect socket flags: ") +
+                                 std::strerror(errno));
+    if ((flags & O_NONBLOCK) != 0) return;
+
+    int result;
+    do {
+        result = ::fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    } while (result < 0 && errno == EINTR);
+    if (result < 0)
+        throw std::runtime_error(std::string("cannot make deadline socket nonblocking: ") +
+                                 std::strerror(errno));
+}
 
 inline std::chrono::steady_clock::time_point deadline_after(
     std::chrono::steady_clock::time_point start, std::chrono::milliseconds timeout) noexcept {
@@ -60,7 +80,9 @@ public:
                           std::chrono::milliseconds idle_read_timeout)
         : fd_(fd),
           first_frame_deadline_(first_frame_deadline),
-          idle_read_timeout_(idle_read_timeout) {}
+          idle_read_timeout_(idle_read_timeout) {
+        ensure_nonblocking(fd_);
+    }
 
     arrow::Status Close() override {
         closed_ = true;
@@ -133,7 +155,9 @@ private:
 class DeadlineFdOutputStream final : public arrow::io::OutputStream {
 public:
     DeadlineFdOutputStream(int fd, std::chrono::milliseconds write_timeout)
-        : fd_(fd), write_timeout_(write_timeout) {}
+        : fd_(fd), write_timeout_(write_timeout) {
+        ensure_nonblocking(fd_);
+    }
 
     arrow::Status Close() override {
         closed_ = true;

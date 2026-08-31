@@ -54,20 +54,24 @@ void Server::serve_socket_fd(int fd, TransportKind transport_kind, const AuthCon
                              std::chrono::steady_clock::time_point first_frame_deadline,
                              std::chrono::milliseconds idle_read_timeout,
                              std::chrono::milliseconds write_timeout) {
+    const bool deadlines_enabled =
+        first_frame_deadline != std::chrono::steady_clock::time_point::max() ||
+        idle_read_timeout != std::chrono::milliseconds::max() ||
+        write_timeout != std::chrono::milliseconds::max();
     std::shared_ptr<arrow::io::InputStream> input;
     std::shared_ptr<socket_detail::DeadlineFdInputStream> deadline_input;
-    if (first_frame_deadline == std::chrono::steady_clock::time_point::max()) {
-        input = std::make_shared<FdInputStream>(fd);
-    } else {
+    if (deadlines_enabled) {
         deadline_input = std::make_shared<socket_detail::DeadlineFdInputStream>(
             fd, first_frame_deadline, idle_read_timeout);
         input = deadline_input;
+    } else {
+        input = std::make_shared<FdInputStream>(fd);
     }
     std::shared_ptr<arrow::io::OutputStream> output;
-    if (write_timeout == std::chrono::milliseconds::max())
-        output = std::make_shared<FdOutputStream>(fd);
-    else
+    if (deadlines_enabled)
         output = std::make_shared<socket_detail::DeadlineFdOutputStream>(fd, write_timeout);
+    else
+        output = std::make_shared<FdOutputStream>(fd);
     ConnectionState connection;
     while (true) {
         try {
