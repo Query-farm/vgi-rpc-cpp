@@ -1,0 +1,17 @@
+.git
+.github
+.cache
+.claude
+.env
+.env.*
+.playwright-mcp
+.venv
+build
+build-*
+site
+vcpkg
+__pycache__
+*.key
+*.pem
+*.pyc
+*.png

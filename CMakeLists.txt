@@ -246,3 +246,12 @@ if(VGI_RPC_BUILD_TESTS)
         )
     endif()
 endif()
+
+# Live-Tailnet qualification adapter. This is an opt-in conformance binary,
+# not a production ingress or an installed SDK surface. Keep it after
+# enable_testing() so its focused CTest registration is visible when both
+# options are enabled.
+option(VGI_RPC_BUILD_TAILNET_ADAPTER "Build the live-Tailnet qualification adapter" OFF)
+if(VGI_RPC_BUILD_TAILNET_ADAPTER)
+    add_subdirectory(tailnet-integration)
+endif()
