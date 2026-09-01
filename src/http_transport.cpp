@@ -226,6 +226,14 @@ bool accepts(const std::vector<std::string>& list, const std::string& codec) {
     return std::find(list.begin(), list.end(), codec) != list.end();
 }
 
+std::string socket_endpoint(const std::string& address, int port) {
+    if (address.find(':') != std::string::npos &&
+        !(address.starts_with('[') && address.ends_with(']'))) {
+        return "[" + address + "]:" + std::to_string(port);
+    }
+    return address + ":" + std::to_string(port);
+}
+
 // Which codec to answer with, and on which header to stamp it.
 struct CodecChoice {
     std::string codec;  // empty = send identity
@@ -367,6 +375,13 @@ public:
           sessions_(cfg.token_key, rpc.server_id(), cfg.sticky_default_ttl),
           proof_(cfg.proof_mode, cfg.proof_origin_id, cfg.proof_secrets, cfg.proof_skew_seconds,
                  cfg.proof_replay_cache) {
+        if (cfg.peer_identity_resolution_timeout <= std::chrono::milliseconds::zero()) {
+            throw std::invalid_argument("peer identity resolution timeout must be positive");
+        }
+        if (cfg.peer_authentication_policy && cfg.peer_identity_providers.empty()) {
+            throw std::invalid_argument(
+                "peer authentication policy requires at least one identity provider");
+        }
         if (!cfg.external_storage_url.empty()) {
             // Throws for a scheme this build cannot serve, so an operator who
             // configured a bucket learns at startup rather than on the first
@@ -408,6 +423,11 @@ private:
     std::string strip_prefix(const std::string& path) const;
 
     AuthIdentity identify(const httplib::Request& req) const;
+    struct ResolvedHttpIdentity {
+        AuthContext auth = AuthContext::anonymous();
+        PeerEvidenceSet evidence;
+    };
+    ResolvedHttpIdentity resolve_http_identity(const httplib::Request& req) const;
     // Returns true when the request was refused; `res` is then complete.
     bool refuse_if_unauthorized(const httplib::Request& req, httplib::Response& res,
                                 const std::string& request_id);
@@ -715,6 +735,49 @@ AuthIdentity HttpServer::identify(const httplib::Request& req) const {
     return id;
 }
 
+HttpServer::ResolvedHttpIdentity HttpServer::resolve_http_identity(
+    const httplib::Request& req) const {
+    const AuthIdentity application = identify(req);
+    AuthContext auth = AuthContext::anonymous();
+    auth.authenticated = application.authenticated;
+    auth.domain = application.domain;
+    if (application.authenticated) auth.principal = application.principal;
+    if (cfg_.peer_identity_providers.empty()) return {std::move(auth), PeerEvidenceSet{}};
+
+    if (cfg_.peer_identity_resolution_timeout <= std::chrono::milliseconds::zero()) {
+        throw std::invalid_argument("peer identity resolution timeout must be positive");
+    }
+    PeerResolutionContext context;
+    context.transport = "http";
+    if (!req.remote_addr.empty()) {
+        context.immediate_peer = req.remote_addr;
+        context.source_endpoint = socket_endpoint(req.remote_addr, req.remote_port);
+    }
+    if (!req.local_addr.empty()) {
+        context.destination_address = socket_endpoint(req.local_addr, req.local_port);
+    }
+    const std::string authority = req.get_header_value("Host");
+    if (!authority.empty()) context.authority = authority;
+    context.service_name = cfg_.peer_service_name;
+    for (const auto& [name, value] : req.headers) context.headers[name].push_back(value);
+    if (context.source_endpoint) context.metadata["remote_addr"] = *context.source_endpoint;
+    context.metadata["request_uri"] = req.path;
+    context.deadline = std::chrono::steady_clock::now() + cfg_.peer_identity_resolution_timeout;
+    context.validate();
+
+    std::vector<PeerIdentityResult> results;
+    results.reserve(cfg_.peer_identity_providers.size());
+    for (const auto& provider : cfg_.peer_identity_providers) {
+        if (!provider) throw PeerIdentityRejected("peer identity provider is empty");
+        auto result = provider(context);
+        result.validate();
+        results.push_back(std::move(result));
+    }
+    PeerEvidenceSet evidence(std::move(results));
+    if (cfg_.peer_authentication_policy) auth = cfg_.peer_authentication_policy(evidence, auth);
+    return {std::move(auth), std::move(evidence)};
+}
+
 void HttpServer::write_unauthorized(const httplib::Request& req, httplib::Response& res,
                                     AuthReason reason) const {
     res.status = 401;
@@ -895,8 +958,20 @@ void HttpServer::handle_session_delete(const httplib::Request& req, httplib::Res
         res.status = 404;
         return;
     }
-    const AuthIdentity id = identify(req);
-    const std::string aad = session_aad(id.domain, id.principal, id.authenticated);
+    ResolvedHttpIdentity resolved;
+    try {
+        resolved = resolve_http_identity(req);
+    } catch (const PeerIdentityUnavailable&) {
+        res.status = 503;
+        res.set_header("Retry-After", "5");
+        return;
+    } catch (const std::exception&) {
+        write_unauthorized(req, res, AuthReason::INVALID_CREDENTIAL);
+        return;
+    }
+    const std::string principal = resolved.auth.principal.value_or("");
+    const std::string aad =
+        session_aad(resolved.auth.domain, principal, resolved.auth.authenticated);
     const bool hit = sessions_.close(req.get_header_value(SESSION_HEADER), aad);
     // 204 on a hit, 200 on every failure — idempotent, so a caller holding a
     // stolen token cannot probe whether a session exists.
@@ -916,6 +991,21 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
     // Authentication precedes method dispatch, so a caller cannot enumerate
     // which methods this worker implements by comparing 401 against 404.
     if (refuse_if_unauthorized(req, res, request_id)) return;
+
+    ResolvedHttpIdentity resolved;
+    try {
+        resolved = resolve_http_identity(req);
+    } catch (const PeerIdentityUnavailable&) {
+        res.status = 503;
+        res.set_header("Retry-After", "5");
+        return;
+    } catch (const std::exception&) {
+        write_unauthorized(req, res, AuthReason::INVALID_CREDENTIAL);
+        return;
+    }
+    const std::string principal = resolved.auth.principal.value_or("");
+    const std::string aad =
+        session_aad(resolved.auth.domain, principal, resolved.auth.authenticated);
 
     const std::string ctype = req.get_header_value("Content-Type");
     if (ctype.rfind(ARROW_CONTENT_TYPE, 0) != 0) {
@@ -1002,9 +1092,6 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
         }
     }
 
-    const AuthIdentity id = identify(req);
-    const std::string aad = session_aad(id.domain, id.principal, id.authenticated);
-
     // Synthetic method: vends upload/download URL pairs so a client can
     // externalize an outgoing batch the server would otherwise refuse at 413.
     // Present only when a backend is configured, so a client that discovers
@@ -1068,6 +1155,7 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
 
     auto log_sink = std::make_shared<LogSink>(rpc_.server_id(), request_id);
     CallContext ctx(log_sink, rpc_.server_id(), request_id, TransportKind::HTTP);
+    ctx.set_identity(resolved.auth, resolved.evidence);
 
     // Sticky machinery for this request, installed only on HTTP.
     StickySlot sticky;

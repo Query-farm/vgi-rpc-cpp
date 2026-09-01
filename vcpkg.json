@@ -8,6 +8,7 @@
       "default-features": false
     },
     "libsodium",
+    "curl",
     "nlohmann-json",
     "openssl",
     {

@@ -8,6 +8,8 @@
 #include "vgi_rpc/metadata.h"
 #include "vgi_rpc/wire.h"
 
+#include "http_socks5h.h"
+
 #include <arrow/buffer.h>
 #include <arrow/array.h>
 #include <arrow/builder.h>
@@ -567,7 +569,7 @@ std::string encode_zstd(const std::string& body, int level, int64_t max_encoded_
     };
     std::unique_ptr<ZSTD_CCtx, Deleter> context(ZSTD_createCCtx());
     if (!context) throw HttpClientError("cannot allocate zstd request encoder");
-    for (const auto [parameter, value] :
+    for (const auto& [parameter, value] :
          {std::pair{ZSTD_c_compressionLevel, level}, std::pair{ZSTD_c_contentSizeFlag, 1}}) {
         const size_t configured = ZSTD_CCtx_setParameter(context.get(), parameter, value);
         if (ZSTD_isError(configured)) {
@@ -958,6 +960,11 @@ public:
                                   tls_options.insecure_skip_verification_for_testing)) {
             throw std::invalid_argument("TLS options require an https:// base URL");
         }
+        if (config.tcp_proxy) {
+            socks_client = std::make_unique<SocksHttpClient>(
+                base_url.value, *config.tcp_proxy, config.connection_timeout_seconds,
+                config.read_timeout_seconds, config.write_timeout_seconds, tls_options);
+        }
         client =
             std::make_unique<httplib::Client>(base_url.value, tls_options.client_certificate_file,
                                               tls_options.client_private_key_file);
@@ -983,6 +990,27 @@ public:
             config.prefix.insert(config.prefix.begin(), '/');
         }
         while (config.prefix.size() > 1 && config.prefix.back() == '/') config.prefix.pop_back();
+    }
+
+    httplib::Response send_socks_request(const std::string& http_method,
+                                         const std::string& request_path,
+                                         const httplib::Headers& headers, const std::string& body,
+                                         const CallOptions& options, const std::string& rpc_method,
+                                         const std::string& request_id) const {
+        try {
+            return socks_client->send(http_method, request_path, headers, body,
+                                      max_encoded_response_bytes, options);
+        } catch (const SocksHttpFailure& error) {
+            HttpClientErrorKind kind = HttpClientErrorKind::TRANSPORT;
+            switch (error.kind()) {
+                case SocksHttpFailureKind::TLS: kind = HttpClientErrorKind::TLS; break;
+                case SocksHttpFailureKind::TIMEOUT: kind = HttpClientErrorKind::TIMEOUT; break;
+                case SocksHttpFailureKind::CANCELLED: kind = HttpClientErrorKind::CANCELLED; break;
+                case SocksHttpFailureKind::LIMIT: kind = HttpClientErrorKind::LIMIT; break;
+                case SocksHttpFailureKind::TRANSPORT: break;
+            }
+            throw HttpClientError(kind, error.what(), 0, rpc_method, request_id);
+        }
     }
 
     BoundedHttpResponse post_inline(
@@ -1087,21 +1115,51 @@ public:
                 }
                 max_timeout_milliseconds = std::max<int64_t>(1, remaining.count());
             }
-            ScopedHttpMaxTimeout max_timeout(*client, max_timeout_milliseconds);
-            std::stop_callback stop_callback(options.stop_token, [this] { client->stop(); });
             check_call_active(options, method, request_id);
-            auto result =
-                client->Post(request_path, headers, *payload, kArrowContentType,
-                             [&](const char* data, size_t size) {
-                                 if (size > static_cast<uint64_t>(max_encoded_response_bytes) ||
-                                     response.body.size() >
-                                         static_cast<uint64_t>(max_encoded_response_bytes) - size) {
-                                     response_too_large = true;
-                                     return false;
-                                 }
-                                 response.body.append(data, size);
-                                 return true;
-                             });
+            httplib::Response wire_response;
+            if (socks_client) {
+                headers.emplace("Content-Type", kArrowContentType);
+                wire_response = send_socks_request("POST", request_path, headers, *payload, options,
+                                                   method, request_id);
+                response.body = std::move(wire_response.body);
+            } else {
+                ScopedHttpMaxTimeout max_timeout(*client, max_timeout_milliseconds);
+                std::stop_callback stop_callback(options.stop_token, [this] { client->stop(); });
+                auto result = client->Post(
+                    request_path, headers, *payload, kArrowContentType,
+                    [&](const char* data, size_t size) {
+                        if (size > static_cast<uint64_t>(max_encoded_response_bytes) ||
+                            response.body.size() >
+                                static_cast<uint64_t>(max_encoded_response_bytes) - size) {
+                            response_too_large = true;
+                            return false;
+                        }
+                        response.body.append(data, size);
+                        return true;
+                    });
+                if (response_too_large) {
+                    throw HttpClientError(
+                        HttpClientErrorKind::LIMIT,
+                        "encoded HTTP RPC response exceeds max_encoded_response_bytes (" +
+                            std::to_string(max_encoded_response_bytes) + ")",
+                        0, method, request_id);
+                }
+                if (!result) {
+                    int tls_error = 0;
+                    unsigned long tls_backend_error = 0;
+#ifdef CPPHTTPLIB_OPENSSL_SUPPORT
+                    tls_error = result.ssl_error();
+                    tls_backend_error = result.ssl_backend_error();
+#endif
+                    const HttpClientErrorKind kind = classify_transport_error(
+                        result.error(), options, secure_transport, tls_error, tls_backend_error);
+                    throw HttpClientError(kind,
+                                          std::string("HTTP RPC transport failed: ") +
+                                              httplib::to_string(result.error()),
+                                          0, method, request_id);
+                }
+                wire_response = std::move(*result);
+            }
             if (response_too_large) {
                 throw HttpClientError(
                     HttpClientErrorKind::LIMIT,
@@ -1109,43 +1167,29 @@ public:
                         std::to_string(max_encoded_response_bytes) + ")",
                     0, method, request_id);
             }
-            if (!result) {
-                int tls_error = 0;
-                unsigned long tls_backend_error = 0;
-#ifdef CPPHTTPLIB_OPENSSL_SUPPORT
-                tls_error = result.ssl_error();
-                tls_backend_error = result.ssl_backend_error();
-#endif
-                const HttpClientErrorKind kind = classify_transport_error(
-                    result.error(), options, secure_transport, tls_error, tls_backend_error);
-                throw HttpClientError(
-                    kind,
-                    std::string("HTTP RPC transport failed: ") + httplib::to_string(result.error()),
-                    0, method, request_id);
-            }
-            response.status = result->status;
-            response.rpc_error = result->get_header_value("X-VGI-RPC-Error") == "true";
-            response.content_type = result->get_header_value("Content-Type");
-            response.www_authenticate = result->get_header_value("WWW-Authenticate");
-            response.retry_after = result->get_header_value("Retry-After");
-            response.auth_reason = result->get_header_value("VGI-Auth-Reason");
+            response.status = wire_response.status;
+            response.rpc_error = wire_response.get_header_value("X-VGI-RPC-Error") == "true";
+            response.content_type = wire_response.get_header_value("Content-Type");
+            response.www_authenticate = wire_response.get_header_value("WWW-Authenticate");
+            response.retry_after = wire_response.get_header_value("Retry-After");
+            response.auth_reason = wire_response.get_header_value("VGI-Auth-Reason");
             if (sticky_session) {
                 response.sticky_update =
-                    stage_sticky_response(*result, sticky_session, method, request_id);
+                    stage_sticky_response(wire_response, sticky_session, method, request_id);
             }
-            harvest_capabilities(*result, server_capabilities);
+            harvest_capabilities(wire_response, server_capabilities);
             if (server_capabilities.max_request_bytes) {
                 server_max_request_bytes = server_capabilities.max_request_bytes;
             }
-            if (result->has_header("VGI-Supported-Encodings") &&
-                !includes_encoding(result->get_header_value("VGI-Supported-Encodings"),
+            if (wire_response.has_header("VGI-Supported-Encodings") &&
+                !includes_encoding(wire_response.get_header_value("VGI-Supported-Encodings"),
                                    kZstdEncoding)) {
                 send_compressed = false;
             }
 
-            std::string content_encoding = result->get_header_value("Content-Encoding");
+            std::string content_encoding = wire_response.get_header_value("Content-Encoding");
             if (content_encoding.empty()) {
-                content_encoding = result->get_header_value("X-VGI-Content-Encoding");
+                content_encoding = wire_response.get_header_value("X-VGI-Content-Encoding");
             }
             content_encoding = ascii_lower(trim_ascii(std::move(content_encoding)));
             if (content_encoding.empty() || content_encoding == "identity") {
@@ -1362,6 +1406,13 @@ public:
             headers.emplace("VGI-Session", token);
             headers.emplace("X-Request-ID", request_id);
 
+            if (socks_client) {
+                auto options = CallOptions::with_timeout(std::chrono::milliseconds(250));
+                (void)send_socks_request("DELETE", request_path, headers, {}, options,
+                                         "__session__", request_id);
+                return;
+            }
+
             httplib::Request request;
             request.method = "DELETE";
             request.path = request_path;
@@ -1447,50 +1498,63 @@ public:
                     *options.deadline - std::chrono::steady_clock::now());
                 max_timeout_milliseconds = std::max<int64_t>(1, remaining.count());
             }
-            ScopedHttpMaxTimeout max_timeout(*client, max_timeout_milliseconds);
-            std::stop_callback stop_callback(options.stop_token, [this] { client->stop(); });
             check_call_active(options, "OPTIONS", request_id);
-            httplib::Request request;
-            request.method = "OPTIONS";
-            request.path = health_path;
-            request.headers = std::move(headers);
-            bool response_too_large = false;
-            request.content_receiver = [&](const char* data, size_t size, uint64_t, uint64_t) {
-                if (size > static_cast<uint64_t>(max_encoded_response_bytes) ||
-                    request.body.size() >
-                        static_cast<uint64_t>(max_encoded_response_bytes) - size) {
-                    response_too_large = true;
-                    return false;
-                }
-                request.body.append(data, size);
-                return true;
-            };
             httplib::Response response;
-            httplib::Error transport_error = httplib::Error::Success;
-            max_timeout.start(request);
-            const bool sent = client->send(request, response, transport_error);
-            if (response_too_large) {
-                throw HttpClientError(
-                    HttpClientErrorKind::LIMIT,
-                    "HTTP capability response exceeds max_encoded_response_bytes (" +
-                        std::to_string(max_encoded_response_bytes) + ")",
-                    0, "OPTIONS", request_id);
-            }
-            if (!sent) {
-                if (attempt + 1 < attempts && !options.stop_token.stop_requested() &&
-                    !deadline_expired(options)) {
-                    continue;
+            if (socks_client) {
+                try {
+                    response = send_socks_request("OPTIONS", health_path, headers, {}, options,
+                                                  "OPTIONS", request_id);
+                } catch (const HttpClientError& error) {
+                    if (attempt + 1 < attempts && is_retryable_transport_error(error.kind()) &&
+                        !options.stop_token.stop_requested() && !deadline_expired(options)) {
+                        continue;
+                    }
+                    throw;
                 }
-                const HttpClientErrorKind kind =
-                    classify_transport_error(transport_error, options, secure_transport);
-                throw HttpClientError(kind,
-                                      std::string("HTTP capability discovery failed: ") +
-                                          httplib::to_string(transport_error),
-                                      0, "OPTIONS", request_id);
+            } else {
+                ScopedHttpMaxTimeout max_timeout(*client, max_timeout_milliseconds);
+                std::stop_callback stop_callback(options.stop_token, [this] { client->stop(); });
+                httplib::Request request;
+                request.method = "OPTIONS";
+                request.path = health_path;
+                request.headers = std::move(headers);
+                bool response_too_large = false;
+                request.content_receiver = [&](const char* data, size_t size, uint64_t, uint64_t) {
+                    if (size > static_cast<uint64_t>(max_encoded_response_bytes) ||
+                        request.body.size() >
+                            static_cast<uint64_t>(max_encoded_response_bytes) - size) {
+                        response_too_large = true;
+                        return false;
+                    }
+                    request.body.append(data, size);
+                    return true;
+                };
+                httplib::Error transport_error = httplib::Error::Success;
+                max_timeout.start(request);
+                const bool sent = client->send(request, response, transport_error);
+                if (response_too_large) {
+                    throw HttpClientError(
+                        HttpClientErrorKind::LIMIT,
+                        "HTTP capability response exceeds max_encoded_response_bytes (" +
+                            std::to_string(max_encoded_response_bytes) + ")",
+                        0, "OPTIONS", request_id);
+                }
+                if (!sent) {
+                    if (attempt + 1 < attempts && !options.stop_token.stop_requested() &&
+                        !deadline_expired(options)) {
+                        continue;
+                    }
+                    const HttpClientErrorKind kind =
+                        classify_transport_error(transport_error, options, secure_transport);
+                    throw HttpClientError(kind,
+                                          std::string("HTTP capability discovery failed: ") +
+                                              httplib::to_string(transport_error),
+                                          0, "OPTIONS", request_id);
+                }
+                // cpp-httplib routes a streaming receiver into Request::body;
+                // move it onto the response-shaped object used below.
+                response.body = std::move(request.body);
             }
-            // cpp-httplib routes a streaming receiver into Request::body;
-            // move it onto the response-shaped object used below.
-            response.body = std::move(request.body);
             std::optional<BoundedHttpResponse::StickyUpdate> sticky_update;
             if (sticky_session) {
                 sticky_update =
@@ -1720,6 +1784,7 @@ private:
     }
 
     std::unique_ptr<httplib::Client> client;
+    std::unique_ptr<SocksHttpClient> socks_client;
     std::timed_mutex mutex;
     RetryPolicy retry_policy;
     TlsOptions tls_options;
@@ -1849,6 +1914,13 @@ HttpClientBuilder& HttpClientBuilder::client_certificate(std::string certificate
     if (!impl_) throw std::logic_error("HttpClientBuilder is moved from");
     impl_->tls_options.client_certificate_file = std::move(certificate_file);
     impl_->tls_options.client_private_key_file = std::move(private_key_file);
+    return *this;
+}
+
+HttpClientBuilder& HttpClientBuilder::tcp_proxy(std::string proxy_uri) {
+    if (!impl_) throw std::logic_error("HttpClientBuilder is moved from");
+    validate_socks5h_http_proxy_uri(proxy_uri);
+    impl_->config.tcp_proxy = std::move(proxy_uri);
     return *this;
 }
 

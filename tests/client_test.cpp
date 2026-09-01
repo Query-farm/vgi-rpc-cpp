@@ -5,6 +5,7 @@
 
 #include "vgi_rpc/arrow_utils.h"
 #include "vgi_rpc/client.h"
+#include "vgi_rpc/http_client.h"
 #include "vgi_rpc/metadata.h"
 #include "vgi_rpc/result.h"
 #include "vgi_rpc/shm.h"
@@ -19,9 +20,11 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cctype>
 #include <cstring>
 #include <exception>
 #include <memory>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -551,5 +554,121 @@ TEST_CASE("SOCKS5h uses one deadline while waiting for proxy negotiation",
     REQUIRE_THROWS(ClientTransport::connect_tcp("target.example", 9400, options));
     proxy.join();
     (void)::close(listener);
+}
+
+TEST_CASE("HTTP SOCKS5h sends unresolved origins only to the proxy and bounds headers",
+          "[http-client][socks5h]") {
+    int listener = ::socket(AF_INET, SOCK_STREAM, 0);
+    REQUIRE(listener >= 0);
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    REQUIRE(::bind(listener, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0);
+    REQUIRE(::listen(listener, 1) == 0);
+    socklen_t address_size = sizeof(address);
+    REQUIRE(::getsockname(listener, reinterpret_cast<sockaddr*>(&address), &address_size) == 0);
+
+    std::string observed_host;
+    uint16_t observed_port = 0;
+    std::exception_ptr server_error;
+    std::thread proxy([&] {
+        int client_socket = -1;
+        try {
+            client_socket = ::accept(listener, nullptr, nullptr);
+            if (client_socket < 0) throw std::runtime_error("fake HTTP SOCKS proxy accept failed");
+            std::array<uint8_t, 3> greeting{};
+            recv_exact_test(client_socket, greeting.data(), greeting.size());
+            if (greeting != std::array<uint8_t, 3>{0x05, 0x01, 0x00}) {
+                throw std::runtime_error("unexpected HTTP SOCKS greeting");
+            }
+            send_fragmented_test(client_socket, {0x05, 0x00});
+            std::array<uint8_t, 5> request{};
+            recv_exact_test(client_socket, request.data(), request.size());
+            if (request[0] != 0x05 || request[1] != 0x01 || request[2] != 0x00 ||
+                request[3] != 0x03) {
+                throw std::runtime_error("HTTP origin was not encoded as a SOCKS domain");
+            }
+            std::vector<uint8_t> hostname(request[4]);
+            recv_exact_test(client_socket, hostname.data(), hostname.size());
+            observed_host.assign(hostname.begin(), hostname.end());
+            std::array<uint8_t, 2> port{};
+            recv_exact_test(client_socket, port.data(), port.size());
+            observed_port = static_cast<uint16_t>((port[0] << 8) | port[1]);
+            send_fragmented_test(client_socket, {0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0x20, 0x00});
+
+            std::string http_headers;
+            for (std::array<char, 1> byte{}; http_headers.find("\r\n\r\n") == std::string::npos;) {
+                const auto received = ::recv(client_socket, byte.data(), byte.size(), 0);
+                if (received <= 0) throw std::runtime_error("truncated HTTP request via SOCKS");
+                http_headers.push_back(byte[0]);
+                if (http_headers.size() > 64 * 1024) {
+                    throw std::runtime_error("oversized HTTP headers via SOCKS");
+                }
+            }
+            std::string lower_headers = http_headers;
+            std::transform(
+                lower_headers.begin(), lower_headers.end(), lower_headers.begin(),
+                [](unsigned char byte) { return static_cast<char>(std::tolower(byte)); });
+            const auto length_start = lower_headers.find("content-length:");
+            if (length_start != std::string::npos) {
+                const auto value_start = lower_headers.find_first_not_of(" \t", length_start + 15);
+                const auto value_end = lower_headers.find("\r\n", value_start);
+                const size_t content_length = static_cast<size_t>(
+                    std::stoull(lower_headers.substr(value_start, value_end - value_start)));
+                std::vector<uint8_t> request_body(content_length);
+                recv_exact_test(client_socket, request_body.data(), request_body.size());
+            }
+            const std::string response =
+                "HTTP/1.1 200 OK\r\nX-Oversized: " + std::string(70 * 1024, 'a') +
+                "\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            size_t sent = 0;
+            while (sent < response.size()) {
+                const auto count =
+                    ::send(client_socket, response.data() + sent, response.size() - sent, 0);
+                // The client is expected to abort the transfer as soon as its
+                // header cap trips, so a short final send is not a proxy error.
+                if (count <= 0) break;
+                sent += static_cast<size_t>(count);
+            }
+            (void)::shutdown(client_socket, SHUT_WR);
+        } catch (...) {
+            server_error = std::current_exception();
+        }
+        if (client_socket >= 0) (void)::close(client_socket);
+    });
+
+    HttpClientConfig config;
+    config.prefix = "";
+    config.compression_level = std::nullopt;
+    config.tcp_proxy = "socks5h://127.0.0.1:" + std::to_string(ntohs(address.sin_port));
+    auto http_client =
+        HttpClient::builder("http://must-not-resolve.invalid:9400").config(config).build();
+    bool call_succeeded = false;
+    std::optional<HttpClientErrorKind> observed_error;
+    std::string observed_error_message;
+    try {
+        (void)http_client.call("echo", AnnotatedBatch::data(make_empty_batch(empty_schema())));
+        call_succeeded = true;
+    } catch (const HttpClientError& error) {
+        observed_error = error.kind();
+        observed_error_message = error.what();
+    } catch (...) {
+        (void)::shutdown(listener, SHUT_RDWR);
+        (void)::close(listener);
+        proxy.join();
+        throw;
+    }
+    proxy.join();
+    (void)::close(listener);
+    if (server_error) std::rethrow_exception(server_error);
+    REQUIRE(observed_host == "must-not-resolve.invalid");
+    REQUIRE(observed_port == 9400);
+    REQUIRE_FALSE(call_succeeded);
+    INFO(observed_error_message);
+    REQUIRE(observed_error == HttpClientErrorKind::LIMIT);
+
+    config.tcp_proxy = "socks5h://user@127.0.0.1:1080";
+    REQUIRE_THROWS_AS(HttpClient::builder("http://example.invalid").config(config).build(),
+                      std::invalid_argument);
 }
 #endif

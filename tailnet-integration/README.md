@@ -10,13 +10,14 @@ The adapter exposes only transport surfaces implemented by the C++ SDK:
 | `client-tcp` direct | yes | Raw VGI over Tailnet TCP |
 | `client-tcp` via SOCKS5h | yes | Proxy-side DNS; no direct fallback |
 | `client-http` direct | yes | HTTPS and spoofed Serve-header assertion |
-| `client-http` via SOCKS5h | no | `HttpClient` has no per-client proxy dialer |
-| `server-tcp` | yes | Direct LocalAPI WhoIs with primary Tailnet auth |
-| `server-http` | no | The Serve header provider exists, but C++ HTTP serving does not yet accept peer identity providers/policies |
+| `client-http` via SOCKS5h | yes | Proxy-side DNS; no direct fallback |
+| `server-tcp` | yes | LocalAPI WhoIs with primary Tailnet auth; optional required PROXY v2 and Service target |
+| `server-http` | yes | Tailscale Serve headers from explicitly trusted proxy IPs; capability-only requests remain anonymous |
 
-Raw TCP PROXY v2 is implemented by the C++ library, but this adapter does not
-claim a Tailscale Service qualification until the canonical live topology
-exercises an adjacent trusted PROXY v2 sender.
+For a Tailscale Service qualification, `server-tcp` accepts
+`--proxy-protocol-v2 --trusted-proxy-address <exact-ip> --service-name svc:...`.
+The trusted address is the immediate PROXY sender, and the listener rejects
+connections without a valid PROXY v2 preamble.
 
 Build locally with `-DVGI_RPC_BUILD_TAILNET_ADAPTER=ON`, or build the container:
 

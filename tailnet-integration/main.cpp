@@ -10,6 +10,7 @@
 #include <vgi_rpc/client.h>
 #include <vgi_rpc/crypto.h>
 #include <vgi_rpc/http_client.h>
+#include <vgi_rpc/http_config.h>
 #include <vgi_rpc/identity.h>
 #include <vgi_rpc/proxy_protocol_v2.h>
 #include <vgi_rpc/server.h>
@@ -63,7 +64,8 @@ struct Expectation {
 class Options {
 public:
     Options(int argc, char** argv, int first) {
-        static const std::set<std::string> flags = {"--expect-authenticated", "--expect-proxy"};
+        static const std::set<std::string> flags = {"--expect-authenticated", "--expect-proxy",
+                                                    "--proxy-protocol-v2"};
         for (int index = first; index < argc; ++index) {
             const std::string name = argv[index];
             if (!name.starts_with("--"))
@@ -425,14 +427,15 @@ void run_tcp_client(int argc, char** argv) {
 
 void run_http_client(int argc, char** argv) {
     const Options options(argc, argv, 2);
-    options.allow({"--url", "--spoof-login", "--expected-issuer", "--expected-evidence-source",
-                   "--expected-assurance", "--expected-subject-kind",
+    options.allow({"--url", "--proxy", "--spoof-login", "--expected-issuer",
+                   "--expected-evidence-source", "--expected-assurance", "--expected-subject-kind",
                    "--expected-subject-stability", "--expected-capability", "--expected-tag",
                    "--expected-target-kind", "--expected-target-value", "--expect-authenticated",
                    "--expect-proxy"});
     const auto spoof_login = options.require("--spoof-login");
     auto builder = HttpClient::builder(options.require("--url"));
     builder.prefix("").protocol_version("2.0.0").header("Tailscale-User-Login", spoof_login);
+    if (const auto proxy = options.optional("--proxy")) builder.tcp_proxy(*proxy);
     auto client = builder.build();
     const auto expected = client_expectation(options, "http");
     const auto request = AnnotatedBatch::data(empty_batch());
@@ -465,8 +468,15 @@ std::unique_ptr<Server> build_probe_server(Expectation expected) {
 void run_tcp_server(int argc, char** argv) {
     const Options options(argc, argv, 2);
     options.allow({"--host", "--port", "--issuer", "--localapi-socket", "--expected-capability",
-                   "--expected-tag"});
+                   "--expected-tag", "--proxy-protocol-v2", "--trusted-proxy-address",
+                   "--service-name"});
     const auto issuer = options.require("--issuer");
+    const bool proxy_protocol_v2 = options.flag("--proxy-protocol-v2");
+    const auto trusted_proxy = options.optional("--trusted-proxy-address");
+    const auto service_name = options.optional("--service-name");
+    if (proxy_protocol_v2 && !trusted_proxy) {
+        throw std::invalid_argument("--trusted-proxy-address is required with --proxy-protocol-v2");
+    }
     Expectation expected{
         .issuer = issuer,
         .transport = "tcp",
@@ -475,11 +485,11 @@ void run_tcp_server(int argc, char** argv) {
         .subject_kind = PeerSubjectKind::TAGGED_NODE,
         .subject_stability = SubjectStability::STABLE,
         .capability = options.require("--expected-capability"),
-        .capability_target_kind = "destination_ip",
-        .capability_target_value = std::nullopt,
+        .capability_target_kind = service_name ? "service" : "destination_ip",
+        .capability_target_value = service_name,
         .tag = options.require("--expected-tag"),
         .authenticated = true,
-        .proxy_present = false,
+        .proxy_present = proxy_protocol_v2,
         .spoofed_subject_fingerprint = std::nullopt,
     };
     TailscaleLocalAPIOptions localapi;
@@ -489,6 +499,9 @@ void run_tcp_server(int argc, char** argv) {
     auto provider = tailscale_localapi_identity_provider(std::move(localapi));
     auto policy = peer_identity_primary(std::string(kProvider));
     TcpServerOptions server_options;
+    server_options.proxy_protocol_v2_required = proxy_protocol_v2;
+    if (trusted_proxy) server_options.trusted_proxy_addresses = {*trusted_proxy};
+    if (service_name) server_options.service_name = *service_name;
     server_options.resolve_identity = [provider = std::move(provider), policy = std::move(policy)](
                                           const PeerResolutionContext& context) mutable {
         PeerEvidenceSet evidence({provider(context)});
@@ -498,6 +511,44 @@ void run_tcp_server(int argc, char** argv) {
     auto server = build_probe_server(std::move(expected));
     server->serve_tcp(options.value_or("--host", "0.0.0.0"),
                       parse_port(options.value_or("--port", "19400")), server_options);
+}
+
+void run_http_server(int argc, char** argv) {
+    const Options options(argc, argv, 2);
+    options.allow({"--host", "--port", "--issuer", "--trusted-proxy-ipv4", "--trusted-proxy-ipv6",
+                   "--expected-capability"});
+    const auto issuer = options.require("--issuer");
+    Expectation expected{
+        .issuer = issuer,
+        .transport = "http",
+        .evidence_source = "serve_proxy",
+        .assurance = IdentityAssurance::CONFIGURED_PROXY,
+        .subject_kind = PeerSubjectKind::UNKNOWN,
+        .subject_stability = SubjectStability::NONE,
+        .capability = options.require("--expected-capability"),
+        .capability_target_kind = std::nullopt,
+        .capability_target_value = std::nullopt,
+        .tag = std::nullopt,
+        .authenticated = false,
+        .proxy_present = true,
+        .spoofed_subject_fingerprint = std::nullopt,
+    };
+    TailscaleServeOptions serve;
+    serve.issuer = issuer;
+    serve.trusted_proxy_addresses = {
+        options.value_or("--trusted-proxy-ipv4", "127.0.0.1"),
+        options.value_or("--trusted-proxy-ipv6", "::1"),
+    };
+    HttpConfig config;
+    config.host = options.value_or("--host", "127.0.0.1");
+    config.port = parse_port(options.value_or("--port", "19400"));
+    config.prefix = "";
+    config.peer_identity_providers = {
+        tailscale_serve_identity_provider(std::move(serve)),
+    };
+    config.peer_authentication_policy = require_peer_identity(std::string(kProvider));
+    auto server = build_probe_server(std::move(expected));
+    server->serve_http(config);
 }
 
 nlohmann::json tcp_snapshot_fixture() {
@@ -575,6 +626,16 @@ void run_self_test() {
                      nlohmann::json::json_pointer("/auth/peer_evidence_binding_present"), false);
     require_rejected(snapshot, expected,
                      nlohmann::json::json_pointer("/identities/0/capability_target/kind"), "node");
+
+    auto service_expected = expected;
+    service_expected.capability_target_kind = "service";
+    service_expected.capability_target_value = "svc:vgi-ci";
+    service_expected.proxy_present = true;
+    auto service_snapshot = snapshot;
+    service_snapshot["identities"][0]["capability_target"] = {{"kind", "service"},
+                                                              {"value", "svc:vgi-ci"}};
+    service_snapshot["identities"][0]["proxy_present"] = true;
+    (void)validate_snapshot(service_snapshot.dump(), service_expected);
 
     const std::string spoof_login = "attacker@example.invalid";
     Expectation serve{
@@ -660,16 +721,13 @@ void run(int argc, char** argv) {
     }
     if (argc < 2) {
         throw std::invalid_argument(
-            "usage: vgi-rpc-tailnet-cpp client-tcp|client-http|server-tcp [options]");
+            "usage: vgi-rpc-tailnet-cpp client-tcp|client-http|server-tcp|server-http [options]");
     }
     const std::string_view mode = argv[1];
     if (mode == "client-tcp") return run_tcp_client(argc, argv);
     if (mode == "client-http") return run_http_client(argc, argv);
     if (mode == "server-tcp") return run_tcp_server(argc, argv);
-    if (mode == "server-http") {
-        throw std::invalid_argument(
-            "server-http is unsupported: C++ HTTP serving does not expose peer identity hooks");
-    }
+    if (mode == "server-http") return run_http_server(argc, argv);
     throw std::invalid_argument("unknown adapter mode");
 }
 

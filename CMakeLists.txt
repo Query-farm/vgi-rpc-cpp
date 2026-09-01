@@ -19,6 +19,7 @@ set(CMAKE_CXX_VISIBILITY_PRESET hidden)
 set(CMAKE_VISIBILITY_INLINES_HIDDEN ON)
 
 find_package(Arrow CONFIG REQUIRED)
+find_package(CURL REQUIRED)
 find_package(nlohmann_json CONFIG REQUIRED)
 find_package(httplib CONFIG REQUIRED)
 find_package(zstd CONFIG REQUIRED)
@@ -72,6 +73,7 @@ add_library(vgi_rpc
     src/access_log.cpp
     src/http_transport.cpp
     src/http_client.cpp
+    src/http_socks5h.cpp
     src/client.cpp
     src/client_description.cpp
     src/client_external.cpp
@@ -132,6 +134,7 @@ target_link_libraries(vgi_rpc PUBLIC
 # no sodium header and links no sodium symbol of its own.
 target_link_libraries(vgi_rpc PRIVATE unofficial-sodium::sodium)
 target_link_libraries(vgi_rpc PRIVATE OpenSSL::Crypto)
+target_link_libraries(vgi_rpc PRIVATE CURL::libcurl)
 target_link_libraries(vgi_rpc PRIVATE zstd::libzstd)
 # Gzip is a mandatory HTTP wire codec. cpp-httplib uses zlib to stream
 # request decompression into our decoded-byte cap, and http_transport.cpp uses

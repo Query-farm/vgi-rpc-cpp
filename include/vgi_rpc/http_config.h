@@ -7,14 +7,17 @@
 #pragma once
 
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <map>
 #include <optional>
 #include <string>
+#include <vector>
 
 #include "vgi_rpc/crypto.h"
 #include "vgi_rpc/export.h"
+#include "vgi_rpc/identity.h"
 #include "vgi_rpc/proxy_proof.h"
 
 namespace vgi_rpc {
@@ -126,6 +129,19 @@ struct HttpConfig {
     // request.  Never enable in production — a request must not steer the
     // reason its rejection reports.
     bool honour_requested_auth_reason = false;
+
+    // Off-wire transport identity. Providers receive the accepted HTTP peer,
+    // original header multiplicity, and logical destination. Evidence is
+    // resolved once per request and passed to CallContext; no VGI wire change
+    // is involved.
+    std::vector<PeerIdentityProvider> peer_identity_providers;
+    PeerAuthenticationPolicy peer_authentication_policy;
+    std::optional<std::string> peer_service_name;
+    // Cooperative budget exposed to synchronous providers through
+    // PeerResolutionContext::deadline. Custom providers must honor that
+    // deadline and return promptly; the server cannot preempt a callback.
+    // Built-in header-only providers do not perform blocking I/O.
+    std::chrono::milliseconds peer_identity_resolution_timeout{1000};
 
     // Proxy proof.
     ProofMode proof_mode = ProofMode::OFF;

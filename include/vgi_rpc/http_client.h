@@ -115,6 +115,12 @@ struct HttpClientConfig {
     int read_timeout_seconds = 30;
     int write_timeout_seconds = 30;
     bool keep_alive = true;
+    // Optional explicit SOCKS5h proxy for the VGI RPC origin. The origin
+    // hostname is resolved by the proxy, NO AUTH is the only supported method,
+    // and failure never falls back to a direct connection. Externalized object
+    // upload/download URLs retain ClientExternalHttp's separate validation and
+    // transport policy; this option does not proxy those auxiliary requests.
+    std::optional<std::string> tcp_proxy;
     // Sending credentials over plain HTTP is unsafe and therefore refused by
     // default.  Set this only for an already-protected local/private channel.
     bool allow_insecure_credentials = false;
@@ -221,6 +227,7 @@ public:
     HttpClientBuilder& custom_ca_file(std::string path);
     HttpClientBuilder& client_certificate(std::string certificate_file,
                                           std::string private_key_file);
+    HttpClientBuilder& tcp_proxy(std::string proxy_uri);
     HttpClientBuilder& dangerous_disable_tls_verification_for_testing(bool disabled = true);
     // External-location resolution is securely enabled by default. Override
     // limits/policy here; LOOPBACK_HTTP_TEST is only for local conformance.
