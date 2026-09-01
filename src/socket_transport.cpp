@@ -14,6 +14,7 @@
 #include "vgi_rpc/proxy_protocol_v2.h"
 #include "vgi_rpc/wire.h"
 #include "socket_transport_internal.h"
+#include "iroh_identity_internal.h"
 
 #include <algorithm>
 #include <array>
@@ -187,10 +188,11 @@ ProxyProtocolV2Address read_proxy_protocol_v2(
     std::vector<uint8_t> preamble(total);
     std::copy(prefix.begin(), prefix.end(), preamble.begin());
     read_exact_until(fd, std::span<uint8_t>(preamble).subspan(prefix.size()), deadline);
-    return parse_proxy_protocol_v2(preamble, options.maximum_proxy_preamble_bytes);
+    return parse_proxy_protocol_v2(preamble, options.maximum_proxy_preamble_bytes,
+                                   {.allow_iroh_identity = !options.iroh_proxy_issuer.empty()});
 }
 
-TcpServerOptions::ResolvedIdentity resolve_tcp_identity(
+TcpServerOptions::ResolvedIdentity resolve_tcp_identity_impl(
     int fd, const AcceptedPeer& peer, const TcpServerOptions& options,
     std::chrono::steady_clock::time_point connection_setup_deadline) {
     PeerResolutionContext context;
@@ -210,9 +212,20 @@ TcpServerOptions::ResolvedIdentity resolve_tcp_identity(
         if (normalized_peer.empty() || !trusted)
             throw ProxyProtocolV2Error("immediate peer is not a trusted PROXY v2 sender");
         const auto asserted = read_proxy_protocol_v2(fd, options, connection_setup_deadline);
-        context.asserted_peer = socket_endpoint(asserted.source_address, asserted.source_port);
-        context.destination_address =
-            socket_endpoint(asserted.destination_address, asserted.destination_port);
+        if (asserted.iroh_endpoint_id) {
+            static constexpr char hex[] = "0123456789abcdef";
+            std::string endpoint;
+            endpoint.reserve(64);
+            for (const uint8_t byte : *asserted.iroh_endpoint_id) {
+                endpoint += hex[byte >> 4];
+                endpoint += hex[byte & 0x0f];
+            }
+            context.metadata["iroh_endpoint_id"] = endpoint;
+        } else {
+            context.asserted_peer = socket_endpoint(asserted.source_address, asserted.source_port);
+            context.destination_address =
+                socket_endpoint(asserted.destination_address, asserted.destination_port);
+        }
     }
 
     context.deadline = std::min(socket_detail::deadline_after(std::chrono::steady_clock::now(),
@@ -221,8 +234,19 @@ TcpServerOptions::ResolvedIdentity resolve_tcp_identity(
     context.validate();
     if (context.remaining_budget() <= std::chrono::steady_clock::duration::zero())
         throw PeerIdentityUnavailable("connection setup budget exhausted");
-    return options.resolve_identity ? options.resolve_identity(context)
-                                    : TcpServerOptions::ResolvedIdentity{};
+    auto resolved = options.resolve_identity ? options.resolve_identity(context)
+                                             : TcpServerOptions::ResolvedIdentity{};
+    const auto endpoint = context.metadata.find("iroh_endpoint_id");
+    if (endpoint != context.metadata.end()) {
+        auto identity = iroh_internal::forwarded_identity(endpoint->get<std::string>(),
+                                                          options.iroh_proxy_issuer, "tcp",
+                                                          "proxy_protocol_v2", peer.endpoint);
+        resolved.evidence =
+            resolved.evidence.with_result(PeerIdentityResult::available(std::move(identity)));
+    }
+    if (options.peer_authentication_policy)
+        resolved.auth = options.peer_authentication_policy(resolved.evidence, resolved.auth);
+    return resolved;
 }
 
 // Socket buffer asked for on an accepted Unix domain socket.  macOS gives one
@@ -295,6 +319,12 @@ void accept_loop(int listen_fd, TransportKind transport_kind, size_t maximum_act
 
 }  // namespace
 
+TcpServerOptions::ResolvedIdentity socket_detail::resolve_tcp_identity(
+    int fd, const socket_detail::AcceptedPeer& peer, const TcpServerOptions& options,
+    std::chrono::steady_clock::time_point connection_setup_deadline) {
+    return resolve_tcp_identity_impl(fd, peer, options, connection_setup_deadline);
+}
+
 void Server::serve_unix(const std::string& path) {
     // A leftover socket file from an unclean exit would make bind fail with
     // EADDRINUSE even though nothing is listening.
@@ -355,6 +385,11 @@ void Server::serve_tcp(const std::string& host, int port, const TcpServerOptions
         throw std::invalid_argument("TCP admission, timeout, and framing limits must be positive");
     if (options.proxy_protocol_v2_required && options.trusted_proxy_addresses.empty())
         throw std::invalid_argument("PROXY v2 requires at least one exact trusted proxy address");
+    if (!options.iroh_proxy_issuer.empty()) {
+        if (!options.proxy_protocol_v2_required)
+            throw std::invalid_argument("Iroh forwarding requires required PROXY v2");
+        iroh_internal::validate_issuer(options.iroh_proxy_issuer);
+    }
     std::unordered_set<std::string> normalized_proxies;
     for (const auto& address : options.trusted_proxy_addresses) {
         const auto normalized = normalize_ip(address);
@@ -416,7 +451,8 @@ void Server::serve_tcp(const std::string& host, int port, const TcpServerOptions
         options.maximum_pending_connections, [this, options](int fd, const AcceptedPeer& peer) {
             const auto setup_deadline =
                 socket_detail::deadline_after(peer.accepted_at, options.connection_setup_timeout);
-            const auto identity = resolve_tcp_identity(fd, peer, options, setup_deadline);
+            const auto identity =
+                socket_detail::resolve_tcp_identity(fd, peer, options, setup_deadline);
             serve_socket_fd(fd, TransportKind::TCP, identity.auth, identity.evidence,
                             setup_deadline, options.idle_read_timeout, options.write_timeout);
         });

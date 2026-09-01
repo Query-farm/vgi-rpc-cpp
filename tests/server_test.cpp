@@ -313,6 +313,17 @@ TEST_CASE("serve_tcp: PROXY v2 configuration fails closed before binding", "[ser
     TcpServerOptions invalid_admission;
     invalid_admission.maximum_active_connections = 0;
     REQUIRE_THROWS_AS(server->serve_tcp("127.0.0.1", 0, invalid_admission), std::invalid_argument);
+
+    TcpServerOptions iroh_without_proxy;
+    iroh_without_proxy.iroh_proxy_issuer = "production-mesh";
+    REQUIRE_THROWS_AS(server->serve_tcp("127.0.0.1", 0, iroh_without_proxy), std::invalid_argument);
+
+    TcpServerOptions invalid_iroh_issuer;
+    invalid_iroh_issuer.proxy_protocol_v2_required = true;
+    invalid_iroh_issuer.trusted_proxy_addresses = {"127.0.0.1"};
+    invalid_iroh_issuer.iroh_proxy_issuer = "bad\nissuer";
+    REQUIRE_THROWS_AS(server->serve_tcp("127.0.0.1", 0, invalid_iroh_issuer),
+                      std::invalid_argument);
 }
 
 TEST_CASE("on_serve_start serializes concurrent callers and fires once after success",

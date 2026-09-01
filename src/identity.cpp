@@ -337,6 +337,15 @@ const PeerIdentity& PeerEvidenceSet::require_usable_provider(const std::string& 
     require_available_provider(provider);
     return unique_verified_subject(provider);
 }
+PeerEvidenceSet PeerEvidenceSet::with_result(PeerIdentityResult result) const {
+    result.validate();
+    PeerEvidenceSet combined = *this;
+    if (!combined.statuses_.emplace(result.provider, result.status).second)
+        throw std::invalid_argument("duplicate peer provider");
+    std::move(result.identities.begin(), result.identities.end(),
+              std::back_inserter(combined.identities_));
+    return combined;
+}
 std::string PeerEvidenceSet::binding_digest(const std::vector<std::string>& providers,
                                             const AuthContext* application_auth) const {
     std::set<std::string> selected(providers.begin(), providers.end());

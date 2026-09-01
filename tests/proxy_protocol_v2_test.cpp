@@ -48,6 +48,16 @@ std::vector<uint8_t> ipv6_header() {
     return value;
 }
 
+std::vector<uint8_t> iroh_header(uint8_t version = 1, size_t endpoint_bytes = 32) {
+    std::vector<uint8_t> body{VGI_IROH_ENDPOINT_TLV, 0, static_cast<uint8_t>(1 + endpoint_bytes),
+                              version};
+    for (size_t index = 0; index < endpoint_bytes; ++index)
+        body.push_back(static_cast<uint8_t>(index));
+    auto value = prefix(0x01, 0x00, static_cast<uint16_t>(body.size()));
+    value.insert(value.end(), body.begin(), body.end());
+    return value;
+}
+
 }  // namespace
 
 TEST_CASE("PROXY v2 parses TCP over IPv4 and IPv6", "[proxy-v2]") {
@@ -96,4 +106,52 @@ TEST_CASE("PROXY v2 rejects unsafe commands families and sizes", "[proxy-v2]") {
 
     auto oversized = prefix(0x01, 0x11, 600);
     REQUIRE_THROWS_AS(proxy_protocol_v2_size(oversized), ProxyProtocolV2Error);
+}
+
+TEST_CASE("PROXY v2 Iroh identity requires the dedicated UNSPEC opt-in", "[proxy-v2][iroh]") {
+    const auto preamble = iroh_header();
+    REQUIRE_THROWS_AS(parse_proxy_protocol_v2(preamble), ProxyProtocolV2Error);
+
+    const auto parsed = parse_proxy_protocol_v2(
+        preamble, 536, ProxyProtocolV2ParseOptions{.allow_iroh_identity = true});
+    REQUIRE(parsed.source_address.empty());
+    REQUIRE(parsed.destination_address.empty());
+    REQUIRE(parsed.iroh_endpoint_id);
+    for (size_t index = 0; index < parsed.iroh_endpoint_id->size(); ++index)
+        REQUIRE((*parsed.iroh_endpoint_id)[index] == static_cast<uint8_t>(index));
+}
+
+TEST_CASE("ordinary PROXY v2 parsing never promotes an Iroh TLV", "[proxy-v2][iroh]") {
+    auto value = ipv4_header();
+    const auto identity = iroh_header();
+    value[14] = 0;
+    value[15] = 48;
+    value.insert(value.end(), identity.begin() + 16, identity.end());
+    const auto parsed = parse_proxy_protocol_v2(value);
+    REQUIRE(parsed.source_address == "192.0.2.7");
+    REQUIRE_FALSE(parsed.iroh_endpoint_id);
+}
+
+TEST_CASE("PROXY v2 rejects ambiguous or malformed Iroh identities", "[proxy-v2][iroh]") {
+    const auto enabled = ProxyProtocolV2ParseOptions{.allow_iroh_identity = true};
+
+    const auto missing = prefix(0x01, 0x00, 0);
+    REQUIRE_THROWS_AS(parse_proxy_protocol_v2(missing, 536, enabled), ProxyProtocolV2Error);
+    REQUIRE_THROWS_AS(parse_proxy_protocol_v2(iroh_header(2), 536, enabled), ProxyProtocolV2Error);
+    REQUIRE_THROWS_AS(parse_proxy_protocol_v2(iroh_header(1, 31), 536, enabled),
+                      ProxyProtocolV2Error);
+
+    auto duplicate = iroh_header();
+    const std::vector<uint8_t> second(duplicate.begin() + 16, duplicate.end());
+    duplicate[14] = 0;
+    duplicate[15] = 72;
+    duplicate.insert(duplicate.end(), second.begin(), second.end());
+    REQUIRE_THROWS_AS(parse_proxy_protocol_v2(duplicate, 536, enabled), ProxyProtocolV2Error);
+
+    auto ip_identity = ipv4_header();
+    const auto identity = iroh_header();
+    ip_identity[14] = 0;
+    ip_identity[15] = 48;
+    ip_identity.insert(ip_identity.end(), identity.begin() + 16, identity.end());
+    REQUIRE_THROWS_AS(parse_proxy_protocol_v2(ip_identity, 536, enabled), ProxyProtocolV2Error);
 }

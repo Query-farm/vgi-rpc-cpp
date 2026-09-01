@@ -19,6 +19,15 @@ TEST_CASE("peer identity matches shared principal and binding vector") {
             "948ce118ddd5f212e7bfd62e13ffdba0675397c56a43060e98656965389e5367");
 }
 
+TEST_CASE("peer evidence extension preserves immutability and rejects duplicate providers") {
+    const PeerEvidenceSet empty;
+    const auto extended = empty.with_result(PeerIdentityResult::available(stable_identity()));
+    REQUIRE(empty.status("spiffe") == PeerIdentityStatus::OFF);
+    REQUIRE(extended.status("spiffe") == PeerIdentityStatus::AVAILABLE);
+    REQUIRE_THROWS_AS(extended.with_result(PeerIdentityResult::available(stable_identity())),
+                      std::invalid_argument);
+}
+
 TEST_CASE("primary authentication emits the normalized identity claim contract") {
     PeerEvidenceSet evidence({PeerIdentityResult::available(stable_identity())});
     const auto auth = peer_identity_primary("spiffe")(evidence, AuthContext::anonymous());

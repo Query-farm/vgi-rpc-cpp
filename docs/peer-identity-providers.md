@@ -1,6 +1,7 @@
-# Tailscale and trusted HTTP proxy identity
+# Tailscale, Iroh, and trusted HTTP proxy identity
 
-The C++ adapters in `tailscale_identity.h` and `spiffe_proxy_identity.h` turn
+The C++ adapters in `tailscale_identity.h`, `iroh_identity.h`, and
+`spiffe_proxy_identity.h` turn
 transport evidence into `PeerIdentity`; they do not make authorization
 decisions. Enable them explicitly and apply an authentication policy such as
 `peer_identity_primary` or `require_peer_identity` separately.
@@ -10,6 +11,27 @@ CIDRs, and source ranges are rejected. The backend must not be reachable around
 that proxy, and the proxy must replace or remove client-supplied identity
 headers. Raw duplicate headers and case-varied duplicates fail closed. Header
 evidence has `configured_proxy` assurance.
+
+## Iroh behind an HTTP bridge
+
+`iroh_forwarded_header_provider` consumes exactly one
+`VGI-Forwarded-Iroh-Endpoint` value after the exact immediate-proxy IP check.
+The value must be the canonical 64-character lowercase hexadecimal EndpointId;
+uppercase, short, duplicate, case-varied duplicate, control-bearing, and
+untrusted requests fail closed. The operator supplies the issuer locally.
+
+The resulting stable endpoint identity has `configured_proxy` assurance and
+`original_assurance=cryptographic_peer`: the adjacent bridge authenticated the
+Iroh peer cryptographically, while the worker authenticates only its trusted
+hop to that bridge. The backend must be unreachable except through the bridge,
+which must strip any client-provided forwarding header before setting its own.
+
+```cpp
+vgi_rpc::HttpConfig config;
+config.peer_identity_providers.push_back(vgi_rpc::iroh_forwarded_header_provider(
+    {.issuer = "production-mesh", .trusted_proxy_addresses = {"127.0.0.1"}}));
+config.peer_authentication_policy = vgi_rpc::peer_identity_primary("iroh");
+```
 
 ## Tailscale
 

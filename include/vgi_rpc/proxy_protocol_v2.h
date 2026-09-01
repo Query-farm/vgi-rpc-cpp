@@ -2,10 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -16,14 +18,20 @@
 
 namespace vgi_rpc {
 
-// Deliberately closed: raw VGI accepts only a relayed TCP connection with a
-// concrete IPv4 or IPv6 address. LOCAL, UNSPEC, UDP and Unix-family preambles
-// cannot establish caller evidence and are rejected.
 struct VGI_RPC_EXPORT ProxyProtocolV2Address {
     std::string source_address;
     std::string destination_address;
     uint16_t source_port = 0;
     uint16_t destination_port = 0;
+    // Present only on the dedicated opt-in PROXY/UNSPEC Iroh form. Ordinary
+    // parsing remains closed to UNSPEC and never promotes this TLV.
+    std::optional<std::array<uint8_t, 32>> iroh_endpoint_id;
+};
+
+inline constexpr uint8_t VGI_IROH_ENDPOINT_TLV = 0xe0;
+
+struct VGI_RPC_EXPORT ProxyProtocolV2ParseOptions {
+    bool allow_iroh_identity = false;
 };
 
 class VGI_RPC_EXPORT ProxyProtocolV2Error : public std::runtime_error {
@@ -40,6 +48,11 @@ VGI_RPC_EXPORT size_t proxy_protocol_v2_size(std::span<const uint8_t> prefix,
 // and ignored. No caller-controlled TLV is treated as identity evidence.
 VGI_RPC_EXPORT ProxyProtocolV2Address parse_proxy_protocol_v2(std::span<const uint8_t> preamble,
                                                               size_t maximum_bytes = 536);
+// Dedicated opt-in parser. allow_iroh_identity permits PROXY/UNSPEC only when
+// it carries exactly one fixed versioned VGI Iroh EndpointId TLV.
+VGI_RPC_EXPORT ProxyProtocolV2Address parse_proxy_protocol_v2(std::span<const uint8_t> preamble,
+                                                              size_t maximum_bytes,
+                                                              ProxyProtocolV2ParseOptions options);
 
 struct VGI_RPC_EXPORT TcpServerOptions {
     // Persistent raw connections consume one worker each. Admission is
@@ -78,6 +91,14 @@ struct VGI_RPC_EXPORT TcpServerOptions {
     // UNAVAILABLE PeerIdentityResult and passed to the configured policy;
     // throwing is a fail-closed connection rejection.
     std::function<ResolvedIdentity(const PeerResolutionContext&)> resolve_identity;
+
+    // Enables the fixed Iroh EndpointId TLV only on required PROXY v2
+    // connections from the exact trusted proxy allowlist. The issuer is
+    // worker-local configuration and is never accepted from the preamble.
+    std::string iroh_proxy_issuer;
+    // Runs after callback evidence is combined with built-in forwarded Iroh
+    // evidence. Empty means observe without changing callback authentication.
+    PeerAuthenticationPolicy peer_authentication_policy;
 };
 
 }  // namespace vgi_rpc

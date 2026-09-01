@@ -50,6 +50,7 @@ endif()
 
 add_library(vgi_rpc
     src/identity.cpp
+    src/iroh_identity.cpp
     src/tailscale_identity.cpp
     src/spiffe_proxy_identity.cpp
     src/proxy_protocol_v2.cpp

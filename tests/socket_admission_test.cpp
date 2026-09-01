@@ -12,6 +12,8 @@
 #include <chrono>
 #include <future>
 #include <mutex>
+#include <optional>
+#include <string>
 #include <sys/socket.h>
 #include <thread>
 #include <unistd.h>
@@ -26,6 +28,31 @@ std::array<int, 2> socket_pair() {
     std::array<int, 2> pair{-1, -1};
     REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM, 0, pair.data()) == 0);
     return pair;
+}
+
+std::vector<uint8_t> iroh_preamble() {
+    std::vector<uint8_t> value = {0x0d,
+                                  0x0a,
+                                  0x0d,
+                                  0x0a,
+                                  0x00,
+                                  0x0d,
+                                  0x0a,
+                                  0x51,
+                                  0x55,
+                                  0x49,
+                                  0x54,
+                                  0x0a,
+                                  0x21,
+                                  0x00,
+                                  0x00,
+                                  0x24,
+                                  vgi_rpc::VGI_IROH_ENDPOINT_TLV,
+                                  0x00,
+                                  0x21,
+                                  0x01};
+    for (uint8_t index = 0; index < 32; ++index) value.push_back(index);
+    return value;
 }
 
 }  // namespace
@@ -153,6 +180,68 @@ TEST_CASE("socket admission rejects without blocking and releases permits", "[so
     ::close(after_release[1]);
     std::lock_guard lock(failures_mutex);
     REQUIRE(failures == std::vector{ConnectionFailure::REJECTED});
+}
+
+TEST_CASE("trusted PROXY v2 Iroh identity is promoted before connection policy",
+          "[socket][admission][iroh]") {
+    auto pair = socket_pair();
+    auto preamble = iroh_preamble();
+    preamble.insert(preamble.end(), {'V', 'G', 'I'});
+    REQUIRE(::send(pair[1], preamble.data(), preamble.size(), 0) ==
+            static_cast<ssize_t>(preamble.size()));
+
+    vgi_rpc::TcpServerOptions options;
+    options.proxy_protocol_v2_required = true;
+    options.trusted_proxy_addresses = {"127.0.0.1"};
+    options.iroh_proxy_issuer = "production-mesh";
+    options.peer_authentication_policy = vgi_rpc::peer_identity_primary("iroh");
+    std::optional<vgi_rpc::PeerResolutionContext> observed;
+    options.resolve_identity = [&](const vgi_rpc::PeerResolutionContext& context) {
+        observed = context;
+        return vgi_rpc::TcpServerOptions::ResolvedIdentity{};
+    };
+    AcceptedPeer peer{"127.0.0.1", "127.0.0.1:43123", std::chrono::steady_clock::now()};
+    const auto resolved = resolve_tcp_identity(
+        pair[0], peer, options, std::chrono::steady_clock::now() + std::chrono::seconds(1));
+
+    constexpr const char* endpoint =
+        "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+    REQUIRE(observed);
+    REQUIRE_FALSE(observed->asserted_peer);
+    REQUIRE(observed->metadata["iroh_endpoint_id"] == endpoint);
+    const auto& identity = resolved.evidence.unique_verified_subject("iroh");
+    REQUIRE(identity.subject_key() == std::optional<std::string>(endpoint));
+    REQUIRE(identity.issuer() == "production-mesh");
+    REQUIRE(identity.assurance() == vgi_rpc::IdentityAssurance::CONFIGURED_PROXY);
+    REQUIRE(identity.attributes()["original_assurance"] == "cryptographic_peer");
+    REQUIRE(identity.proxy_address() == std::optional<std::string>("127.0.0.1:43123"));
+    REQUIRE(resolved.auth.authenticated);
+
+    std::array<uint8_t, 3> following{};
+    REQUIRE(::recv(pair[0], following.data(), following.size(), 0) == 3);
+    REQUIRE(following == std::array<uint8_t, 3>{'V', 'G', 'I'});
+    ::close(pair[0]);
+    ::close(pair[1]);
+}
+
+TEST_CASE("Iroh PROXY v2 rejects an untrusted immediate peer before reading a preamble",
+          "[socket][admission][iroh]") {
+    auto pair = socket_pair();
+    vgi_rpc::TcpServerOptions options;
+    options.proxy_protocol_v2_required = true;
+    options.trusted_proxy_addresses = {"127.0.0.1"};
+    options.iroh_proxy_issuer = "production-mesh";
+    AcceptedPeer peer{"192.0.2.1", "192.0.2.1:43123", std::chrono::steady_clock::now()};
+
+    try {
+        (void)resolve_tcp_identity(pair[0], peer, options,
+                                   std::chrono::steady_clock::now() + std::chrono::seconds(1));
+        FAIL("untrusted immediate peer was accepted");
+    } catch (const vgi_rpc::ProxyProtocolV2Error& error) {
+        REQUIRE(std::string(error.what()) == "immediate peer is not a trusted PROXY v2 sender");
+    }
+    ::close(pair[0]);
+    ::close(pair[1]);
 }
 
 #else

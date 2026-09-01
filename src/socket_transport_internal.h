@@ -34,6 +34,7 @@
 #include <vector>
 
 #include "vgi_rpc/wire.h"
+#include "vgi_rpc/proxy_protocol_v2.h"
 
 namespace vgi_rpc::socket_detail {
 
@@ -69,6 +70,10 @@ struct AcceptedPeer {
     std::string endpoint;
     std::chrono::steady_clock::time_point accepted_at = std::chrono::steady_clock::now();
 };
+
+TcpServerOptions::ResolvedIdentity resolve_tcp_identity(
+    int fd, const AcceptedPeer& peer, const TcpServerOptions& options,
+    std::chrono::steady_clock::time_point connection_setup_deadline);
 
 // Socket-only input adapter with an absolute deadline for the complete first
 // VGI frame, then a fresh bounded deadline for each subsequent read.  The

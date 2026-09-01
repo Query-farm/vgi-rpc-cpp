@@ -123,7 +123,9 @@ void serve_tcp(const std::string& host, int port,
 Serve persistent raw Arrow-IPC connections. `TcpServerOptions` configures
 finite active/pending admission, complete-setup and idle-read deadlines,
 bounded response writes, trusted PROXY v2 parsing, and an optional
-connection-snapshot identity resolver. Excess connections are rejected
+connection-snapshot identity resolver. `iroh_proxy_issuer` enables the fixed
+bridge-forwarded Iroh EndpointId form only on required PROXY v2, while
+`peer_authentication_policy` evaluates the combined evidence snapshot. Excess connections are rejected
 without blocking the accept loop. See [Trusted PROXY protocol v2
 listeners](../proxy-protocol-v2.md) for the trust and availability model.
 

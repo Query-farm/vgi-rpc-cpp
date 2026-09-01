@@ -27,12 +27,29 @@ options.resolve_identity = [](const vgi_rpc::PeerResolutionContext& peer) {
 server->serve_tcp("127.0.0.1", 9400, options);
 ```
 
+An Iroh-to-TCP bridge uses the same listener with an explicit local issuer and
+post-merge policy:
+
+```cpp
+options.iroh_proxy_issuer = "production-mesh";
+options.peer_authentication_policy = vgi_rpc::peer_identity_primary("iroh");
+```
+
+That opt-in permits only `PROXY` + `UNSPEC` carrying exactly one experimental
+TLV type `0xE0`. Its payload is version byte `1` followed by the raw 32-byte
+Iroh EndpointId. The listener renders the subject as exactly 64 lowercase hex
+characters. The issuer remains worker-local configuration; no preamble field
+can choose it. Evidence has `configured_proxy` assurance and the attribute
+`original_assurance=cryptographic_peer`, preserving that the bridge verified
+the Iroh connection while the worker verified only the adjacent forwarding
+hop.
+
 The listener:
 
 - checks the accepted socket's immediate peer against exact configured IP
   addresses before reading any asserted data;
 - accepts PROXY protocol version 2 only;
-- accepts the `PROXY` command with TCP over IPv4 or IPv6 only;
+- accepts the `PROXY` command with TCP over IPv4 or IPv6 only by default;
 - rejects `LOCAL`, `UNSPEC`, UDP, Unix addresses, malformed lengths,
   truncation, and oversized preambles;
 - structurally validates and ignores bounded unknown TLVs;
@@ -47,6 +64,14 @@ The listener:
   accept loop; and
 - reads exactly the declared preamble, leaving all following VGI bytes for the
   Arrow IPC reader.
+
+The ordinary `parse_proxy_protocol_v2` overload remains strict. Only
+`ProxyProtocolV2ParseOptions::allow_iroh_identity` (used automatically by a
+non-empty `iroh_proxy_issuer`) enables the dedicated UNSPEC form. Missing,
+duplicate, wrong-version, wrong-sized, or IP-family Iroh TLVs fail closed. The
+immediate peer is checked against the exact trusted IP allowlist before any
+preamble byte is consumed, and Iroh forwarding requires
+`proxy_protocol_v2_required=true`.
 
 The production defaults are 32 active connections, 128 additional admitted
 connections, a five-second complete setup budget, and 60-second read/write

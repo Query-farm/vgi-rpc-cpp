@@ -14,6 +14,7 @@ endfunction()
 
 vgi_rpc_add_test(crypto_test)
 vgi_rpc_add_test(identity_test)
+vgi_rpc_add_test(iroh_identity_test)
 vgi_rpc_add_test(identity_providers_test)
 target_link_libraries(identity_providers_test PRIVATE OpenSSL::Crypto)
 target_compile_definitions(identity_providers_test PRIVATE

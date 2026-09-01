@@ -130,6 +130,9 @@ public:
     const PeerIdentity& unique_verified_subject(const std::string& provider) const;
     void require_available_provider(const std::string& provider) const;
     const PeerIdentity& require_usable_provider(const std::string& provider) const;
+    // Return a new immutable snapshot with one additional provider result.
+    // Duplicate providers fail closed.
+    PeerEvidenceSet with_result(PeerIdentityResult result) const;
     std::string binding_digest(const std::vector<std::string>& providers,
                                const AuthContext* application_auth = nullptr) const;
 
