@@ -130,10 +130,18 @@ struct HttpConfig {
     // reason its rejection reports.
     bool honour_requested_auth_reason = false;
 
+    // Proxy proof.
+    ProofMode proof_mode = ProofMode::OFF;
+    std::string proof_origin_id;
+    std::string proof_secrets;
+    int proof_skew_seconds = 30;
+    bool proof_replay_cache = true;
+
     // Off-wire transport identity. Providers receive the accepted HTTP peer,
     // original header multiplicity, and logical destination. Evidence is
     // resolved once per request and passed to CallContext; no VGI wire change
-    // is involved.
+    // is involved. These fields remain at the end to preserve positional
+    // aggregate initialization of the pre-existing configuration fields.
     std::vector<PeerIdentityProvider> peer_identity_providers;
     PeerAuthenticationPolicy peer_authentication_policy;
     std::optional<std::string> peer_service_name;
@@ -142,13 +150,6 @@ struct HttpConfig {
     // deadline and return promptly; the server cannot preempt a callback.
     // Built-in header-only providers do not perform blocking I/O.
     std::chrono::milliseconds peer_identity_resolution_timeout{1000};
-
-    // Proxy proof.
-    ProofMode proof_mode = ProofMode::OFF;
-    std::string proof_origin_id;
-    std::string proof_secrets;
-    int proof_skew_seconds = 30;
-    bool proof_replay_cache = true;
 };
 
 }  // namespace vgi_rpc

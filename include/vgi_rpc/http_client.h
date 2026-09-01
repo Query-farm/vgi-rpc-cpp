@@ -115,12 +115,6 @@ struct HttpClientConfig {
     int read_timeout_seconds = 30;
     int write_timeout_seconds = 30;
     bool keep_alive = true;
-    // Optional explicit SOCKS5h proxy for the VGI RPC origin. The origin
-    // hostname is resolved by the proxy, NO AUTH is the only supported method,
-    // and failure never falls back to a direct connection. Externalized object
-    // upload/download URLs retain ClientExternalHttp's separate validation and
-    // transport policy; this option does not proxy those auxiliary requests.
-    std::optional<std::string> tcp_proxy;
     // Sending credentials over plain HTTP is unsafe and therefore refused by
     // default.  Set this only for an already-protected local/private channel.
     bool allow_insecure_credentials = false;
@@ -135,6 +129,14 @@ struct HttpClientConfig {
     // max_response_bytes, preserving existing configurations and guarantees.
     int64_t max_encoded_response_bytes = 0;
     int64_t max_decoded_response_bytes = 0;
+    // Optional explicit SOCKS5h proxy for the VGI RPC origin. The origin
+    // hostname is resolved by the proxy, NO AUTH is the only supported method,
+    // and failure never falls back to a direct connection. Externalized object
+    // upload/download URLs retain ClientExternalHttp's separate validation and
+    // transport policy; this option does not proxy those auxiliary requests.
+    // Kept at the end to preserve positional aggregate initialization of the
+    // pre-existing configuration fields.
+    std::optional<std::string> tcp_proxy;
 };
 
 class VGI_RPC_EXPORT HttpClientError : public std::runtime_error {
