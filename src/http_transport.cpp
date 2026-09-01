@@ -1592,6 +1592,16 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
 
 void HttpServer::run() {
     httplib::Server svr;
+#ifndef _WIN32
+    // Allow a supervised worker to reclaim its listening address immediately
+    // after a graceful or crash restart.  Without SO_REUSEADDR, established
+    // connections left in TIME_WAIT can make a replacement worker fail its
+    // bind even though the previous listener has already exited.
+    svr.set_socket_options([](socket_t socket) {
+        const int enabled = 1;
+        (void)::setsockopt(socket, SOL_SOCKET, SO_REUSEADDR, &enabled, sizeof(enabled));
+    });
+#endif
     // RPC responses are frequently split into a header segment and a small
     // Arrow payload. Leaving Nagle enabled can deadlock that trailing segment
     // against the peer's delayed ACK timer, adding roughly 40-50 ms even on
