@@ -283,7 +283,55 @@ TEST_CASE("Tailscale LocalAPI is deadline-bound, uncached, and scopes capabiliti
     REQUIRE(identity.assurance() == IdentityAssurance::LOCAL_DAEMON);
     REQUIRE(identity.subject_key() == std::optional<std::string>("user:123"));
     REQUIRE(identity.source_address() == std::optional<std::string>("100.64.0.10"));
+    REQUIRE_FALSE(identity.proxy_address().has_value());
     REQUIRE(identity.attributes()["capability_target"]["kind"] == "service");
+}
+
+TEST_CASE("Tailscale LocalAPI preserves the immediate proxy for an asserted peer") {
+    std::atomic<int> requests{0};
+    std::atomic<bool> request_correct{true};
+    TestHttpServer server([&](const httplib::Request& request, httplib::Response& response) {
+        ++requests;
+        request_correct = request.get_param_value("addr") == "100.64.0.10:4242" &&
+                          request.get_param_value("proto") == "tcp";
+        response.set_content(whois_json(false), "application/json");
+    });
+    auto provider = tailscale_localapi_identity_provider(
+        {"tailnet:example", {}, server.endpoint(), {}, 2s, 65'536, 32'768});
+    auto context = resolution();
+    context.transport = "tcp";
+    context.immediate_peer = "::ffff:127.0.0.1";
+    context.source_endpoint = "127.0.0.1:49152";
+    context.destination_address = "192.0.2.10:9400";
+
+    const auto available = provider(context);
+
+    REQUIRE(available.status == PeerIdentityStatus::AVAILABLE);
+    REQUIRE(requests == 1);
+    REQUIRE(request_correct);
+    const auto& identity = available.identities.front();
+    REQUIRE(identity.source_address() == std::optional<std::string>("100.64.0.10"));
+    REQUIRE(identity.proxy_address() == std::optional<std::string>("127.0.0.1"));
+}
+
+TEST_CASE("Tailscale LocalAPI rejects incomplete asserted-proxy context before I/O") {
+    std::atomic<int> requests{0};
+    TestHttpServer server([&](const httplib::Request&, httplib::Response& response) {
+        ++requests;
+        response.set_content(whois_json(false), "application/json");
+    });
+    auto provider = tailscale_localapi_identity_provider(
+        {"tailnet:example", {}, server.endpoint(), {}, 2s, 65'536, 32'768});
+    auto context = resolution();
+    context.transport = "tcp";
+
+    context.immediate_peer.reset();
+    REQUIRE(provider(context).status == PeerIdentityStatus::INVALID);
+    REQUIRE(requests == 0);
+
+    context.immediate_peer = "127.1";
+    REQUIRE(provider(context).status == PeerIdentityStatus::INVALID);
+    REQUIRE(requests == 0);
 }
 
 TEST_CASE("Tailscale LocalAPI separates status and malformed-response outcomes") {

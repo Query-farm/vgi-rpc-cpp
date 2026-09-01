@@ -605,7 +605,8 @@ std::string destination_ip(const std::string& value) {
 
 PeerIdentity whois_identity(const nlohmann::json& payload, const std::string& issuer,
                             const PeerResolutionContext& context, const std::string& source,
-                            nlohmann::json target) {
+                            nlohmann::json target,
+                            std::optional<std::string> proxy_address = std::nullopt) {
     if (!payload.is_object() || !payload.contains("Node") || !payload["Node"].is_object())
         throw std::invalid_argument("WhoIs response is missing Node");
     const auto& node = payload["Node"];
@@ -663,7 +664,7 @@ PeerIdentity whois_identity(const nlohmann::json& payload, const std::string& is
     return PeerIdentity(kProvider, "localapi", IdentityAssurance::LOCAL_DAEMON, issuer,
                         context.transport, kind, subject, SubjectStability::STABLE, true,
                         std::move(attributes), std::move(capabilities), true,
-                        destination_ip(source));
+                        destination_ip(source), std::move(proxy_address));
 }
 }  // namespace
 
@@ -749,6 +750,12 @@ PeerIdentityProvider tailscale_localapi_identity_provider(TailscaleLocalAPIOptio
                 options.max_response_header_bytes](const PeerResolutionContext& context) {
         try {
             context.validate();
+            std::optional<std::string> proxy_address;
+            if (context.asserted_peer) {
+                if (!context.immediate_peer || !parse_exact_ip(*context.immediate_peer))
+                    return result(kProvider, PeerIdentityStatus::INVALID);
+                proxy_address = destination_ip(*context.immediate_peer);
+            }
             const auto source =
                 context.asserted_peer
                     ? context.asserted_peer
@@ -791,8 +798,8 @@ PeerIdentityProvider tailscale_localapi_identity_provider(TailscaleLocalAPIOptio
             if (media_type != "application/json")
                 return result(kProvider, PeerIdentityStatus::INVALID);
             const auto payload = parse_bounded_json(response.body, body_limit);
-            return PeerIdentityResult::available(
-                whois_identity(payload, issuer, context, *source, std::move(target)));
+            return PeerIdentityResult::available(whois_identity(
+                payload, issuer, context, *source, std::move(target), std::move(proxy_address)));
         } catch (const Unavailable&) {
             return result(kProvider, PeerIdentityStatus::UNAVAILABLE);
         } catch (const std::exception&) {
