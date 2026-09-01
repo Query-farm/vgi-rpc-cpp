@@ -18,10 +18,9 @@ namespace {
 constexpr const char* kEndpoint =
     "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
 
-PeerResolutionContext context(
-    std::optional<std::string> peer = "127.0.0.1",
-    std::map<std::string, std::vector<std::string>> headers = {
-        {IROH_FORWARDED_ENDPOINT_HEADER, {kEndpoint}}}) {
+PeerResolutionContext context(std::optional<std::string> peer = "127.0.0.1",
+                              std::map<std::string, std::vector<std::string>> headers = {
+                                  {IROH_FORWARDED_ENDPOINT_HEADER, {kEndpoint}}}) {
     PeerResolutionContext result;
     result.transport = "http";
     result.immediate_peer = std::move(peer);
@@ -56,8 +55,8 @@ TEST_CASE("forwarded Iroh HTTP identity is stable and locally namespaced", "[ide
     const PeerEvidenceSet evidence({result});
     const auto auth = peer_identity_primary("iroh")(evidence, AuthContext::anonymous());
     REQUIRE(auth.authenticated);
-    REQUIRE(auth.principal == std::optional<std::string>(
-                                  std::string("peer/iroh/production-mesh/") + kEndpoint));
+    REQUIRE(auth.principal ==
+            std::optional<std::string>(std::string("peer/iroh/production-mesh/") + kEndpoint));
 }
 
 TEST_CASE("forwarded Iroh HTTP identity fails closed", "[identity][iroh]") {
@@ -65,15 +64,17 @@ TEST_CASE("forwarded Iroh HTTP identity fails closed", "[identity][iroh]") {
     REQUIRE(provider(context("192.0.2.1")).status == PeerIdentityStatus::UNTRUSTED_PROXY);
     REQUIRE(provider(context("::ffff:127.0.0.1")).status == PeerIdentityStatus::AVAILABLE);
     REQUIRE(provider(context("127.0.0.1", {})).status == PeerIdentityStatus::NO_MATCH);
-    REQUIRE(provider(context("127.0.0.1", {{IROH_FORWARDED_ENDPOINT_HEADER, {kEndpoint, kEndpoint}}}))
-                .status == PeerIdentityStatus::INVALID);
-    REQUIRE(provider(context("127.0.0.1", {{IROH_FORWARDED_ENDPOINT_HEADER, {"00"}}}))
-                .status == PeerIdentityStatus::INVALID);
+    REQUIRE(
+        provider(context("127.0.0.1", {{IROH_FORWARDED_ENDPOINT_HEADER, {kEndpoint, kEndpoint}}}))
+            .status == PeerIdentityStatus::INVALID);
+    REQUIRE(provider(context("127.0.0.1", {{IROH_FORWARDED_ENDPOINT_HEADER, {"00"}}})).status ==
+            PeerIdentityStatus::INVALID);
 
     std::string uppercase(kEndpoint);
     uppercase[10] = 'A';
-    REQUIRE(provider(context("127.0.0.1", {{IROH_FORWARDED_ENDPOINT_HEADER, {uppercase}}}))
-                .status == PeerIdentityStatus::INVALID);
+    REQUIRE(
+        provider(context("127.0.0.1", {{IROH_FORWARDED_ENDPOINT_HEADER, {uppercase}}})).status ==
+        PeerIdentityStatus::INVALID);
 
     auto duplicates = context();
     duplicates.headers["vgi-forwarded-iroh-endpoint"] = {kEndpoint};

@@ -14,8 +14,8 @@
 namespace vgi_rpc {
 namespace {
 
-using identity_internal::IpAddress;
 using identity_internal::has_control;
+using identity_internal::IpAddress;
 using identity_internal::parse_exact_ip;
 using identity_internal::result;
 using identity_internal::valid_utf8;
@@ -40,8 +40,7 @@ bool canonical_endpoint(const std::string& endpoint) noexcept {
 }
 
 PeerIdentity forwarded_identity(const std::string& endpoint, const std::string& issuer,
-                                const std::string& transport,
-                                const std::string& evidence_source,
+                                const std::string& transport, const std::string& evidence_source,
                                 const std::string& proxy_address) {
     validate_issuer(issuer);
     if (!canonical_endpoint(endpoint))
@@ -66,11 +65,10 @@ PeerIdentityProvider iroh_forwarded_header_provider(IrohForwardedHeaderOptions o
         if (!trusted.insert(*address).second)
             throw std::invalid_argument("duplicate Iroh bridge address");
     }
-    return [issuer = std::move(options.issuer), trusted = std::move(trusted)](
-               const PeerResolutionContext& context) {
-        const auto immediate = context.immediate_peer
-                                   ? parse_exact_ip(*context.immediate_peer)
-                                   : std::optional<IpAddress>{};
+    return [issuer = std::move(options.issuer),
+            trusted = std::move(trusted)](const PeerResolutionContext& context) {
+        const auto immediate = context.immediate_peer ? parse_exact_ip(*context.immediate_peer)
+                                                      : std::optional<IpAddress>{};
         if (!immediate || trusted.find(*immediate) == trusted.end())
             return result(kProvider, PeerIdentityStatus::UNTRUSTED_PROXY);
         try {
