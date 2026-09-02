@@ -42,7 +42,9 @@ public:
 
     httplib::Response send(const std::string& method, const std::string& path,
                            const httplib::Headers& headers, const std::string& body,
-                           int64_t maximum_response_bytes, const CallOptions& options) const;
+                           int64_t maximum_encoded_response_bytes,
+                           int64_t maximum_identity_response_bytes,
+                           const CallOptions& options) const;
 
 private:
     std::string base_url_;

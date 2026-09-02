@@ -78,6 +78,11 @@ public:
     explicit PlainFaultServer(std::shared_ptr<arrow::Schema> schema)
         : schema_(std::move(schema)), response_(unary_response(schema_, 17)) {
         install_handlers();
+        server_.set_post_routing_handler([](const httplib::Request&, httplib::Response& response) {
+            if (!response.has_header("VGI-Accept-Max-Response-Bytes-Support")) {
+                response.set_header("VGI-Accept-Max-Response-Bytes-Support", "true");
+            }
+        });
         port_ = server_.bind_to_any_port("127.0.0.1");
         if (port_ <= 0) throw std::runtime_error("failed to bind HTTP resilience server");
         thread_ = std::thread([this] { (void)server_.listen_after_bind(); });
@@ -96,6 +101,7 @@ public:
     std::atomic<int> retry_requests{0};
     std::atomic<int> slow_requests{0};
     std::atomic<int> capability_requests{0};
+    std::atomic<int> large_capability_requests{0};
     std::atomic<bool> call_headers_valid{false};
     std::atomic<bool> retry_request_ids_valid{true};
 
@@ -115,16 +121,20 @@ private:
         server_.Options("/health",
                         [this](const httplib::Request& request, httplib::Response& response) {
                             ++capability_requests;
-                            if (request.get_header_value("Authorization") != "Bearer dynamic") {
-                                response.status = 401;
+                            (void)request;
+                            response.status = 204;
+                            response.set_header("VGI-Accept-Max-Response-Bytes-Support", "true");
+                        });
+        server_.Options("/large/health",
+                        [this](const httplib::Request&, httplib::Response& response) {
+                            if (large_capability_requests.fetch_add(1) == 0) {
+                                response.status = 500;
+                                response.set_content(std::string(128 * 1024, 'c'), "text/plain");
                                 return;
                             }
                             response.status = 204;
+                            response.set_header("VGI-Accept-Max-Response-Bytes-Support", "true");
                         });
-        server_.Options("/large/health", [](const httplib::Request&, httplib::Response& response) {
-            response.status = 500;
-            response.set_content(std::string(16 * 1024, 'c'), "text/plain");
-        });
         server_.Post("/ok", [this](const httplib::Request&, httplib::Response& response) {
             ++ok_requests;
             arrow_response(response);
@@ -338,6 +348,15 @@ public:
           server_(certificate.c_str(), private_key.c_str(),
                   client_ca.empty() ? nullptr : client_ca.c_str()) {
         if (!server_.is_valid()) throw std::runtime_error("failed to initialize TLS test server");
+        server_.set_post_routing_handler([](const httplib::Request&, httplib::Response& response) {
+            if (!response.has_header("VGI-Accept-Max-Response-Bytes-Support")) {
+                response.set_header("VGI-Accept-Max-Response-Bytes-Support", "true");
+            }
+        });
+        server_.Options("/health", [](const httplib::Request&, httplib::Response& response) {
+            response.status = 204;
+            response.set_header("VGI-Accept-Max-Response-Bytes-Support", "true");
+        });
         server_.Post("/ok", [this](const httplib::Request&, httplib::Response& response) {
             response.set_content(response_, kArrowContentType);
         });
@@ -417,8 +436,8 @@ void test_builder_errors_and_redirects(PlainFaultServer& server,
     HttpClientConfig limited_config;
     limited_config.prefix = "/large";
     limited_config.compression_level = std::nullopt;
-    limited_config.max_encoded_response_bytes = 1024;
-    limited_config.max_decoded_response_bytes = 1024;
+    limited_config.max_encoded_response_bytes = 64 * 1024;
+    limited_config.max_decoded_response_bytes = 64 * 1024;
     auto limited = HttpClient::builder(server.origin()).config(limited_config).build();
     const auto capability_limit =
         require_client_error([&] { (void)limited.capabilities(); }, "capability response limit");
@@ -430,6 +449,7 @@ void test_builder_errors_and_redirects(PlainFaultServer& server,
 
 void test_auth_callback_and_call_options(PlainFaultServer& server,
                                          const std::shared_ptr<arrow::Schema>& schema) {
+    server.capability_requests.store(0);
     HttpClient* reentrant_client = nullptr;
     std::atomic<bool> reentered{false};
     auto builder = plain_builder(server.origin()).header("X-Layer", "static");
@@ -477,7 +497,8 @@ void test_auth_callback_and_call_options(PlainFaultServer& server,
     const auto auth_error =
         require_client_error([&] { (void)callback_failure.call("ok", empty_request(), schema); },
                              "credential callback failure");
-    require(auth_error.kind() == HttpClientErrorKind::AUTHENTICATION && auth_error.method() == "ok",
+    require(auth_error.kind() == HttpClientErrorKind::AUTHENTICATION &&
+                auth_error.method() == "OPTIONS",
             "credential callback failure was not structured as authentication");
 }
 

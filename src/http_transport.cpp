@@ -63,6 +63,11 @@ namespace {
 constexpr const char* ARROW_CONTENT_TYPE = "application/vnd.apache.arrow.stream";
 constexpr const char* REQUEST_ID_HEADER = "X-Request-ID";
 constexpr const char* RPC_ERROR_HEADER = "X-VGI-RPC-Error";
+constexpr const char* ACCEPT_MAX_RESPONSE_BYTES_HEADER = "VGI-Accept-Max-Response-Bytes";
+constexpr const char* ACCEPT_MAX_RESPONSE_BYTES_SUPPORT_HEADER =
+    "VGI-Accept-Max-Response-Bytes-Support";
+constexpr int64_t MAX_SAFE_RESPONSE_BYTES = 9'007'199'254'740'991LL;
+constexpr int64_t MIN_RESPONSE_BYTES = 64LL << 10;
 constexpr const char* AUTH_REASON_HEADER = "VGI-Auth-Reason";
 constexpr const char* AUTH_PROXY_REQUIRED_HEADER = "VGI-Auth-Proxy-Required";
 constexpr const char* PROOF_HEADER = "VGI-Proxy-Proof";
@@ -89,7 +94,47 @@ struct HttpStreamSession {
     bool is_exchange = false;
     std::string method_name;
     std::string aad;  // identity this stream was opened under
+    std::optional<int64_t> response_limit_bytes;
+    std::optional<int64_t> preferred_response_bytes;
 };
+
+std::optional<int64_t> min_limit(std::optional<int64_t> left, std::optional<int64_t> right) {
+    if (left && right) return std::min(*left, *right);
+    return left ? left : right;
+}
+
+std::optional<int64_t> configured_limit(int64_t application, int64_t hosting) {
+    return min_limit(application >= 0 ? std::optional<int64_t>(application) : std::nullopt,
+                     hosting >= 0 ? std::optional<int64_t>(hosting) : std::nullopt);
+}
+
+std::optional<std::string> parse_accepted_response_limit(
+    const httplib::Request& req, std::optional<int64_t>& accepted_response_limit) {
+    accepted_response_limit.reset();
+    const auto accepted_count = req.get_header_value_count(ACCEPT_MAX_RESPONSE_BYTES_HEADER);
+    if (accepted_count > 1) {
+        return std::string(ACCEPT_MAX_RESPONSE_BYTES_HEADER) + " must appear exactly once";
+    }
+    if (accepted_count == 0) return std::nullopt;
+
+    const std::string raw = req.get_header_value(ACCEPT_MAX_RESPONSE_BYTES_HEADER);
+    const bool digits =
+        !raw.empty() && raw.front() != '0' &&
+        std::all_of(raw.begin(), raw.end(), [](unsigned char c) { return c >= '0' && c <= '9'; });
+    try {
+        size_t consumed = 0;
+        const int64_t parsed = digits ? std::stoll(raw, &consumed) : 0;
+        if (!digits || consumed != raw.size() || parsed < MIN_RESPONSE_BYTES ||
+            parsed > MAX_SAFE_RESPONSE_BYTES) {
+            throw std::invalid_argument("range");
+        }
+        accepted_response_limit = parsed;
+        return std::nullopt;
+    } catch (const std::exception&) {
+        return std::string(ACCEPT_MAX_RESPONSE_BYTES_HEADER) +
+               " must be one ASCII integer between 65536 and 9007199254740991";
+    }
+}
 
 std::string buffer_to_string(const std::shared_ptr<arrow::Buffer>& buf) {
     return std::string(reinterpret_cast<const char*>(buf->data()),
@@ -169,8 +214,11 @@ bool run_producer_turns(const std::shared_ptr<arrow::ipc::RecordBatchWriter>& wr
                         const std::shared_ptr<StreamState>& state,
                         const std::shared_ptr<arrow::Schema>& schema, CallContext& ctx,
                         const std::string& server_id, const std::string& request_id, bool* errored,
-                        const CycleExternalizer& externalize, const AnnotatedBatch& input) {
-    OutputCollector oc(schema, /*producer=*/true, server_id, request_id);
+                        const CycleExternalizer& externalize, const AnnotatedBatch& input,
+                        std::optional<int64_t> response_limit_bytes,
+                        std::optional<int64_t> preferred_response_bytes) {
+    OutputCollector oc(schema, /*producer=*/true, server_id, request_id, response_limit_bytes,
+                       preferred_response_bytes);
     try {
         state->process(input, oc, ctx);
     } catch (const std::exception& e) {
@@ -322,7 +370,7 @@ std::optional<std::string> gzip_compress(const std::string& body) {
 constexpr const char* kAllowedRequestHeaders =
     "content-type, accept, accept-encoding, authorization, x-request-id, "
     "x-vgi-accept-encoding, vgi-session, vgi-session-accept, vgi-proxy-proof, "
-    "x-conformance-principal, x-conformance-auth-reason";
+    "vgi-accept-max-response-bytes, x-conformance-principal, x-conformance-auth-reason";
 
 // Headers that ride failure and session responses, which OPTIONS /health
 // never advertises.  A check derived from advertisements structurally cannot
@@ -377,6 +425,23 @@ public:
                  cfg.proof_replay_cache) {
         if (cfg.peer_identity_resolution_timeout <= std::chrono::milliseconds::zero()) {
             throw std::invalid_argument("peer identity resolution timeout must be positive");
+        }
+        for (const auto [value, name] :
+             {std::pair{cfg.max_response_bytes, "max_response_bytes"},
+              std::pair{cfg.hosting_max_response_bytes, "hosting_max_response_bytes"},
+              std::pair{cfg.preferred_response_bytes, "preferred_response_bytes"}}) {
+            if (value >= 0 && (value < MIN_RESPONSE_BYTES || value > MAX_SAFE_RESPONSE_BYTES)) {
+                throw std::invalid_argument(std::string(name) +
+                                            " must be between 65536 and 9007199254740991");
+            }
+        }
+        for (const auto [value, name] :
+             {std::pair{cfg.max_request_bytes, "max_request_bytes"},
+              std::pair{cfg.hosting_max_request_bytes, "hosting_max_request_bytes"}}) {
+            if (value >= 0 && (value == 0 || value > MAX_SAFE_RESPONSE_BYTES)) {
+                throw std::invalid_argument(std::string(name) +
+                                            " must be between 1 and 9007199254740991");
+            }
         }
         if (cfg.peer_authentication_policy && cfg.peer_identity_providers.empty()) {
             throw std::invalid_argument(
@@ -479,15 +544,18 @@ std::string HttpServer::strip_prefix(const std::string& path) const {
 }
 
 void HttpServer::stamp_capabilities(httplib::Response& res) const {
-    if (cfg_.max_response_bytes >= 0) {
-        res.set_header("VGI-Max-Response-Bytes", std::to_string(cfg_.max_response_bytes));
+    res.set_header(ACCEPT_MAX_RESPONSE_BYTES_SUPPORT_HEADER, "true");
+    if (auto limit = configured_limit(cfg_.max_response_bytes, cfg_.hosting_max_response_bytes)) {
+        res.set_header("VGI-Max-Response-Bytes", std::to_string(*limit));
     }
     if (cfg_.max_externalized_response_bytes >= 0) {
         res.set_header("VGI-Max-Externalized-Response-Bytes",
                        std::to_string(cfg_.max_externalized_response_bytes));
     }
-    if (cfg_.max_request_bytes >= 0) {
-        res.set_header("VGI-Max-Request-Bytes", std::to_string(cfg_.max_request_bytes));
+    const auto configured_request_limit =
+        configured_limit(cfg_.max_request_bytes, cfg_.hosting_max_request_bytes);
+    if (configured_request_limit) {
+        res.set_header("VGI-Max-Request-Bytes", std::to_string(*configured_request_limit));
     }
     // Always present: an absent header means "unknown", and the client needs
     // to know whether to expect pointer batches at all.
@@ -497,7 +565,7 @@ void HttpServer::stamp_capabilities(httplib::Response& res) const {
         // The threshold doubles as the inline-request ceiling: a body over it
         // is what the client externalizes instead, so advertising one number
         // keeps the two sides from disagreeing about where the line is.
-        if (cfg_.max_request_bytes < 0) {
+        if (!configured_request_limit) {
             res.set_header("VGI-Max-Request-Bytes", std::to_string(cfg_.externalize_threshold));
         }
         res.set_header("VGI-Max-Upload-Bytes",
@@ -869,7 +937,19 @@ bool HttpServer::refuse_if_unauthorized(const httplib::Request& req, httplib::Re
 void HttpServer::handle_health(const httplib::Request& req, httplib::Response& res) const {
     // Exempt from authentication in every mode: health probes come from load
     // balancers and orchestrators directly, not through the proxy.
-    stamp_common(req, res, random_hex(16));
+    const std::string request_id = random_hex(16);
+    stamp_common(req, res, request_id);
+    if (req.method == "OPTIONS") {
+        std::optional<int64_t> accepted_response_limit;
+        if (const auto error = parse_accepted_response_limit(req, accepted_response_limit)) {
+            res.status = 400;
+            res.set_header(RPC_ERROR_HEADER, "true");
+            set_arrow_content(
+                req, res,
+                error_body(empty_schema(), "ValueError", *error, rpc_.server_id(), request_id));
+            return;
+        }
+    }
     res.status = 200;
     if (req.method == "GET") {
         nlohmann::json body;
@@ -1034,6 +1114,19 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
                           error_body(empty_schema(), type, msg, rpc_.server_id(), request_id));
     };
 
+    std::optional<int64_t> accepted_response_limit;
+    if (const auto error = parse_accepted_response_limit(req, accepted_response_limit)) {
+        fail(400, "ValueError", *error);
+        return;
+    }
+    const auto configured_response_limit =
+        configured_limit(cfg_.max_response_bytes, cfg_.hosting_max_response_bytes);
+    auto response_limit = min_limit(configured_response_limit, accepted_response_limit);
+    auto preferred_response = cfg_.preferred_response_bytes >= 0
+                                  ? std::optional<int64_t>(cfg_.preferred_response_bytes)
+                                  : std::nullopt;
+    preferred_response = min_limit(preferred_response, response_limit);
+
     auto body_buf = arrow::Buffer::Wrap(request_body.data(), request_body.size());
     auto reader = std::make_shared<arrow::io::BufferReader>(body_buf);
     std::optional<IpcStreamContents> contents;
@@ -1128,10 +1221,18 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
                 schema, static_cast<int64_t>(pairs.size()),
                 {unwrap(up.Finish()), unwrap(down.Finish()), unwrap(exp.Finish())});
             res.status = 200;
-            set_arrow_content(req, res,
-                              build_body([&](const std::shared_ptr<arrow::io::OutputStream>& out) {
-                                  write_ipc_stream(out, schema, {AnnotatedBatch::data(out_batch)});
-                              }));
+            std::string body = build_body([&](const std::shared_ptr<arrow::io::OutputStream>& out) {
+                write_ipc_stream(out, schema, {AnnotatedBatch::data(out_batch)});
+            });
+            if (response_limit && static_cast<int64_t>(body.size()) > *response_limit) {
+                res.set_header(RPC_ERROR_HEADER, "true");
+                body = error_body(schema, "ResponseTooLargeError",
+                                  "method '" + method_name + "' exceeds max_response_bytes (" +
+                                      std::to_string(body.size()) + " > " +
+                                      std::to_string(*response_limit) + ")",
+                                  rpc_.server_id(), request_id);
+            }
+            set_arrow_content(req, res, std::move(body));
         } catch (const std::exception& e) {
             fail(500, "RuntimeError", std::string("cannot vend upload URLs: ") + e.what());
         }
@@ -1156,6 +1257,7 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
     auto log_sink = std::make_shared<LogSink>(rpc_.server_id(), request_id);
     CallContext ctx(log_sink, rpc_.server_id(), request_id, TransportKind::HTTP);
     ctx.set_identity(resolved.auth, resolved.evidence);
+    ctx.set_response_budgets(response_limit, preferred_response);
 
     // Sticky machinery for this request, installed only on HTTP.
     StickySlot sticky;
@@ -1249,16 +1351,15 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
         // The wire cap counts only what lands on the wire; an externalized
         // payload leaves a pointer batch of a few hundred bytes behind, so it
         // is measured after externalization, not before.
-        if (cfg_.max_response_bytes >= 0 &&
-            static_cast<int64_t>(body.size()) > cfg_.max_response_bytes) {
+        if (response_limit && static_cast<int64_t>(body.size()) > *response_limit) {
             res.status = 200;
             res.set_header(RPC_ERROR_HEADER, "true");
             set_arrow_content(
                 req, res,
-                error_body(method_info.result_schema, "RpcError",
-                           "HTTP body exceeds max_response_bytes (" + std::to_string(body.size()) +
-                               " > " + std::to_string(cfg_.max_response_bytes) + ") for method '" +
-                               method_name + "'",
+                error_body(method_info.result_schema, "ResponseTooLargeError",
+                           "method '" + method_name + "' exceeds max_response_bytes (" +
+                               std::to_string(body.size()) + " > " +
+                               std::to_string(*response_limit) + ")",
                            rpc_.server_id(), request_id));
             return;
         }
@@ -1339,6 +1440,8 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
                 session->is_exchange = true;
                 session->method_name = method_name;
                 session->aad = aad;
+                session->response_limit_bytes = response_limit;
+                session->preferred_response_bytes = preferred_response;
                 std::lock_guard<std::mutex> registry_lock(streams_mutex_);
                 streams_[cursor] = std::move(session);
             } else {
@@ -1353,7 +1456,8 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
                 }
                 const bool finished = run_producer_turns(
                     writer, stream.state, output_schema, ctx, rpc_.server_id(), request_id,
-                    &errored, externalize, AnnotatedBatch::data(make_empty_batch(empty_schema())));
+                    &errored, externalize, AnnotatedBatch::data(make_empty_batch(empty_schema())),
+                    response_limit, preferred_response);
                 if (!finished) {
                     VGI_RPC_THROW_NOT_OK(writer->WriteRecordBatch(
                         *make_empty_batch(output_schema), init_metadata(cursor, call_token)));
@@ -1364,6 +1468,8 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
                     session->is_exchange = false;
                     session->method_name = method_name;
                     session->aad = aad;
+                    session->response_limit_bytes = response_limit;
+                    session->preferred_response_bytes = preferred_response;
                     std::lock_guard<std::mutex> registry_lock(streams_mutex_);
                     streams_[cursor] = std::move(session);
                 }
@@ -1389,6 +1495,23 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
                                std::to_string(externalized) + " > " +
                                std::to_string(cfg_.max_externalized_response_bytes) +
                                ") for method '" + method_name + "'",
+                           rpc_.server_id(), request_id));
+            return;
+        }
+        if (response_limit && static_cast<int64_t>(body.size()) > *response_limit) {
+            {
+                std::lock_guard<std::mutex> registry_lock(streams_mutex_);
+                streams_.erase(cursor);
+            }
+            res.status = 200;
+            res.set_header(RPC_ERROR_HEADER, "true");
+            apply_sticky();
+            set_arrow_content(
+                req, res,
+                error_body(output_schema, "ResponseTooLargeError",
+                           "method '" + method_name + "' exceeds max_response_bytes (" +
+                               std::to_string(body.size()) + " > " +
+                               std::to_string(*response_limit) + ")",
                            rpc_.server_id(), request_id));
             return;
         }
@@ -1430,6 +1553,13 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
         fail(400, "ProtocolError", "Unknown or missing stream state token");
         return;
     }
+    // A continuation may tighten the budget but cannot raise the cap under
+    // which the stream was opened. Reapplying the configured cap also makes
+    // a later hosting/app reduction effective immediately.
+    response_limit = min_limit(response_limit, sess->response_limit_bytes);
+    preferred_response = min_limit(preferred_response, sess->preferred_response_bytes);
+    preferred_response = min_limit(preferred_response, response_limit);
+    ctx.set_response_budgets(response_limit, preferred_response);
 
     // With the call-state cache off, a continuation must stand on its own: it
     // has to carry the call token /init handed over, not just the cursor.  A
@@ -1471,10 +1601,18 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
         }
         res.status = 200;
         apply_sticky();
-        set_arrow_content(req, res,
-                          build_body([&](const std::shared_ptr<arrow::io::OutputStream>& out) {
-                              write_ipc_stream(out, output_schema, {});
-                          }));
+        std::string body = build_body([&](const std::shared_ptr<arrow::io::OutputStream>& out) {
+            write_ipc_stream(out, output_schema, {});
+        });
+        if (response_limit && static_cast<int64_t>(body.size()) > *response_limit) {
+            res.set_header(RPC_ERROR_HEADER, "true");
+            body = error_body(output_schema, "ResponseTooLargeError",
+                              "method '" + sess->method_name + "' exceeds max_response_bytes (" +
+                                  std::to_string(body.size()) + " > " +
+                                  std::to_string(*response_limit) + ")",
+                              rpc_.server_id(), request_id);
+        }
+        set_arrow_content(req, res, std::move(body));
         return;
     }
 
@@ -1524,7 +1662,8 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
     try {
         if (sess->is_exchange) {
             auto coerced = coerce_input(batch, sess->input_schema);
-            OutputCollector oc(output_schema, /*producer=*/false, rpc_.server_id(), request_id);
+            OutputCollector oc(output_schema, /*producer=*/false, rpc_.server_id(), request_id,
+                               response_limit, preferred_response);
             sess->state->process(AnnotatedBatch::data(coerced), oc, ctx);
             std::string body = build_body([&](const std::shared_ptr<arrow::io::OutputStream>& out) {
                 std::vector<AnnotatedBatch> batches = oc.batches();
@@ -1543,18 +1682,22 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
                 }
                 write_ipc_stream(out, output_schema, batches);
             });
-            if (cfg_.max_response_bytes >= 0 &&
-                static_cast<int64_t>(body.size()) > cfg_.max_response_bytes) {
+            if (response_limit && static_cast<int64_t>(body.size()) > *response_limit) {
+                {
+                    std::lock_guard<std::mutex> registry_lock(streams_mutex_);
+                    auto sit = streams_.find(cursor);
+                    if (sit != streams_.end() && sit->second == sess) streams_.erase(sit);
+                }
                 res.status = 200;
                 res.set_header(RPC_ERROR_HEADER, "true");
                 apply_sticky();
-                set_arrow_content(req, res,
-                                  error_body(output_schema, "RpcError",
-                                             "HTTP body exceeds max_response_bytes (" +
-                                                 std::to_string(body.size()) + " > " +
-                                                 std::to_string(cfg_.max_response_bytes) +
-                                                 ") for method '" + sess->method_name + "'",
-                                             rpc_.server_id(), request_id));
+                set_arrow_content(
+                    req, res,
+                    error_body(output_schema, "ResponseTooLargeError",
+                               "method '" + sess->method_name + "' exceeds max_response_bytes (" +
+                                   std::to_string(body.size()) + " > " +
+                                   std::to_string(*response_limit) + ")",
+                               rpc_.server_id(), request_id));
                 return;
             }
             res.status = 200;
@@ -1565,9 +1708,10 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
             bool errored = false;
             std::string body = build_body([&](const std::shared_ptr<arrow::io::OutputStream>& out) {
                 auto writer = unwrap(arrow::ipc::MakeStreamWriter(out, output_schema));
-                finished = run_producer_turns(
-                    writer, sess->state, output_schema, ctx, rpc_.server_id(), request_id, &errored,
-                    externalize, AnnotatedBatch::with_metadata(batch, custom_metadata));
+                finished = run_producer_turns(writer, sess->state, output_schema, ctx,
+                                              rpc_.server_id(), request_id, &errored, externalize,
+                                              AnnotatedBatch::with_metadata(batch, custom_metadata),
+                                              response_limit, preferred_response);
                 if (!finished) {
                     VGI_RPC_THROW_NOT_OK(writer->WriteRecordBatch(*make_empty_batch(output_schema),
                                                                   cursor_metadata(cursor)));
@@ -1575,6 +1719,24 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
                 VGI_RPC_THROW_NOT_OK(writer->Close());
             });
             if (external_cap_exceeded()) return;
+            if (response_limit && static_cast<int64_t>(body.size()) > *response_limit) {
+                {
+                    std::lock_guard<std::mutex> registry_lock(streams_mutex_);
+                    auto sit = streams_.find(cursor);
+                    if (sit != streams_.end() && sit->second == sess) streams_.erase(sit);
+                }
+                res.status = 200;
+                res.set_header(RPC_ERROR_HEADER, "true");
+                apply_sticky();
+                set_arrow_content(
+                    req, res,
+                    error_body(output_schema, "ResponseTooLargeError",
+                               "method '" + sess->method_name + "' exceeds max_response_bytes (" +
+                                   std::to_string(body.size()) + " > " +
+                                   std::to_string(*response_limit) + ")",
+                               rpc_.server_id(), request_id));
+                return;
+            }
             if (finished) {
                 std::lock_guard<std::mutex> registry_lock(streams_mutex_);
                 auto sit = streams_.find(cursor);
@@ -1607,8 +1769,13 @@ void HttpServer::run() {
     // against the peer's delayed ACK timer, adding roughly 40-50 ms even on
     // loopback. Raw TCP already disables Nagle for the same reason.
     svr.set_tcp_nodelay(true);
-    if (cfg_.max_request_bytes >= 0) {
-        svr.set_payload_max_length(static_cast<size_t>(cfg_.max_request_bytes));
+    const auto configured_request_limit =
+        configured_limit(cfg_.max_request_bytes, cfg_.hosting_max_request_bytes);
+    const int64_t rpc_request_limit = configured_request_limit
+                                          ? *configured_request_limit
+                                          : (storage_ ? cfg_.externalize_threshold : -1);
+    if (rpc_request_limit >= 0) {
+        svr.set_payload_max_length(static_cast<size_t>(rpc_request_limit));
     }
     // Keep httplib's default multi-threaded pool. Independent calls dispatch in
     // parallel; the HTTP state registries serialize only turns that address the
@@ -1666,7 +1833,9 @@ void HttpServer::run() {
             serve_start_error = std::current_exception();
         }
 
-        const int64_t cap = cfg_.max_request_bytes;
+        const auto configured_request_limit =
+            configured_limit(cfg_.max_request_bytes, cfg_.hosting_max_request_bytes);
+        const int64_t cap = configured_request_limit.value_or(-1);
         std::string body;
         bool decoded_too_large = false;
         const bool read = reader([&](const char* data, size_t size) {
@@ -1751,9 +1920,10 @@ void HttpServer::run() {
         } catch (...) {
             serve_start_error = std::current_exception();
         }
-        const int64_t cap = cfg_.max_request_bytes >= 0
-                                ? cfg_.max_request_bytes
-                                : (storage_ ? cfg_.externalize_threshold : -1);
+        const auto configured_request_limit =
+            configured_limit(cfg_.max_request_bytes, cfg_.hosting_max_request_bytes);
+        const int64_t cap = configured_request_limit ? *configured_request_limit
+                                                     : (storage_ ? cfg_.externalize_threshold : -1);
         std::string body;
         bool decoded_too_large = false;
         const bool read = reader([&](const char* data, size_t size) {

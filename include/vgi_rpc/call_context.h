@@ -6,6 +6,7 @@
 /// log messages during request handling.
 #pragma once
 
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -69,6 +70,15 @@ public:
     TransportKind transport_kind() const noexcept { return transport_kind_; }
     const AuthContext& auth() const noexcept { return auth_; }
     const PeerEvidenceSet& peer_evidence() const noexcept { return peer_evidence_; }
+    std::optional<int64_t> response_limit_bytes() const noexcept { return response_limit_bytes_; }
+    std::optional<int64_t> preferred_response_bytes() const noexcept {
+        return preferred_response_bytes_;
+    }
+    void set_response_budgets(std::optional<int64_t> limit,
+                              std::optional<int64_t> preferred) noexcept {
+        response_limit_bytes_ = limit;
+        preferred_response_bytes_ = preferred;
+    }
     void set_identity(AuthContext auth, PeerEvidenceSet evidence) {
         auth_ = std::move(auth);
         peer_evidence_ = std::move(evidence);
@@ -105,6 +115,8 @@ private:
     StickySlot* sticky_ = nullptr;
     AuthContext auth_ = AuthContext::anonymous();
     PeerEvidenceSet peer_evidence_;
+    std::optional<int64_t> response_limit_bytes_;
+    std::optional<int64_t> preferred_response_bytes_;
 };
 
 }  // namespace vgi_rpc

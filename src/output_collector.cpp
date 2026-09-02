@@ -12,11 +12,15 @@
 namespace vgi_rpc {
 
 OutputCollector::OutputCollector(std::shared_ptr<arrow::Schema> output_schema, bool producer_mode,
-                                 const std::string& server_id, const std::string& request_id)
+                                 const std::string& server_id, const std::string& request_id,
+                                 std::optional<int64_t> response_limit_bytes,
+                                 std::optional<int64_t> preferred_response_bytes)
     : output_schema_(std::move(output_schema)),
       producer_mode_(producer_mode),
       server_id_(server_id),
-      request_id_(request_id) {}
+      request_id_(request_id),
+      response_limit_bytes_(response_limit_bytes),
+      preferred_response_bytes_(preferred_response_bytes) {}
 
 void OutputCollector::emit_batch(std::shared_ptr<arrow::RecordBatch> batch) {
     if (data_batch_idx_) {

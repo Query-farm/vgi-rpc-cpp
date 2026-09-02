@@ -179,11 +179,23 @@ type is `SessionLostError` throws the dedicated C++ `HttpSessionLostError` class
 
 Request and response caps are mandatory positive byte counts. Requests are
 measured with an Arrow IPC counting pass before the output buffer is allocated.
-`max_response_bytes` remains the compatibility default for two independent
-limits: `max_encoded_response_bytes` bounds bytes accumulated from the network,
-and `max_decoded_response_bytes` bounds the body after HTTP content decoding.
-Leave either specific limit at zero to inherit `max_response_bytes`. Both limits
-apply to fixed-length and chunked responses.
+`max_response_bytes` remains the compatibility default for the encoded network
+limit. `max_encoded_response_bytes` overrides that bound, while
+`max_decoded_response_bytes` optionally narrows the body after HTTP content
+decoding. Leave the encoded limit at zero to use the larger of
+`max_response_bytes` and `accepted_max_response_bytes`; leave the decoded limit
+at zero to inherit `accepted_max_response_bytes`. Both limits apply to
+fixed-length and chunked responses.
+
+`accepted_max_response_bytes` is the protocol-level decoded Arrow IPC budget
+and defaults to 256 MiB. Configure it directly or through the builder's
+`accepted_max_response_bytes` method. The client advertises the effective local
+identity-response limit (the minimum of accepted, encoded, and decoded limits) as
+`VGI-Accept-Max-Response-Bytes` on OPTIONS and every RPC, and refuses to
+dispatch unless capability discovery reports
+`VGI-Accept-Max-Response-Bytes-Support: true`. The header is
+transport-reserved; configure the typed option instead of adding it to a
+custom-header map.
 
 Request bodies use zstd level 3 by default and carry both the standard
 `Accept-Encoding` header and VGI's zstd-first preference header. Set
@@ -198,8 +210,9 @@ present-but-empty `VGI-Supported-Encodings` advertisement likewise disables
 compression for later requests; an absent header retains the legacy assumption
 that the peer supports zstd.
 
-`capabilities()` performs and caches `OPTIONS {prefix}/health`. It exposes sticky,
-externalization, byte-limit, upload-URL, and supported-encoding advertisements.
+`capabilities()` performs and caches `OPTIONS {prefix}/health`. It exposes
+response-budget support, sticky, externalization, byte-limit, upload-URL, and
+supported-encoding advertisements.
 Capability headers on ordinary responses refine the same internal model and the
 server request limit is enforced on later calls.
 

@@ -168,9 +168,21 @@ bool request_omits_pointer_controls(const httplib::Request& request) {
 
 class FaultServer {
 public:
-    explicit FaultServer(std::shared_ptr<arrow::Schema> schema)
-        : schema_(std::move(schema)), good_response_(unary_response(schema_, 7)) {
+    explicit FaultServer(std::shared_ptr<arrow::Schema> schema,
+                         bool advertise_response_budget = true)
+        : schema_(std::move(schema)),
+          good_response_(unary_response(schema_, 7)),
+          advertise_response_budget_(advertise_response_budget) {
         install_handlers();
+        server_.set_post_routing_handler(
+            [this](const httplib::Request&, httplib::Response& response) {
+                const bool omit = response.has_header("X-Test-Omit-Budget-Support");
+                response.headers.erase("X-Test-Omit-Budget-Support");
+                if (advertise_response_budget_ && !omit &&
+                    !response.has_header("VGI-Accept-Max-Response-Bytes-Support")) {
+                    response.set_header("VGI-Accept-Max-Response-Bytes-Support", "true");
+                }
+            });
         port_ = server_.bind_to_any_port("127.0.0.1");
         if (port_ <= 0) throw std::runtime_error("failed to bind local HTTP fault server");
         thread_ = std::thread([this] { (void)server_.listen_after_bind(); });
@@ -190,6 +202,11 @@ public:
 
     std::string origin() const { return "http://127.0.0.1:" + std::to_string(port_); }
     const std::string& good_response() const { return good_response_; }
+    void advertised_response_budget(std::string value, bool duplicate = false) {
+        std::lock_guard<std::mutex> lock(capability_mutex_);
+        advertised_response_budget_ = std::move(value);
+        duplicate_advertised_response_budget_ = duplicate;
+    }
 
     std::atomic<int> preflight_requests{0};
     std::atomic<int> encoded_request_cap_requests{0};
@@ -212,6 +229,8 @@ public:
     std::atomic<bool> transport_block_release{false};
     std::atomic<int> post_retry_requests{0};
     std::atomic<int> producer_retry_requests{0};
+    std::atomic<bool> accepted_response_budget_seen{false};
+    std::atomic<int64_t> last_accepted_response_budget{0};
 
 private:
     void arrow_response(httplib::Response& response, const std::string& body) {
@@ -226,19 +245,34 @@ private:
     }
 
     void install_handlers() {
-        server_.Options("/health", [](const httplib::Request&, httplib::Response& response) {
-            response.status = 204;
-            response.set_header("VGI-Sticky-Enabled", "true");
-            response.set_header("VGI-Sticky-Default-TTL", "45");
-            response.set_header("VGI-Sticky-Echo-Headers", "X-Tenant, X-Region");
-            response.set_header("VGI-Max-Request-Bytes", "123456");
-            response.set_header("VGI-Max-Response-Bytes", "234567");
-            response.set_header("VGI-Max-Externalized-Response-Bytes", "345678");
-            response.set_header("VGI-Externalization-Enabled", "true");
-            response.set_header("VGI-Upload-URL-Support", "true");
-            response.set_header("VGI-Max-Upload-Bytes", "456789");
-            response.set_header("VGI-Supported-Encodings", "ZSTD, gzip");
-        });
+        server_.Options(
+            "/health", [this](const httplib::Request& request, httplib::Response& response) {
+                response.status = 204;
+                if (advertise_response_budget_) {
+                    response.set_header("VGI-Accept-Max-Response-Bytes-Support", "true");
+                }
+                accepted_response_budget_seen.store(
+                    request.get_header_value("VGI-Accept-Max-Response-Bytes") ==
+                    std::to_string(256LL * 1024 * 1024));
+                last_accepted_response_budget.store(
+                    std::stoll(request.get_header_value("VGI-Accept-Max-Response-Bytes")));
+                response.set_header("VGI-Sticky-Enabled", "true");
+                response.set_header("VGI-Sticky-Default-TTL", "45");
+                response.set_header("VGI-Sticky-Echo-Headers", "X-Tenant, X-Region");
+                response.set_header("VGI-Max-Request-Bytes", "123456");
+                {
+                    std::lock_guard<std::mutex> lock(capability_mutex_);
+                    response.set_header("VGI-Max-Response-Bytes", advertised_response_budget_);
+                    if (duplicate_advertised_response_budget_) {
+                        response.headers.emplace("VGI-Max-Response-Bytes", "65537");
+                    }
+                }
+                response.set_header("VGI-Max-Externalized-Response-Bytes", "345678");
+                response.set_header("VGI-Externalization-Enabled", "true");
+                response.set_header("VGI-Upload-URL-Support", "true");
+                response.set_header("VGI-Max-Upload-Bytes", "456789");
+                response.set_header("VGI-Supported-Encodings", "ZSTD, gzip");
+            });
         server_.Post("/preflight", [this](const httplib::Request&, httplib::Response& response) {
             ++preflight_requests;
             arrow_response(response, good_response_);
@@ -248,10 +282,32 @@ private:
                          ++encoded_request_cap_requests;
                          arrow_response(response, good_response_);
                      });
-        server_.Post("/ok", [this](const httplib::Request&, httplib::Response& response) {
+        server_.Post("/ok", [this](const httplib::Request& request, httplib::Response& response) {
             ++recovery_requests;
+            accepted_response_budget_seen.store(
+                accepted_response_budget_seen.load() &&
+                request.get_header_value("VGI-Accept-Max-Response-Bytes") ==
+                    std::to_string(256LL * 1024 * 1024));
+            last_accepted_response_budget.store(
+                std::stoll(request.get_header_value("VGI-Accept-Max-Response-Bytes")));
             arrow_response(response, good_response_);
         });
+        server_.Post("/support-missing",
+                     [this](const httplib::Request&, httplib::Response& response) {
+                         arrow_response(response, good_response_);
+                         response.set_header("X-Test-Omit-Budget-Support", "1");
+                     });
+        server_.Post("/support-duplicate",
+                     [this](const httplib::Request&, httplib::Response& response) {
+                         arrow_response(response, good_response_);
+                         response.set_header("VGI-Accept-Max-Response-Bytes-Support", "true");
+                         response.headers.emplace("VGI-Accept-Max-Response-Bytes-Support", "true");
+                     });
+        server_.Post("/support-uppercase",
+                     [this](const httplib::Request&, httplib::Response& response) {
+                         arrow_response(response, good_response_);
+                         response.set_header("VGI-Accept-Max-Response-Bytes-Support", "TRUE");
+                     });
         server_.Post(
             "/compressed", [this](const httplib::Request& request, httplib::Response& response) {
                 compressed_request_valid.store(
@@ -267,6 +323,11 @@ private:
         server_.Post("/decoded-large",
                      [this](const httplib::Request&, httplib::Response& response) {
                          arrow_response(response, zstd_encode(std::string(256 * 1024, 'd')));
+                         response.set_header("Content-Encoding", "zstd");
+                     });
+        server_.Post("/encoded-large",
+                     [this](const httplib::Request&, httplib::Response& response) {
+                         arrow_response(response, std::string(128 * 1024, 'z'));
                          response.set_header("Content-Encoding", "zstd");
                      });
         server_.Post("/truncated-zstd",
@@ -398,11 +459,11 @@ private:
         });
 
         server_.Post("/fixed-large", [this](const httplib::Request&, httplib::Response& response) {
-            response.set_content(std::string(good_response_.size() + 4096, 'f'), kArrowContentType);
+            response.set_content(std::string(128 * 1024, 'f'), kArrowContentType);
         });
         server_.Post(
             "/chunked-large", [this](const httplib::Request&, httplib::Response& response) {
-                auto payload = std::make_shared<std::string>(good_response_.size() + 4096, 'c');
+                auto payload = std::make_shared<std::string>(128 * 1024, 'c');
                 response.set_chunked_content_provider(
                     kArrowContentType, [payload](size_t offset, httplib::DataSink& sink) {
                         if (offset >= payload->size()) {
@@ -503,6 +564,10 @@ private:
 
     std::shared_ptr<arrow::Schema> schema_;
     std::string good_response_;
+    bool advertise_response_budget_ = true;
+    std::mutex capability_mutex_;
+    std::string advertised_response_budget_ = "234567";
+    bool duplicate_advertised_response_budget_ = false;
     httplib::Server server_;
     std::thread thread_;
     int port_ = 0;
@@ -561,19 +626,26 @@ void test_response_caps(FaultServer& server, const std::string& origin,
                         const std::shared_ptr<arrow::Schema>& schema) {
     HttpClientConfig config;
     config.prefix = "";
-    config.max_response_bytes = static_cast<int64_t>(server.good_response().size() + 32);
+    config.max_response_bytes = 8 * 1024 * 1024;
+    config.accepted_max_response_bytes = 64 * 1024;
     HttpClient client(origin, config);
 
-    (void)require_http_client_error(
+    const auto fixed_error = require_http_client_error(
         [&] { (void)client.call("fixed-large", empty_request(), schema); },
         "fixed-length response cap");
+    require(std::string(fixed_error.what()).find("max_decoded_response_bytes (65536)") !=
+                std::string::npos,
+            "identity response was not bounded by the decoded cap during receipt");
     auto fixed_recovery = client.call("ok", empty_request(), schema);
     require(fixed_recovery.batch && fixed_recovery.batch->num_rows() == 1,
             "client did not recover after fixed-length response overflow");
 
-    (void)require_http_client_error(
+    const auto chunked_error = require_http_client_error(
         [&] { (void)client.call("chunked-large", empty_request(), schema); },
         "chunked response cap");
+    require(std::string(chunked_error.what()).find("max_decoded_response_bytes (65536)") !=
+                std::string::npos,
+            "chunked identity response was not bounded by the decoded cap during receipt");
     auto chunked_recovery = client.call("ok", empty_request(), schema);
     require(chunked_recovery.batch && chunked_recovery.batch->num_rows() == 1,
             "client did not recover after chunked response overflow");
@@ -598,8 +670,7 @@ void test_compression(FaultServer& server, const std::string& origin,
     HttpClientConfig decoded_cap;
     decoded_cap.prefix = "";
     decoded_cap.max_encoded_response_bytes = 64 * 1024;
-    decoded_cap.max_decoded_response_bytes =
-        static_cast<int64_t>(server.good_response().size() + 32);
+    decoded_cap.max_decoded_response_bytes = 64 * 1024;
     HttpClient decoded_limited(origin, decoded_cap);
     const auto decoded_error = require_http_client_error(
         [&] { (void)decoded_limited.call("decoded-large", empty_request(), schema); },
@@ -610,11 +681,11 @@ void test_compression(FaultServer& server, const std::string& origin,
 
     HttpClientConfig encoded_cap;
     encoded_cap.prefix = "";
-    encoded_cap.max_encoded_response_bytes = 8;
+    encoded_cap.max_encoded_response_bytes = 64 * 1024;
     encoded_cap.max_decoded_response_bytes = 1024 * 1024;
     HttpClient encoded_limited(origin, encoded_cap);
     const auto encoded_error = require_http_client_error(
-        [&] { (void)encoded_limited.call("compressed", empty_request(), schema); },
+        [&] { (void)encoded_limited.call("encoded-large", empty_request(), schema); },
         "encoded zstd response cap");
     require(
         std::string(encoded_error.what()).find("max_encoded_response_bytes") != std::string::npos,
@@ -699,12 +770,14 @@ void test_producer_retry_requires_idempotency(FaultServer& server, const std::st
             "explicitly idempotent producer continuation did not use retry policy");
 }
 
-void test_capabilities_and_row_metadata(const std::string& origin,
+void test_capabilities_and_row_metadata(FaultServer& server, const std::string& origin,
                                         const std::shared_ptr<arrow::Schema>& schema) {
     HttpClientConfig config;
     config.prefix = "";
     HttpClient client(origin, config);
     const auto caps = client.capabilities();
+    require(caps.accept_max_response_bytes_support,
+            "accepted response-budget capability was not parsed");
     require(caps.sticky_enabled && caps.sticky_default_ttl == 45,
             "sticky capability fields were not parsed");
     require(caps.sticky_echo_headers == std::vector<std::string>({"X-Tenant", "X-Region"}),
@@ -720,6 +793,68 @@ void test_capabilities_and_row_metadata(const std::string& origin,
     auto result = client.call("row-log-metadata", empty_request(), schema);
     require(result.batch && result.batch->num_rows() == 1,
             "non-empty application batch with log metadata was swallowed as control");
+    require(server.accepted_response_budget_seen.load(),
+            "client omitted its accepted response budget on OPTIONS or POST");
+}
+
+void test_response_budget_support_is_mandatory(const std::shared_ptr<arrow::Schema>& schema) {
+    FaultServer legacy(schema, false);
+    HttpClientConfig config;
+    config.prefix = "";
+    HttpClient client(legacy.origin(), config);
+    const auto error =
+        require_http_client_error([&] { (void)client.call("ok", empty_request(), schema); },
+                                  "missing response-budget support capability");
+    require(error.kind() == HttpClientErrorKind::PROTOCOL &&
+                std::string(error.what()).find("VGI-Accept-Max-Response-Bytes-Support") !=
+                    std::string::npos,
+            "missing response-budget support did not fail closed");
+    require(legacy.recovery_requests.load() == 0,
+            "RPC reached a server without response-budget support");
+}
+
+void test_response_budget_support_is_required_on_every_response(
+    const std::string& origin, const std::shared_ptr<arrow::Schema>& schema) {
+    HttpClientConfig config;
+    config.prefix = "";
+    for (const std::string method : {"support-missing", "support-duplicate", "support-uppercase"}) {
+        HttpClient client(origin, config);
+        const auto error = require_http_client_error(
+            [&] { (void)client.call(method, empty_request(), schema); }, method);
+        require(error.kind() == HttpClientErrorKind::PROTOCOL &&
+                    std::string(error.what()).find("VGI-Accept-Max-Response-Bytes-Support") !=
+                        std::string::npos,
+                method + " response-budget support did not fail closed");
+    }
+}
+
+void test_advertised_response_budget_is_strict_and_bounds_decoded_bytes(
+    FaultServer& server, const std::string& origin, const std::shared_ptr<arrow::Schema>& schema) {
+    HttpClientConfig narrowed;
+    narrowed.prefix = "";
+    narrowed.accepted_max_response_bytes = 512 * 1024;
+    narrowed.max_encoded_response_bytes = 512 * 1024;
+    narrowed.max_decoded_response_bytes = 1024 * 1024;
+    HttpClient client(origin, narrowed);
+    const auto narrowed_error = require_http_client_error(
+        [&] { (void)client.call("decoded-large", empty_request(), schema); },
+        "advertised decoded response cap");
+    require(std::string(narrowed_error.what()).find("234567") != std::string::npos,
+            "advertised response cap did not narrow the decoded limit independently of the "
+            "encoded safety limit");
+
+    for (const auto& [value, duplicate] :
+         {std::pair{std::string("invalid"), false}, std::pair{std::string("65535"), false},
+          std::pair{std::string("65536"), true}}) {
+        server.advertised_response_budget(value, duplicate);
+        HttpClient invalid(origin, HttpClientConfig{.prefix = ""});
+        const auto error = require_http_client_error([&] { (void)invalid.capabilities(); },
+                                                     "invalid advertised response cap");
+        require(error.kind() == HttpClientErrorKind::PROTOCOL &&
+                    std::string(error.what()).find("VGI-Max-Response-Bytes") != std::string::npos,
+                "malformed or duplicate advertised response cap did not fail closed");
+    }
+    server.advertised_response_budget("234567");
 }
 
 void test_response_headers(const std::string& origin,
@@ -945,6 +1080,10 @@ void test_config_validation(const std::string& origin) {
     reserved.headers["Content-Type"] = "text/plain";
     require_invalid(std::move(reserved), "reserved transport header");
 
+    HttpClientConfig reserved_budget;
+    reserved_budget.headers["vGi-AcCePt-MaX-ReSpOnSe-ByTeS"] = "123";
+    require_invalid(std::move(reserved_budget), "reserved response-budget header");
+
     HttpClientConfig crlf;
     crlf.headers["X-Test"] = "safe\r\ninjected: true";
     require_invalid(std::move(crlf), "CRLF-bearing header");
@@ -961,11 +1100,88 @@ void test_config_validation(const std::string& origin) {
     negative_encoded_cap.max_encoded_response_bytes = -1;
     require_invalid(std::move(negative_encoded_cap), "negative encoded response cap");
 
+    HttpClientConfig zero_accepted;
+    zero_accepted.accepted_max_response_bytes = 0;
+    require_invalid(std::move(zero_accepted), "zero accepted response cap");
+
+    HttpClientConfig below_floor_accepted;
+    below_floor_accepted.accepted_max_response_bytes = (64 * 1024) - 1;
+    require_invalid(std::move(below_floor_accepted), "below-floor accepted response cap");
+
+    HttpClientConfig unsafe_accepted;
+    unsafe_accepted.accepted_max_response_bytes = 9'007'199'254'740'992LL;
+    require_invalid(std::move(unsafe_accepted), "unsafe-integer accepted response cap");
+
     HttpClientConfig explicit_caps;
     explicit_caps.max_response_bytes = 0;
-    explicit_caps.max_encoded_response_bytes = 1024;
-    explicit_caps.max_decoded_response_bytes = 2048;
+    explicit_caps.max_encoded_response_bytes = 64 * 1024;
+    explicit_caps.max_decoded_response_bytes = 64 * 1024;
     HttpClient explicit_client(origin, std::move(explicit_caps));
+
+    HttpClientConfig below_floor_decoded;
+    below_floor_decoded.max_decoded_response_bytes = (64 * 1024) - 1;
+    require_invalid(std::move(below_floor_decoded), "below-floor decoded response cap");
+
+    HttpClientConfig below_floor_encoded;
+    below_floor_encoded.max_encoded_response_bytes = (64 * 1024) - 1;
+    require_invalid(std::move(below_floor_encoded), "below-floor encoded response cap");
+}
+
+void test_accepted_budget_controls_decoded_willingness(
+    const std::shared_ptr<arrow::Schema>& schema) {
+    FaultServer server(schema);
+    HttpClientConfig config;
+    config.prefix = "";
+    config.max_response_bytes = 256 * 1024 * 1024;
+    config.max_encoded_response_bytes = 256 * 1024;
+    config.accepted_max_response_bytes = 1024LL * 1024 * 1024;
+    (void)HttpClient(server.origin(), config).capabilities();
+    require(server.last_accepted_response_budget.load() == 256 * 1024,
+            "explicit encoded ceiling was omitted from the advertised identity budget");
+
+    (void)HttpClient::builder(server.origin())
+        .prefix("")
+        .accepted_max_response_bytes(1024LL * 1024 * 1024)
+        .build()
+        .capabilities();
+    require(server.last_accepted_response_budget.load() == 1024LL * 1024 * 1024,
+            "accepted-budget setter did not raise the default encoded and decoded ceilings");
+
+    (void)HttpClient::builder(server.origin())
+        .prefix("")
+        .accepted_max_response_bytes(192 * 1024)
+        .response_limits(80 * 1024, 96 * 1024)
+        .build()
+        .capabilities();
+    require(server.last_accepted_response_budget.load() == 80 * 1024,
+            "explicit encoded cap was not advertised after accepted-budget setter");
+
+    (void)HttpClient::builder(server.origin())
+        .prefix("")
+        .response_limits(80 * 1024, 96 * 1024)
+        .accepted_max_response_bytes(192 * 1024)
+        .build()
+        .capabilities();
+    require(server.last_accepted_response_budget.load() == 80 * 1024,
+            "accepted-budget and response-limit setters were order dependent");
+
+    (void)HttpClient::builder(server.origin())
+        .prefix("")
+        .accepted_max_response_bytes(192 * 1024)
+        .response_limits(256 * 1024, 96 * 1024)
+        .build()
+        .capabilities();
+    require(server.last_accepted_response_budget.load() == 96 * 1024,
+            "explicit decoded cap was omitted from the advertised identity budget");
+
+    (void)HttpClient::builder(server.origin())
+        .prefix("")
+        .response_limits(256 * 1024, 96 * 1024)
+        .accepted_max_response_bytes(192 * 1024)
+        .build()
+        .capabilities();
+    require(server.last_accepted_response_budget.load() == 96 * 1024,
+            "explicit decoded cap was order-dependent with accepted-budget setter");
 }
 
 void test_ambiguous_exchange(FaultServer& server, const std::string& origin,
@@ -1033,13 +1249,17 @@ int main() {
         test_compression_negotiation(server, origin, schema);
         test_post_retry_requires_idempotency(server, origin, schema);
         test_producer_retry_requires_idempotency(server, origin, schema);
-        test_capabilities_and_row_metadata(origin, schema);
+        test_capabilities_and_row_metadata(server, origin, schema);
+        test_advertised_response_budget_is_strict_and_bounds_decoded_bytes(server, origin, schema);
+        test_response_budget_support_is_required_on_every_response(origin, schema);
         test_response_headers(origin, schema);
         test_pointer_metadata_sanitization(server, origin, schema);
         test_sticky_session_hardening(server, origin, schema);
         test_config_validation(origin);
+        test_accepted_budget_controls_decoded_willingness(schema);
         test_ambiguous_exchange(server, origin, schema);
         test_local_close_and_cancel(server, origin, schema);
+        test_response_budget_support_is_mandatory(schema);
     } catch (const std::exception& error) {
         std::cerr << "native HTTP client fault regression failed: " << error.what() << "\n";
         return 1;

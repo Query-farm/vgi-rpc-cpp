@@ -1536,10 +1536,16 @@ int main(int argc, char** argv) {
             server_id = take_value(i);
         } else if (arg == "--max-response-bytes") {
             http_cfg.max_response_bytes = std::stoll(take_value(i));
+        } else if (arg == "--hosting-max-response-bytes") {
+            http_cfg.hosting_max_response_bytes = std::stoll(take_value(i));
+        } else if (arg == "--preferred-response-bytes") {
+            http_cfg.preferred_response_bytes = std::stoll(take_value(i));
         } else if (arg == "--max-externalized-response-bytes") {
             http_cfg.max_externalized_response_bytes = std::stoll(take_value(i));
         } else if (arg == "--max-request-bytes") {
             http_cfg.max_request_bytes = std::stoll(take_value(i));
+        } else if (arg == "--hosting-max-request-bytes") {
+            http_cfg.hosting_max_request_bytes = std::stoll(take_value(i));
         } else if (arg == "--externalize-threshold") {
             http_cfg.externalize_threshold = std::stoll(take_value(i));
         } else if (arg == "--fake-storage" || arg == "--external-storage") {

@@ -150,6 +150,12 @@ struct HttpConfig {
     // deadline and return promptly; the server cannot preempt a callback.
     // Built-in header-only providers do not perform blocking I/O.
     std::chrono::milliseconds peer_identity_resolution_timeout{1000};
+
+    // Provider-neutral hosting ceilings and advisory response target. These
+    // stay at the end for positional aggregate source compatibility.
+    int64_t hosting_max_request_bytes = -1;
+    int64_t hosting_max_response_bytes = -1;
+    int64_t preferred_response_bytes = -1;
 };
 
 }  // namespace vgi_rpc

@@ -42,6 +42,10 @@ namespace {
 
 constexpr const char* kArrowContentType = "application/vnd.apache.arrow.stream";
 constexpr const char* kZstdEncoding = "zstd";
+constexpr const char* kAcceptMaxResponseBytesHeader = "VGI-Accept-Max-Response-Bytes";
+constexpr const char* kAcceptMaxResponseBytesSupportHeader =
+    "VGI-Accept-Max-Response-Bytes-Support";
+constexpr int64_t kMaxSafeResponseBytes = 9'007'199'254'740'991LL;
 constexpr size_t kMaxStructuredErrorBodyBytes = 4096;
 constexpr size_t kMaxStructuredErrorHeaderBytes = 1024;
 
@@ -526,7 +530,38 @@ std::vector<std::string> parse_list(const std::string& raw, bool lowercase = fal
     return values;
 }
 
-void harvest_capabilities(const httplib::Response& response, HttpServerCapabilities& caps) {
+std::optional<int64_t> strict_advertised_response_limit(const httplib::Response& response,
+                                                        const std::string& method,
+                                                        const std::string& request_id) {
+    const auto count = response.get_header_value_count("VGI-Max-Response-Bytes");
+    if (count == 0) return std::nullopt;
+    const std::string raw = response.get_header_value("VGI-Max-Response-Bytes");
+    const bool digits = count == 1 && !raw.empty() && raw.front() != '0' &&
+                        raw.find(',') == std::string::npos &&
+                        std::all_of(raw.begin(), raw.end(),
+                                    [](unsigned char ch) { return ch >= '0' && ch <= '9'; });
+    try {
+        size_t consumed = 0;
+        const int64_t parsed = digits ? std::stoll(raw, &consumed) : 0;
+        if (!digits || consumed != raw.size() || parsed < (64LL << 10) ||
+            parsed > kMaxSafeResponseBytes) {
+            throw std::invalid_argument("range");
+        }
+        return parsed;
+    } catch (const std::exception&) {
+        throw HttpClientError(
+            HttpClientErrorKind::PROTOCOL,
+            "HTTP response header VGI-Max-Response-Bytes must be exactly one ASCII integer "
+            "between 65536 and 9007199254740991",
+            response.status, method, request_id);
+    }
+}
+
+void harvest_capabilities(const httplib::Response& response, HttpServerCapabilities& caps,
+                          const std::string& method, const std::string& request_id) {
+    caps.accept_max_response_bytes_support =
+        response.get_header_value_count(kAcceptMaxResponseBytesSupportHeader) == 1 &&
+        response.get_header_value(kAcceptMaxResponseBytesSupportHeader) == "true";
     if (response.has_header("VGI-Sticky-Enabled")) {
         caps.sticky_enabled =
             ascii_lower(response.get_header_value("VGI-Sticky-Enabled")) == "true";
@@ -544,8 +579,8 @@ void harvest_capabilities(const httplib::Response& response, HttpServerCapabilit
     if (auto value = positive_header_int(response, "VGI-Max-Request-Bytes")) {
         caps.max_request_bytes = value;
     }
-    if (auto value = positive_header_int(response, "VGI-Max-Response-Bytes")) {
-        caps.max_response_bytes = value;
+    if (response.has_header("VGI-Max-Response-Bytes")) {
+        caps.max_response_bytes = strict_advertised_response_limit(response, method, request_id);
     }
     if (auto value = positive_header_int(response, "VGI-Max-Externalized-Response-Bytes")) {
         caps.max_externalized_response_bytes = value;
@@ -668,8 +703,15 @@ std::string decode_zstd(const std::string& encoded, int64_t max_decoded_bytes, i
 void validate_headers(const std::map<std::string, std::string>& headers,
                       bool allow_insecure_credentials, bool secure_transport) {
     const std::vector<std::string> reserved = {
-        "accept-encoding",   "content-encoding", "content-length",        "content-type", "host",
-        "transfer-encoding", "x-request-id",     "x-vgi-accept-encoding",
+        "accept-encoding",
+        "content-encoding",
+        "content-length",
+        "content-type",
+        "host",
+        "transfer-encoding",
+        "vgi-accept-max-response-bytes",
+        "x-request-id",
+        "x-vgi-accept-encoding",
     };
     const std::vector<std::string> credentials = {"authorization", "cookie", "proxy-authorization"};
     for (const auto& [name, value] : headers) {
@@ -934,17 +976,38 @@ public:
             throw std::invalid_argument(
                 "HTTP client request and response caps must not be negative");
         }
+        if (config.max_response_bytes == 0 && config.max_encoded_response_bytes == 0) {
+            throw std::invalid_argument("HTTP client encoded response cap must not be unbounded");
+        }
         validate_retry_policy(retry_policy);
-        max_encoded_response_bytes = config.max_encoded_response_bytes > 0
-                                         ? config.max_encoded_response_bytes
-                                         : config.max_response_bytes;
+        if (config.accepted_max_response_bytes < (64LL << 10) ||
+            config.accepted_max_response_bytes > kMaxSafeResponseBytes) {
+            throw std::invalid_argument(
+                "accepted_max_response_bytes must be between 65536 and 9007199254740991");
+        }
+        if (config.max_decoded_response_bytes > 0 &&
+            (config.max_decoded_response_bytes < (64LL << 10) ||
+             config.max_decoded_response_bytes > kMaxSafeResponseBytes)) {
+            throw std::invalid_argument(
+                "max_decoded_response_bytes must be zero or between 65536 and "
+                "9007199254740991");
+        }
+        max_encoded_response_bytes =
+            config.max_encoded_response_bytes > 0
+                ? config.max_encoded_response_bytes
+                : std::max(config.max_response_bytes, config.accepted_max_response_bytes);
         max_decoded_response_bytes = config.max_decoded_response_bytes > 0
                                          ? config.max_decoded_response_bytes
-                                         : config.max_response_bytes;
-        if (max_encoded_response_bytes <= 0 || max_decoded_response_bytes <= 0) {
+                                         : config.accepted_max_response_bytes;
+        max_decoded_response_bytes =
+            std::min(max_decoded_response_bytes, config.accepted_max_response_bytes);
+        if (max_encoded_response_bytes < (64LL << 10)) {
             throw std::invalid_argument(
-                "HTTP client encoded and decoded response caps must resolve to positive values");
+                "max_encoded_response_bytes must resolve to at least 65536 so the effective "
+                "identity response budget is protocol-advertisable");
         }
+        advertised_max_response_bytes =
+            std::min(max_encoded_response_bytes, max_decoded_response_bytes);
         validate_headers(config.headers, config.allow_insecure_credentials, secure_transport);
         if (base_url.has_userinfo && !secure_transport && !config.allow_insecure_credentials) {
             throw std::invalid_argument(
@@ -999,7 +1062,8 @@ public:
                                          const std::string& request_id) const {
         try {
             return socks_client->send(http_method, request_path, headers, body,
-                                      max_encoded_response_bytes, options);
+                                      max_encoded_response_bytes,
+                                      effective_decoded_response_limit(), options);
         } catch (const SocksHttpFailure& error) {
             HttpClientErrorKind kind = HttpClientErrorKind::TRANSPORT;
             switch (error.kind()) {
@@ -1018,6 +1082,13 @@ public:
         const std::string& request_id, const CallOptions& options, bool retryable,
         const std::shared_ptr<HttpStickySessionState>& sticky_session = nullptr) {
         check_call_active(options, method, request_id);
+        const auto caps = capabilities(request_id, options, sticky_session);
+        if (!caps.accept_max_response_bytes_support) {
+            throw HttpClientError(HttpClientErrorKind::PROTOCOL,
+                                  std::string("server does not advertise ") +
+                                      kAcceptMaxResponseBytesSupportHeader + ": true",
+                                  0, method, request_id);
+        }
         std::map<std::string, std::string> auth_headers;
         if (auth_callback) {
             try {
@@ -1095,6 +1166,8 @@ public:
             }
             headers.emplace("Accept-Encoding", "zstd, identity");
             headers.emplace("X-VGI-Accept-Encoding", "zstd, identity");
+            headers.emplace(kAcceptMaxResponseBytesHeader,
+                            std::to_string(advertised_max_response_bytes));
             headers.emplace("X-Request-ID", request_id);
             std::string encoded;
             const std::string* payload = &body;
@@ -1125,40 +1198,81 @@ public:
             } else {
                 ScopedHttpMaxTimeout max_timeout(*client, max_timeout_milliseconds);
                 std::stop_callback stop_callback(options.stop_token, [this] { client->stop(); });
-                auto result = client->Post(
-                    request_path, headers, *payload, kArrowContentType,
-                    [&](const char* data, size_t size) {
-                        if (size > static_cast<uint64_t>(max_encoded_response_bytes) ||
-                            response.body.size() >
-                                static_cast<uint64_t>(max_encoded_response_bytes) - size) {
-                            response_too_large = true;
-                            return false;
+                int64_t receive_limit = max_encoded_response_bytes;
+                bool decoded_receive_limit_applied = false;
+                std::exception_ptr header_error;
+                httplib::Request request;
+                request.method = "POST";
+                request.path = request_path;
+                request.headers = headers;
+                request.headers.emplace("Content-Type", kArrowContentType);
+                request.body = *payload;
+                request.response_handler = [&](const httplib::Response& header_response) {
+                    try {
+                        if (header_response.get_header_value_count(
+                                kAcceptMaxResponseBytesSupportHeader) != 1 ||
+                            header_response.get_header_value(
+                                kAcceptMaxResponseBytesSupportHeader) != "true") {
+                            throw HttpClientError(
+                                HttpClientErrorKind::PROTOCOL,
+                                std::string("HTTP RPC response does not advertise exactly one ") +
+                                    kAcceptMaxResponseBytesSupportHeader + ": true",
+                                header_response.status, method, request_id);
                         }
-                        response.body.append(data, size);
+                        int64_t decoded_limit = effective_decoded_response_limit();
+                        if (const auto current = strict_advertised_response_limit(
+                                header_response, method, request_id)) {
+                            decoded_limit = std::min(decoded_limit, *current);
+                        }
+                        std::string encoding = header_response.get_header_value("Content-Encoding");
+                        if (encoding.empty()) {
+                            encoding = header_response.get_header_value("X-VGI-Content-Encoding");
+                        }
+                        encoding = ascii_lower(trim_ascii(std::move(encoding)));
+                        if (encoding.empty() || encoding == "identity") {
+                            receive_limit = std::min(max_encoded_response_bytes, decoded_limit);
+                            decoded_receive_limit_applied =
+                                receive_limit < max_encoded_response_bytes;
+                        }
                         return true;
-                    });
+                    } catch (...) {
+                        header_error = std::current_exception();
+                        return false;
+                    }
+                };
+                request.content_receiver = [&](const char* data, size_t size, uint64_t, uint64_t) {
+                    if (size > static_cast<uint64_t>(receive_limit) ||
+                        response.body.size() > static_cast<uint64_t>(receive_limit) - size) {
+                        response_too_large = true;
+                        return false;
+                    }
+                    response.body.append(data, size);
+                    return true;
+                };
+                httplib::Error transport_error = httplib::Error::Success;
+                max_timeout.start(request);
+                const bool sent = client->send(request, wire_response, transport_error);
+                if (header_error) std::rethrow_exception(header_error);
                 if (response_too_large) {
                     throw HttpClientError(
                         HttpClientErrorKind::LIMIT,
-                        "encoded HTTP RPC response exceeds max_encoded_response_bytes (" +
-                            std::to_string(max_encoded_response_bytes) + ")",
+                        decoded_receive_limit_applied
+                            ? "identity HTTP RPC response exceeds max_decoded_response_bytes (" +
+                                  std::to_string(receive_limit) + ")"
+                            : "encoded HTTP RPC response exceeds max_encoded_response_bytes (" +
+                                  std::to_string(max_encoded_response_bytes) + ")",
                         0, method, request_id);
                 }
-                if (!result) {
+                if (!sent) {
                     int tls_error = 0;
                     unsigned long tls_backend_error = 0;
-#ifdef CPPHTTPLIB_OPENSSL_SUPPORT
-                    tls_error = result.ssl_error();
-                    tls_backend_error = result.ssl_backend_error();
-#endif
                     const HttpClientErrorKind kind = classify_transport_error(
-                        result.error(), options, secure_transport, tls_error, tls_backend_error);
+                        transport_error, options, secure_transport, tls_error, tls_backend_error);
                     throw HttpClientError(kind,
                                           std::string("HTTP RPC transport failed: ") +
-                                              httplib::to_string(result.error()),
+                                              httplib::to_string(transport_error),
                                           0, method, request_id);
                 }
-                wire_response = std::move(*result);
             }
             if (response_too_large) {
                 throw HttpClientError(
@@ -1166,6 +1280,14 @@ public:
                     "encoded HTTP RPC response exceeds max_encoded_response_bytes (" +
                         std::to_string(max_encoded_response_bytes) + ")",
                     0, method, request_id);
+            }
+            if (wire_response.get_header_value_count(kAcceptMaxResponseBytesSupportHeader) != 1 ||
+                wire_response.get_header_value(kAcceptMaxResponseBytesSupportHeader) != "true") {
+                throw HttpClientError(
+                    HttpClientErrorKind::PROTOCOL,
+                    std::string("HTTP RPC response does not advertise exactly one ") +
+                        kAcceptMaxResponseBytesSupportHeader + ": true",
+                    wire_response.status, method, request_id);
             }
             response.status = wire_response.status;
             response.rpc_error = wire_response.get_header_value("X-VGI-RPC-Error") == "true";
@@ -1177,7 +1299,7 @@ public:
                 response.sticky_update =
                     stage_sticky_response(wire_response, sticky_session, method, request_id);
             }
-            harvest_capabilities(wire_response, server_capabilities);
+            harvest_capabilities(wire_response, server_capabilities, method, request_id);
             if (server_capabilities.max_request_bytes) {
                 server_max_request_bytes = server_capabilities.max_request_bytes;
             }
@@ -1193,16 +1315,17 @@ public:
             }
             content_encoding = ascii_lower(trim_ascii(std::move(content_encoding)));
             if (content_encoding.empty() || content_encoding == "identity") {
-                if (response.body.size() > static_cast<uint64_t>(max_decoded_response_bytes)) {
+                const int64_t decoded_limit = effective_decoded_response_limit();
+                if (response.body.size() > static_cast<uint64_t>(decoded_limit)) {
                     throw HttpClientError(
                         HttpClientErrorKind::LIMIT,
                         "decoded HTTP RPC response exceeds max_decoded_response_bytes (" +
-                            std::to_string(max_decoded_response_bytes) + ")",
+                            std::to_string(decoded_limit) + ")",
                         response.status, method, request_id);
                 }
             } else if (content_encoding == kZstdEncoding) {
                 response.body =
-                    decode_zstd(response.body, max_decoded_response_bytes, response.status);
+                    decode_zstd(response.body, effective_decoded_response_limit(), response.status);
             } else {
                 throw HttpClientError(
                     HttpClientErrorKind::PROTOCOL,
@@ -1491,6 +1614,8 @@ public:
                 }
             }
             headers.emplace("Accept-Encoding", "identity");
+            headers.emplace(kAcceptMaxResponseBytesHeader,
+                            std::to_string(advertised_max_response_bytes));
             headers.emplace("X-Request-ID", request_id);
             int64_t max_timeout_milliseconds = 0;
             if (options.deadline) {
@@ -1589,7 +1714,7 @@ public:
                 sticky_session->echo_headers = std::move(sticky_update->echo_headers);
             }
             server_capabilities = HttpServerCapabilities{};
-            harvest_capabilities(response, server_capabilities);
+            harvest_capabilities(response, server_capabilities, "OPTIONS", request_id);
             if (server_capabilities.max_request_bytes) {
                 server_max_request_bytes = server_capabilities.max_request_bytes;
             }
@@ -1610,6 +1735,13 @@ public:
             return std::min(config.max_request_bytes, *server_max_request_bytes);
         }
         return config.max_request_bytes;
+    }
+
+    int64_t effective_decoded_response_limit() const {
+        if (server_capabilities.max_response_bytes) {
+            return std::min(advertised_max_response_bytes, *server_capabilities.max_response_bytes);
+        }
+        return advertised_max_response_bytes;
     }
 
     int64_t request_serialization_cap() {
@@ -1795,6 +1927,7 @@ private:
     std::optional<int64_t> server_max_request_bytes;
     int64_t max_encoded_response_bytes = 0;
     int64_t max_decoded_response_bytes = 0;
+    int64_t advertised_max_response_bytes = 0;
     bool send_compressed = false;
     bool capabilities_fetched = false;
     HttpServerCapabilities server_capabilities;
@@ -1874,6 +2007,12 @@ HttpClientBuilder& HttpClientBuilder::header(std::string name, std::string value
 HttpClientBuilder& HttpClientBuilder::compression_level(std::optional<int> level) {
     if (!impl_) throw std::logic_error("HttpClientBuilder is moved from");
     impl_->config.compression_level = level;
+    return *this;
+}
+
+HttpClientBuilder& HttpClientBuilder::accepted_max_response_bytes(int64_t max_bytes) {
+    if (!impl_) throw std::logic_error("HttpClientBuilder is moved from");
+    impl_->config.accepted_max_response_bytes = max_bytes;
     return *this;
 }
 

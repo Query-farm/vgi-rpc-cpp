@@ -90,6 +90,16 @@ TEST_CASE("finish throws for exchange mode", "[output_collector]") {
     REQUIRE_THROWS_AS(out.finish(), std::runtime_error);
 }
 
+TEST_CASE("response budgets are exposed off wire", "[output_collector]") {
+    OutputCollector out(test_schema(), true, "srv", "req", 4096, 2048);
+    REQUIRE(out.response_limit_bytes() == 4096);
+    REQUIRE(out.preferred_response_bytes() == 2048);
+
+    OutputCollector unbounded(test_schema(), false);
+    REQUIRE_FALSE(unbounded.response_limit_bytes().has_value());
+    REQUIRE_FALSE(unbounded.preferred_response_bytes().has_value());
+}
+
 TEST_CASE("client_log includes request_id when provided", "[output_collector]") {
     OutputCollector out(test_schema(), true, "srv", "req123");
     out.client_log(LogLevel::INFO, "hello");

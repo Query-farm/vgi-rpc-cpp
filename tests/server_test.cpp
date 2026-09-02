@@ -436,6 +436,22 @@ TEST_CASE("ServerBuilder: default server_id is random", "[server]") {
     REQUIRE_FALSE(server->server_id().empty());
 }
 
+TEST_CASE("HTTP response budgets enforce the cross-language numeric range", "[server][http]") {
+    ServerBuilder builder;
+    builder.add_void("test", empty_schema(), [](const Request&, CallContext&) {});
+    auto server = builder.build();
+
+    const auto require_invalid = [&](auto configure) {
+        HttpConfig config;
+        configure(config);
+        REQUIRE_THROWS_AS(server->serve_http(config), std::invalid_argument);
+    };
+    require_invalid([](HttpConfig& c) { c.max_response_bytes = (64 * 1024) - 1; });
+    require_invalid([](HttpConfig& c) { c.hosting_max_response_bytes = (64 * 1024) - 1; });
+    require_invalid([](HttpConfig& c) { c.preferred_response_bytes = (64 * 1024) - 1; });
+    require_invalid([](HttpConfig& c) { c.max_response_bytes = 9'007'199'254'740'992LL; });
+}
+
 // ── Null Schema Validation Tests ─────────────────────────────────────
 
 TEST_CASE("ServerBuilder: null params_schema in add_unary throws", "[server]") {

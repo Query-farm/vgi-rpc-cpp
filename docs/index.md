@@ -64,13 +64,16 @@ resolve and free only pays off once the copy it avoids is large enough.
 
 ## HTTP features
 
-All off by default — a server built with `HttpConfig{}` is byte-identical on
-the wire to one built before any of them existed.
+Application and hosting byte ceilings remain optional. Every HTTP worker now
+advertises response-budget support so clients can require a bounded decoded
+response without guessing whether an older worker ignored the request header.
 
 | Feature | Configuration |
 |---|---|
 | Capability discovery (`GET`/`OPTIONS {prefix}/health`) | always on |
-| Response caps, strict-fail | `max_response_bytes`, `max_externalized_response_bytes` |
+| Response caps, strict-fail | `max_response_bytes`, `hosting_max_response_bytes`, `max_externalized_response_bytes` |
+| Response batching target | `preferred_response_bytes` |
+| Request caps | `max_request_bytes`, `hosting_max_request_bytes` |
 | External locations (pointer batches) | `external_storage_url`, `externalize_threshold` |
 | Bounded request decoding and response negotiation (zstd + gzip) | `compression` |
 | CORS, including `Cross-Origin-Resource-Policy` | `cors_origin` |
@@ -82,6 +85,14 @@ the wire to one built before any of them existed.
 Stream state travels as two tokens split by lifetime — a call token minted
 once by `/init` and a cursor re-minted every turn — so a continuation does not
 re-serialize the fixed half of the call.
+
+Clients send `VGI-Accept-Max-Response-Bytes` on every request. The effective
+decoded Arrow IPC limit is the minimum of the application, hosting, and client
+ceilings. A continuation can lower its init-time limit but cannot raise it.
+Oversize successful responses return an Arrow `ResponseTooLargeError` envelope
+with HTTP 200 and no continuation cursor. `CallContext` and `OutputCollector`
+expose the effective `response_limit_bytes` and the server-only
+`preferred_response_bytes` target to handlers.
 
 ### External storage
 

@@ -27,7 +27,9 @@ namespace vgi_rpc {
 class VGI_RPC_EXPORT OutputCollector {
 public:
     OutputCollector(std::shared_ptr<arrow::Schema> output_schema, bool producer_mode,
-                    const std::string& server_id = "", const std::string& request_id = "");
+                    const std::string& server_id = "", const std::string& request_id = "",
+                    std::optional<int64_t> response_limit_bytes = std::nullopt,
+                    std::optional<int64_t> preferred_response_bytes = std::nullopt);
 
     // Emit a pre-built data batch
     void emit_batch(std::shared_ptr<arrow::RecordBatch> batch);
@@ -56,6 +58,10 @@ public:
     const std::vector<AnnotatedBatch>& batches() const noexcept { return batches_; }
 
     const std::shared_ptr<arrow::Schema>& output_schema() const noexcept { return output_schema_; }
+    std::optional<int64_t> response_limit_bytes() const noexcept { return response_limit_bytes_; }
+    std::optional<int64_t> preferred_response_bytes() const noexcept {
+        return preferred_response_bytes_;
+    }
 
 private:
     std::shared_ptr<arrow::Schema> output_schema_;
@@ -65,6 +71,8 @@ private:
     std::string request_id_;
     std::vector<AnnotatedBatch> batches_;
     std::optional<size_t> data_batch_idx_;
+    std::optional<int64_t> response_limit_bytes_;
+    std::optional<int64_t> preferred_response_bytes_;
 };
 
 }  // namespace vgi_rpc

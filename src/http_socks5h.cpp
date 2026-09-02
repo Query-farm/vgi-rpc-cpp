@@ -67,6 +67,9 @@ std::string trim_header_value(std::string value) {
 struct TransferState {
     httplib::Response response;
     int64_t maximum_response_bytes = 0;
+    int64_t maximum_encoded_response_bytes = 0;
+    int64_t maximum_identity_response_bytes = 0;
+    bool identity_limit_applied = false;
     bool response_too_large = false;
     size_t response_header_bytes = 0;
     bool response_headers_too_large = false;
@@ -108,6 +111,36 @@ size_t receive_header(char* data, size_t size, size_t count, void* opaque) {
         const std::string name = line.substr(0, colon);
         const std::string value = trim_header_value(line.substr(colon + 1));
         if (!name.empty()) state.response.headers.emplace(name, value);
+    } else if (line == "\r\n" || line == "\n") {
+        std::string encoding =
+            trim_header_value(state.response.get_header_value("Content-Encoding"));
+        std::transform(encoding.begin(), encoding.end(), encoding.begin(),
+                       [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+        if (encoding.empty() || encoding == "identity") {
+            int64_t identity_limit = state.maximum_identity_response_bytes;
+            if (state.response.get_header_value_count("VGI-Max-Response-Bytes") == 1) {
+                const std::string raw = state.response.get_header_value("VGI-Max-Response-Bytes");
+                const bool digits = !raw.empty() && raw.front() != '0' &&
+                                    std::all_of(raw.begin(), raw.end(), [](unsigned char ch) {
+                                        return ch >= '0' && ch <= '9';
+                                    });
+                try {
+                    size_t consumed = 0;
+                    const int64_t parsed = digits ? std::stoll(raw, &consumed) : 0;
+                    if (digits && consumed == raw.size() && parsed >= (64LL << 10) &&
+                        parsed <= 9'007'199'254'740'991LL) {
+                        identity_limit = std::min(identity_limit, parsed);
+                    }
+                } catch (const std::exception&) {
+                    // The protocol layer reports malformed capability syntax.
+                    // This callback only derives an early allocation ceiling.
+                }
+            }
+            state.maximum_response_bytes =
+                std::min(state.maximum_encoded_response_bytes, identity_limit);
+            state.identity_limit_applied =
+                state.maximum_response_bytes < state.maximum_encoded_response_bytes;
+        }
     }
     return bytes;
 }
@@ -189,7 +222,8 @@ SocksHttpClient::SocksHttpClient(std::string base_url, std::string proxy_uri,
 
 httplib::Response SocksHttpClient::send(const std::string& method, const std::string& path,
                                         const httplib::Headers& headers, const std::string& body,
-                                        int64_t maximum_response_bytes,
+                                        int64_t maximum_encoded_response_bytes,
+                                        int64_t maximum_identity_response_bytes,
                                         const CallOptions& options) const {
     ensure_curl_initialized();
     std::unique_ptr<CURL, CurlDeleter> handle(curl_easy_init());
@@ -209,7 +243,9 @@ httplib::Response SocksHttpClient::send(const std::string& method, const std::st
     std::unique_ptr<curl_slist, CurlHeadersDeleter> owned_headers(raw_headers);
 
     TransferState state;
-    state.maximum_response_bytes = maximum_response_bytes;
+    state.maximum_response_bytes = maximum_encoded_response_bytes;
+    state.maximum_encoded_response_bytes = maximum_encoded_response_bytes;
+    state.maximum_identity_response_bytes = maximum_identity_response_bytes;
     state.options = &options;
     const std::string url = base_url_ + path;
     curl_easy_setopt(handle.get(), CURLOPT_URL, url.c_str());
@@ -271,7 +307,9 @@ httplib::Response SocksHttpClient::send(const std::string& method, const std::st
     }
     if (state.response_too_large) {
         throw SocksHttpFailure(SocksHttpFailureKind::LIMIT,
-                               "encoded HTTP response exceeds the configured byte limit");
+                               state.identity_limit_applied
+                                   ? "identity HTTP response exceeds the decoded byte limit"
+                                   : "encoded HTTP response exceeds the configured byte limit");
     }
     if (result != CURLE_OK) {
         throw SocksHttpFailure(

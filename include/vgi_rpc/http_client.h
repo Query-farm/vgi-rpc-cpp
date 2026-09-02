@@ -92,6 +92,8 @@ struct HttpServerCapabilities {
     // An absent advertisement is the legacy-server answer: zstd.  A
     // present-but-empty header replaces this with an empty vector.
     std::vector<std::string> supported_encodings = {"zstd"};
+    // Appended for positional aggregate source compatibility.
+    bool accept_max_response_bytes_support = false;
 };
 
 struct HttpUploadUrl {
@@ -108,8 +110,9 @@ struct HttpClientConfig {
     // Independent mandatory local allocation guards.  Both must be positive;
     // the client never offers an unbounded buffering mode.
     int64_t max_request_bytes = 64LL * 1024 * 1024;
-    // Compatibility ceiling used for both encoded and decoded responses unless
-    // either more-specific limit below is positive.
+    // Compatibility ceiling used for encoded responses unless the more-specific
+    // encoded limit below is positive. Decoded willingness is controlled by
+    // accepted_max_response_bytes and may be narrowed by max_decoded_response_bytes.
     int64_t max_response_bytes = 256LL * 1024 * 1024;
     int connection_timeout_seconds = 10;
     int read_timeout_seconds = 30;
@@ -125,8 +128,10 @@ struct HttpClientConfig {
     // zstd request-body compression level.  nullopt sends identity request
     // bodies.  The client always supports bounded zstd response decoding.
     std::optional<int> compression_level = 3;
-    // Independent wire and post-decompression response limits.  Zero inherits
-    // max_response_bytes, preserving existing configurations and guarantees.
+    // Independent wire and post-decompression response limits. Zero encoded
+    // grows with accepted_max_response_bytes (while retaining a larger legacy
+    // max_response_bytes); zero decoded inherits accepted_max_response_bytes.
+    // Explicit narrower values clamp the effective advertised identity budget.
     int64_t max_encoded_response_bytes = 0;
     int64_t max_decoded_response_bytes = 0;
     // Optional explicit SOCKS5h proxy for the VGI RPC origin. The origin
@@ -137,6 +142,10 @@ struct HttpClientConfig {
     // Kept at the end to preserve positional aggregate initialization of the
     // pre-existing configuration fields.
     std::optional<std::string> tcp_proxy;
+    // Maximum decoded Arrow IPC response this client is willing to accept.
+    // Sent on every request. Native clients default to 256 MiB. Appended for
+    // positional aggregate source compatibility.
+    int64_t accepted_max_response_bytes = 256LL * 1024 * 1024;
 };
 
 class VGI_RPC_EXPORT HttpClientError : public std::runtime_error {
@@ -222,6 +231,7 @@ public:
     HttpClientBuilder& protocol_version(std::string version);
     HttpClientBuilder& header(std::string name, std::string value);
     HttpClientBuilder& compression_level(std::optional<int> level);
+    HttpClientBuilder& accepted_max_response_bytes(int64_t max_bytes);
     HttpClientBuilder& response_limits(int64_t max_encoded_bytes, int64_t max_decoded_bytes);
     HttpClientBuilder& retry_policy(RetryPolicy policy);
     HttpClientBuilder& auth_callback(HttpAuthCallback callback);
