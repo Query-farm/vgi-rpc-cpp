@@ -339,7 +339,10 @@ int main() {
                 "empty producer did not terminate during initialization");
 
         {
-            PythonWorker capped_worker(16384);
+            // The shared HTTP budget contract has a 64 KiB floor. Keep the
+            // fixture at that floor while still forcing the producer to span
+            // multiple lock-step responses.
+            PythonWorker capped_worker(64 * 1024);
             require(capped_worker.port() != 0, "capped producer conformance worker is unavailable");
             auto lockstep_client =
                 HttpClient::builder("http://127.0.0.1:" + std::to_string(capped_worker.port()))
