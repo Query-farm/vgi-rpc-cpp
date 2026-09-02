@@ -11,8 +11,7 @@ namespace vgi_rpc {
 std::string IrohStatusDetail::ToString() const {
     return "stage=" + std::to_string(static_cast<uint32_t>(stage_)) +
            ", category=" + std::to_string(static_cast<uint32_t>(category_)) +
-           ", dispatch_certainty=" +
-           std::to_string(static_cast<uint32_t>(dispatch_certainty_)) +
+           ", dispatch_certainty=" + std::to_string(static_cast<uint32_t>(dispatch_certainty_)) +
            (message_.empty() ? std::string{} : ", message=" + message_);
 }
 namespace {
@@ -20,10 +19,9 @@ namespace {
 uint8_t hex_nibble(char value) {
     if (value >= '0' && value <= '9') return static_cast<uint8_t>(value - '0');
     if (value >= 'a' && value <= 'f') return static_cast<uint8_t>(value - 'a' + 10);
-    throw IrohTransportError(
-        "Iroh endpoint ID must be exactly 64 lowercase hexadecimal characters",
-        IrohErrorStage::PARSE, IrohErrorCategory::INVALID_INPUT,
-        IrohDispatchCertainty::NOT_SENT);
+    throw IrohTransportError("Iroh endpoint ID must be exactly 64 lowercase hexadecimal characters",
+                             IrohErrorStage::PARSE, IrohErrorCategory::INVALID_INPUT,
+                             IrohDispatchCertainty::NOT_SENT);
 }
 
 void validate_path(const std::string& path) {
@@ -58,8 +56,8 @@ void validate_path(const std::string& path) {
                                      IrohDispatchCertainty::NOT_SENT);
         }
         if (path[i] == '%') {
-            const auto decoded = static_cast<uint8_t>((hex_nibble(path[i + 1]) << 4) |
-                                                       hex_nibble(path[i + 2]));
+            const auto decoded =
+                static_cast<uint8_t>((hex_nibble(path[i + 1]) << 4) | hex_nibble(path[i + 2]));
             if (decoded == '.' || decoded == '/' || decoded == '\\' || decoded <= 0x20 ||
                 decoded == 0x7f) {
                 throw IrohTransportError(
@@ -109,9 +107,8 @@ IrohEndpoint IrohEndpoint::parse(const std::string& uri) {
     }
     std::string path = slash == std::string::npos ? "" : uri.substr(slash);
     if (scheme == Scheme::IROH && !path.empty()) {
-        throw IrohTransportError("iroh:// endpoints cannot contain a path",
-                                 IrohErrorStage::PARSE, IrohErrorCategory::INVALID_INPUT,
-                                 IrohDispatchCertainty::NOT_SENT);
+        throw IrohTransportError("iroh:// endpoints cannot contain a path", IrohErrorStage::PARSE,
+                                 IrohErrorCategory::INVALID_INPUT, IrohDispatchCertainty::NOT_SENT);
     }
     validate_path(path);
     if (path == "/") path.clear();
@@ -131,8 +128,7 @@ ClientTransport connect_iroh_transport(const std::string& raw_endpoint,
     if (endpoint.scheme != IrohEndpoint::Scheme::IROH) {
         throw IrohTransportError(
             "raw RpcClient requires iroh://; httpi:// requires an iroh-http/2 client",
-            IrohErrorStage::BIND, IrohErrorCategory::UNSUPPORTED,
-            IrohDispatchCertainty::NOT_SENT);
+            IrohErrorStage::BIND, IrohErrorCategory::UNSUPPORTED, IrohDispatchCertainty::NOT_SENT);
     }
     if (options.no_relay && !options.relay_urls.empty()) {
         throw IrohTransportError("no_relay and relay_urls are mutually exclusive",
@@ -142,8 +138,7 @@ ClientTransport connect_iroh_transport(const std::string& raw_endpoint,
     if (options.connect_timeout <= std::chrono::milliseconds::zero() ||
         options.io_timeout <= std::chrono::milliseconds::zero()) {
         throw IrohTransportError("Iroh timeouts must be positive", IrohErrorStage::PARSE,
-                                 IrohErrorCategory::INVALID_INPUT,
-                                 IrohDispatchCertainty::NOT_SENT);
+                                 IrohErrorCategory::INVALID_INPUT, IrohDispatchCertainty::NOT_SENT);
     }
     return provider(endpoint, options);
 }

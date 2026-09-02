@@ -15,8 +15,7 @@
 using namespace vgi_rpc;
 
 namespace {
-const std::string ID =
-    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+const std::string ID = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 }
 
 TEST_CASE("canonical Iroh endpoint parsing") {
@@ -34,10 +33,15 @@ TEST_CASE("canonical Iroh endpoint parsing") {
 TEST_CASE("non-canonical Iroh endpoint rejection") {
     const std::vector<std::string> invalid{
         "iroh://0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF",
-        "iroh://" + ID + "/", "iroh://" + ID + ":443", "iroh://user@" + ID,
-        "httpi://" + ID + "/a//b", "httpi://" + ID + "/a/../b",
-        "httpi://" + ID + "/bad%2", "httpi://" + ID + "?x=1"};
-    for (const auto& value : invalid) CHECK_THROWS_AS(IrohEndpoint::parse(value), IrohTransportError);
+        "iroh://" + ID + "/",
+        "iroh://" + ID + ":443",
+        "iroh://user@" + ID,
+        "httpi://" + ID + "/a//b",
+        "httpi://" + ID + "/a/../b",
+        "httpi://" + ID + "/bad%2",
+        "httpi://" + ID + "?x=1"};
+    for (const auto& value : invalid)
+        CHECK_THROWS_AS(IrohEndpoint::parse(value), IrohTransportError);
 }
 
 TEST_CASE("canonical Iroh transport fixture") {
@@ -57,19 +61,21 @@ TEST_CASE("canonical Iroh transport fixture") {
         CHECK((endpoint.scheme == IrohEndpoint::Scheme::IROH ? "iroh" : "httpi") ==
               vector["scheme"].get<std::string>());
     }
-    const std::vector<std::string> stages{"parse", "bind", "resolve", "connect", "alpn",
-                                          "open_stream", "write", "read", "cancel", "close",
-                                          "internal"};
+    const std::vector<std::string> stages{"parse",  "bind",        "resolve", "connect",
+                                          "alpn",   "open_stream", "write",   "read",
+                                          "cancel", "close",       "internal"};
     const std::vector<std::string> categories{
-        "invalid_input", "unsupported", "unavailable", "timeout", "protocol",
-        "connection_reset", "cancelled", "authentication", "resource_exhausted", "internal"};
+        "invalid_input",      "unsupported",      "unavailable", "timeout",
+        "protocol",           "connection_reset", "cancelled",   "authentication",
+        "resource_exhausted", "internal"};
     const std::vector<std::string> certainties{"not_sent", "unknown", "sent"};
     for (const auto& vector : fixture["error_cases"]) {
-        CHECK(std::find(stages.begin(), stages.end(), vector["stage"].get<std::string>()) != stages.end());
-        CHECK(std::find(categories.begin(), categories.end(), vector["category"].get<std::string>()) != categories.end());
+        CHECK(std::find(stages.begin(), stages.end(), vector["stage"].get<std::string>()) !=
+              stages.end());
+        CHECK(std::find(categories.begin(), categories.end(),
+                        vector["category"].get<std::string>()) != categories.end());
         CHECK(std::find(certainties.begin(), certainties.end(),
-                        vector["dispatch_certainty"].get<std::string>()) !=
-              certainties.end());
+                        vector["dispatch_certainty"].get<std::string>()) != certainties.end());
     }
     try {
         IrohEndpoint::parse("invalid");

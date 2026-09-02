@@ -63,21 +63,37 @@ inline constexpr const char* IROH_ARROW_MUX_ALPN = "vgi-rpc/arrow-mux/1";
 inline constexpr const char* IROH_HTTP_ALPN = "iroh-http/2";
 
 enum class IrohErrorStage : uint32_t {
-    PARSE = 1, BIND = 2, RESOLVE = 3, CONNECT = 4, ALPN = 5, OPEN_STREAM = 6,
-    WRITE = 7, READ = 8, CANCEL = 9, CLOSE = 10, INTERNAL = 11,
+    PARSE = 1,
+    BIND = 2,
+    RESOLVE = 3,
+    CONNECT = 4,
+    ALPN = 5,
+    OPEN_STREAM = 6,
+    WRITE = 7,
+    READ = 8,
+    CANCEL = 9,
+    CLOSE = 10,
+    INTERNAL = 11,
 };
 enum class IrohErrorCategory : uint32_t {
-    INVALID_INPUT = 1, UNSUPPORTED = 2, UNAVAILABLE = 3, TIMEOUT = 4,
-    PROTOCOL = 5, CONNECTION_RESET = 6, CANCELLED = 7, AUTHENTICATION = 8,
-    RESOURCE_EXHAUSTED = 9, INTERNAL = 10,
+    INVALID_INPUT = 1,
+    UNSUPPORTED = 2,
+    UNAVAILABLE = 3,
+    TIMEOUT = 4,
+    PROTOCOL = 5,
+    CONNECTION_RESET = 6,
+    CANCELLED = 7,
+    AUTHENTICATION = 8,
+    RESOURCE_EXHAUSTED = 9,
+    INTERNAL = 10,
 };
 enum class IrohDispatchCertainty : uint32_t { NOT_SENT = 0, UNKNOWN = 1, SENT = 2 };
 
 /// Portable Iroh failure dimensions; dispatch certainty controls safe retries.
 class VGI_RPC_EXPORT IrohTransportError : public std::runtime_error {
 public:
-    IrohTransportError(std::string message, IrohErrorStage stage,
-                       IrohErrorCategory category, IrohDispatchCertainty dispatch_certainty)
+    IrohTransportError(std::string message, IrohErrorStage stage, IrohErrorCategory category,
+                       IrohDispatchCertainty dispatch_certainty)
         : std::runtime_error(std::move(message)),
           stage_(stage),
           category_(category),
@@ -197,9 +213,9 @@ private:
 using IrohTransportProvider =
     std::function<ClientTransport(const IrohEndpoint&, const IrohTransportOptions&)>;
 
-VGI_RPC_EXPORT ClientTransport connect_iroh_transport(
-    const std::string& endpoint, const IrohTransportProvider& provider,
-    const IrohTransportOptions& options = {});
+VGI_RPC_EXPORT ClientTransport connect_iroh_transport(const std::string& endpoint,
+                                                      const IrohTransportProvider& provider,
+                                                      const IrohTransportOptions& options = {});
 
 /// Return the linked vgi-iroh C ABI provider. Throws a clear unsupported error
 /// when the library was built without VGI_RPC_WITH_IROH_CABI.

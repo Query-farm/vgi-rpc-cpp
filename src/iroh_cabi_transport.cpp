@@ -52,16 +52,16 @@ IrohTransportError cabi_error(const char* operation, const vgi_iroh_error& error
         ++message_size;
     }
     return IrohTransportError(
-        std::string("Iroh ") + operation + " failed: " +
-            std::string(error.message, message_size),
+        std::string("Iroh ") + operation + " failed: " + std::string(error.message, message_size),
         error_stage(error.stage), error_category(error.category),
         dispatch_certainty(error.dispatch_certainty));
 }
 
 arrow::Status cabi_status(const char* operation, const vgi_iroh_error& error) {
     const auto failure = cabi_error(operation, error);
-    return arrow::Status::IOError(failure.what()).WithDetail(std::make_shared<IrohStatusDetail>(
-        failure.stage(), failure.category(), failure.dispatch_certainty(), failure.what()));
+    return arrow::Status::IOError(failure.what())
+        .WithDetail(std::make_shared<IrohStatusDetail>(
+            failure.stage(), failure.category(), failure.dispatch_certainty(), failure.what()));
 }
 
 uint8_t cancel_check(void* userdata) noexcept {
@@ -75,12 +75,12 @@ uint8_t cancel_check(void* userdata) noexcept {
 }
 
 void validate_hint(const std::string& hint) {
-    if (hint.empty() || std::any_of(hint.begin(), hint.end(), [](unsigned char c) {
-            return c <= 0x1f || c == 0x7f;
-        })) {
-        throw IrohTransportError("Iroh relay and direct-address hints must be non-empty and contain no controls",
-                                 IrohErrorStage::PARSE, IrohErrorCategory::INVALID_INPUT,
-                                 IrohDispatchCertainty::NOT_SENT);
+    if (hint.empty() || std::any_of(hint.begin(), hint.end(),
+                                    [](unsigned char c) { return c <= 0x1f || c == 0x7f; })) {
+        throw IrohTransportError(
+            "Iroh relay and direct-address hints must be non-empty and contain no controls",
+            IrohErrorStage::PARSE, IrohErrorCategory::INVALID_INPUT,
+            IrohDispatchCertainty::NOT_SENT);
     }
 }
 
@@ -134,7 +134,8 @@ public:
             secret.data(),
             options.no_relay ? VGI_IROH_RELAY_DISABLED
                              : (relays.empty() ? VGI_IROH_RELAY_DEFAULT : VGI_IROH_RELAY_CUSTOM),
-            relays.empty() ? nullptr : relays.data(), relays.size(),
+            relays.empty() ? nullptr : relays.data(),
+            relays.size(),
             static_cast<uint64_t>(options.connect_timeout.count()),
             static_cast<uint64_t>(options.io_timeout.count())};
         auto candidate = std::make_shared<NativeEndpoint>();
@@ -156,8 +157,7 @@ private:
             if (RAND_bytes(value->data(), static_cast<int>(value->size())) != 1) {
                 delete value;
                 throw IrohTransportError("could not generate process Iroh identity",
-                                         IrohErrorStage::BIND,
-                                         IrohErrorCategory::INTERNAL,
+                                         IrohErrorStage::BIND, IrohErrorCategory::INTERNAL,
                                          IrohDispatchCertainty::NOT_SENT);
             }
             return value;
@@ -216,21 +216,22 @@ public:
         while (total < nbytes) {
             if (state_->cancel_callback && cancel_check(&state_->cancel_callback)) {
                 state_->cancel();
-                return arrow::Status::Cancelled("Iroh read cancelled").WithDetail(
-                    std::make_shared<IrohStatusDetail>(IrohErrorStage::CANCEL,
-                        IrohErrorCategory::CANCELLED, IrohDispatchCertainty::UNKNOWN,
-                        "Iroh read cancelled"));
+                return arrow::Status::Cancelled("Iroh read cancelled")
+                    .WithDetail(std::make_shared<IrohStatusDetail>(
+                        IrohErrorStage::CANCEL, IrohErrorCategory::CANCELLED,
+                        IrohDispatchCertainty::UNKNOWN, "Iroh read cancelled"));
             }
             size_t read = 0;
             vgi_iroh_error error{};
             const size_t chunk = static_cast<size_t>(std::min<int64_t>(nbytes - total, 64 << 20));
             uint8_t timed_out = 0;
-            const auto result = state_->cancel_callback
-                ? vgi_iroh_stream_read_timeout(state_->stream,
-                                               static_cast<uint8_t*>(out) + total, chunk, 50,
-                                               &read, &timed_out, &error)
-                : vgi_iroh_stream_read(state_->stream,
-                                       static_cast<uint8_t*>(out) + total, chunk, &read, &error);
+            const auto result =
+                state_->cancel_callback
+                    ? vgi_iroh_stream_read_timeout(state_->stream,
+                                                   static_cast<uint8_t*>(out) + total, chunk, 50,
+                                                   &read, &timed_out, &error)
+                    : vgi_iroh_stream_read(state_->stream, static_cast<uint8_t*>(out) + total,
+                                           chunk, &read, &error);
             if (result != VGI_IROH_OK) return cabi_status("read", error);
             if (timed_out) continue;
             if (read == 0) break;
@@ -273,12 +274,13 @@ public:
         if (closed_) return arrow::Status::IOError("Iroh output stream is closed");
         if (nbytes < 0) return arrow::Status::Invalid("negative Iroh write length");
         vgi_iroh_error error{};
-        const auto result = state_->cancel_callback
-            ? vgi_iroh_stream_write_cancellable(state_->stream, static_cast<const uint8_t*>(data),
-                                                static_cast<size_t>(nbytes), cancel_check,
-                                                &state_->cancel_callback, &error)
-            : vgi_iroh_stream_write(state_->stream, static_cast<const uint8_t*>(data),
-                                    static_cast<size_t>(nbytes), &error);
+        const auto result =
+            state_->cancel_callback
+                ? vgi_iroh_stream_write_cancellable(
+                      state_->stream, static_cast<const uint8_t*>(data),
+                      static_cast<size_t>(nbytes), cancel_check, &state_->cancel_callback, &error)
+                : vgi_iroh_stream_write(state_->stream, static_cast<const uint8_t*>(data),
+                                        static_cast<size_t>(nbytes), &error);
         if (result != VGI_IROH_OK) {
             return cabi_status("write", error);
         }
@@ -294,7 +296,8 @@ private:
 };
 
 ClientTransport open_native(const std::shared_ptr<EndpointPool>& pool,
-                            const IrohEndpoint& remote_endpoint, const IrohTransportOptions& options) {
+                            const IrohEndpoint& remote_endpoint,
+                            const IrohTransportOptions& options) {
     if (vgi_iroh_abi_version() != VGI_IROH_ABI_VERSION) {
         throw IrohTransportError("linked vgi-iroh C ABI version does not match this SDK",
                                  IrohErrorStage::BIND, IrohErrorCategory::UNSUPPORTED,
@@ -309,16 +312,18 @@ ClientTransport open_native(const std::shared_ptr<EndpointPool>& pool,
     state->cancel_callback = options.cancel_check;
     std::vector<const char*> direct_addresses;
     direct_addresses.reserve(options.direct_addresses.size());
-    for (const auto& address : options.direct_addresses) direct_addresses.push_back(address.c_str());
+    for (const auto& address : options.direct_addresses)
+        direct_addresses.push_back(address.c_str());
     vgi_iroh_remote remote{remote_endpoint.endpoint_id.c_str(),
                            options.remote_relay_url ? options.remote_relay_url->c_str() : nullptr,
                            direct_addresses.empty() ? nullptr : direct_addresses.data(),
                            direct_addresses.size()};
     vgi_iroh_error error{};
-    const auto result = options.cancel_check
-        ? vgi_iroh_stream_open_cancellable(endpoint->endpoint, &remote, cancel_check,
-                                           &state->cancel_callback, &state->stream, &error)
-        : vgi_iroh_stream_open(endpoint->endpoint, &remote, &state->stream, &error);
+    const auto result =
+        options.cancel_check
+            ? vgi_iroh_stream_open_cancellable(endpoint->endpoint, &remote, cancel_check,
+                                               &state->cancel_callback, &state->stream, &error)
+            : vgi_iroh_stream_open(endpoint->endpoint, &remote, &state->stream, &error);
     if (result != VGI_IROH_OK) {
         throw cabi_error("stream open", error);
     }
@@ -337,9 +342,9 @@ IrohTransportProvider native_iroh_transport_provider() {
 #else
     return [](const IrohEndpoint&, const IrohTransportOptions&) -> ClientTransport {
         throw IrohTransportError(
-            "iroh:// requires vgi-rpc-c++ built with VGI_RPC_WITH_IROH_CABI and a version-matched vgi-iroh library",
-            IrohErrorStage::BIND, IrohErrorCategory::UNSUPPORTED,
-            IrohDispatchCertainty::NOT_SENT);
+            "iroh:// requires vgi-rpc-c++ built with VGI_RPC_WITH_IROH_CABI and a version-matched "
+            "vgi-iroh library",
+            IrohErrorStage::BIND, IrohErrorCategory::UNSUPPORTED, IrohDispatchCertainty::NOT_SENT);
     };
 #endif
 }
@@ -354,8 +359,7 @@ std::string native_iroh_endpoint_id(const IrohTransportOptions& options) {
     if (options.connect_timeout <= std::chrono::milliseconds::zero() ||
         options.io_timeout <= std::chrono::milliseconds::zero()) {
         throw IrohTransportError("Iroh timeouts must be positive", IrohErrorStage::PARSE,
-                                 IrohErrorCategory::INVALID_INPUT,
-                                 IrohDispatchCertainty::NOT_SENT);
+                                 IrohErrorCategory::INVALID_INPUT, IrohDispatchCertainty::NOT_SENT);
     }
     for (const auto& relay : options.relay_urls) validate_hint(relay);
     const auto endpoint = process_endpoint_pool()->get(options);
@@ -376,8 +380,7 @@ std::string native_iroh_endpoint_id(const IrohTransportOptions& options) {
     (void)options;
     throw IrohTransportError(
         "local EndpointId requires vgi-rpc-c++ built with VGI_RPC_WITH_IROH_CABI",
-        IrohErrorStage::BIND, IrohErrorCategory::UNSUPPORTED,
-        IrohDispatchCertainty::NOT_SENT);
+        IrohErrorStage::BIND, IrohErrorCategory::UNSUPPORTED, IrohDispatchCertainty::NOT_SENT);
 #endif
 }
 
