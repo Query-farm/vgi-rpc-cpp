@@ -129,6 +129,7 @@ public:
         port_ = server_.bind_to_any_port("127.0.0.1");
         REQUIRE(port_ > 0);
         thread_ = std::thread([this] { server_.listen_after_bind(); });
+        server_.wait_until_ready();
     }
     ~TestHttpServer() {
         server_.stop();
