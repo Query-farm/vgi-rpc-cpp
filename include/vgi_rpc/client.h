@@ -14,6 +14,7 @@
 #include <arrow/util/key_value_metadata.h>
 
 #include <chrono>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -21,6 +22,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "vgi_rpc/annotated_batch.h"
@@ -55,6 +57,85 @@ struct SocketTransportOptions {
     // URI userinfo is rejected. C++ callers must supply Unicode target names as
     // pre-encoded ASCII IDNA A-labels. A proxy failure never falls back direct.
     std::optional<std::string> proxy;
+};
+
+inline constexpr const char* IROH_ARROW_MUX_ALPN = "vgi-rpc/arrow-mux/1";
+inline constexpr const char* IROH_HTTP_ALPN = "iroh-http/2";
+
+enum class IrohErrorStage : uint32_t {
+    PARSE = 1, BIND = 2, RESOLVE = 3, CONNECT = 4, ALPN = 5, OPEN_STREAM = 6,
+    WRITE = 7, READ = 8, CANCEL = 9, CLOSE = 10, INTERNAL = 11,
+};
+enum class IrohErrorCategory : uint32_t {
+    INVALID_INPUT = 1, UNSUPPORTED = 2, UNAVAILABLE = 3, TIMEOUT = 4,
+    PROTOCOL = 5, CONNECTION_RESET = 6, CANCELLED = 7, AUTHENTICATION = 8,
+    RESOURCE_EXHAUSTED = 9, INTERNAL = 10,
+};
+enum class IrohDispatchCertainty : uint32_t { NOT_SENT = 0, UNKNOWN = 1, SENT = 2 };
+
+/// Portable Iroh failure dimensions; dispatch certainty controls safe retries.
+class VGI_RPC_EXPORT IrohTransportError : public std::runtime_error {
+public:
+    IrohTransportError(std::string message, IrohErrorStage stage,
+                       IrohErrorCategory category, IrohDispatchCertainty dispatch_certainty)
+        : std::runtime_error(std::move(message)),
+          stage_(stage),
+          category_(category),
+          dispatch_certainty_(dispatch_certainty) {}
+    IrohErrorStage stage() const noexcept { return stage_; }
+    IrohErrorCategory category() const noexcept { return category_; }
+    IrohDispatchCertainty dispatch_certainty() const noexcept { return dispatch_certainty_; }
+
+private:
+    IrohErrorStage stage_;
+    IrohErrorCategory category_;
+    IrohDispatchCertainty dispatch_certainty_;
+};
+
+/// Arrow statuses from native I/O retain the same structured C-ABI fields.
+class VGI_RPC_EXPORT IrohStatusDetail : public arrow::StatusDetail {
+public:
+    IrohStatusDetail(IrohErrorStage stage, IrohErrorCategory category,
+                     IrohDispatchCertainty dispatch_certainty, std::string message = {})
+        : stage_(stage),
+          category_(category),
+          dispatch_certainty_(dispatch_certainty),
+          message_(std::move(message)) {}
+    const char* type_id() const override { return "vgi_rpc::IrohStatusDetail"; }
+    std::string ToString() const override;
+    IrohErrorStage stage() const noexcept { return stage_; }
+    IrohErrorCategory category() const noexcept { return category_; }
+    IrohDispatchCertainty dispatch_certainty() const noexcept { return dispatch_certainty_; }
+
+private:
+    IrohErrorStage stage_;
+    IrohErrorCategory category_;
+    IrohDispatchCertainty dispatch_certainty_;
+    std::string message_;
+};
+
+struct IrohEndpoint {
+    enum class Scheme { IROH, HTTPI };
+    Scheme scheme;
+    std::string endpoint_id;
+    std::array<uint8_t, 32> endpoint_id_bytes{};
+    std::string base_path;
+    std::string alpn;
+
+    static IrohEndpoint parse(const std::string& uri);
+};
+
+struct IrohTransportOptions {
+    std::optional<std::array<uint8_t, 32>> secret_key;
+    std::vector<std::string> relay_urls;
+    bool no_relay = false;
+    /// Optional route hints for the remote endpoint (not local relay selection).
+    std::optional<std::string> remote_relay_url;
+    std::vector<std::string> direct_addresses;
+    std::chrono::milliseconds connect_timeout{30000};
+    std::chrono::milliseconds io_timeout{300000};
+    /// Called by blocking native operations; true cancels only the current logical operation.
+    std::function<bool()> cancel_check;
 };
 
 /// Owning, move-only pair of raw input/output streams.
@@ -110,6 +191,22 @@ private:
     friend class RpcClient;
     friend class ClientStream;
 };
+
+/// Optional native implementation seam, normally backed by the version-matched
+/// vgi-iroh C ABI static library. No connector is downloaded or spawned.
+using IrohTransportProvider =
+    std::function<ClientTransport(const IrohEndpoint&, const IrohTransportOptions&)>;
+
+VGI_RPC_EXPORT ClientTransport connect_iroh_transport(
+    const std::string& endpoint, const IrohTransportProvider& provider,
+    const IrohTransportOptions& options = {});
+
+/// Return the linked vgi-iroh C ABI provider. Throws a clear unsupported error
+/// when the library was built without VGI_RPC_WITH_IROH_CABI.
+VGI_RPC_EXPORT IrohTransportProvider native_iroh_transport_provider();
+VGI_RPC_EXPORT bool native_iroh_transport_available() noexcept;
+/// Return the process-shared provider's stable local EndpointId, creating it if necessary.
+VGI_RPC_EXPORT std::string native_iroh_endpoint_id(const IrohTransportOptions& options = {});
 
 /// A remote exception envelope, preserving both human- and machine-readable
 /// fields from the wire.
@@ -209,6 +306,10 @@ public:
     static RpcClient connect_tcp(const std::string& host, uint16_t port,
                                  const RpcClientOptions& options = {},
                                  const SocketTransportOptions& transport_options = {});
+    static RpcClient connect_iroh(const std::string& endpoint,
+                                  const IrohTransportProvider& provider,
+                                  const RpcClientOptions& options = {},
+                                  const IrohTransportOptions& transport_options = {});
 
     AnnotatedBatch call_unary(const std::string& method,
                               const std::shared_ptr<arrow::RecordBatch>& params,

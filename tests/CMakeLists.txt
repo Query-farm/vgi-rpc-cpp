@@ -15,6 +15,10 @@ endfunction()
 vgi_rpc_add_test(crypto_test)
 vgi_rpc_add_test(identity_test)
 vgi_rpc_add_test(iroh_identity_test)
+vgi_rpc_add_test(iroh_client_test)
+target_compile_definitions(iroh_client_test PRIVATE
+    VGI_RPC_IROH_VECTORS="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/iroh_transport_vectors.json"
+)
 vgi_rpc_add_test(identity_providers_test)
 target_link_libraries(identity_providers_test PRIVATE OpenSSL::Crypto)
 target_compile_definitions(identity_providers_test PRIVATE
