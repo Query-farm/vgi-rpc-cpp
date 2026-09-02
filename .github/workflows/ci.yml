@@ -118,13 +118,15 @@ jobs:
           -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
 
       - name: Build
-        # The hosted ARM runner repeatedly terminated the build while more
-        # than fifteen Arrow-linked executables reached the linker together.
-        # Keep complete ARM target coverage, but bound its compiler/linker
-        # fan-out; x64 and macOS retain their existing native parallelism.
+        # Hosted Linux runners repeatedly terminated while more than fifteen
+        # Arrow-linked executables reached the linker together. Keep complete
+        # target coverage, but bound Linux compiler/linker fan-out according
+        # to the runner size; macOS retains its native parallelism.
         run: |
           if [ "$RUNNER_ARCH" = "ARM64" ]; then
             cmake --build --preset default --parallel 2
+          elif [ "$RUNNER_OS" = "Linux" ]; then
+            cmake --build --preset default --parallel 4
           else
             cmake --build --preset default --parallel
           fi
