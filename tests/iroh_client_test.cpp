@@ -256,7 +256,23 @@ TEST_CASE("native C ABI connects to a live Iroh Arrow-mux worker", "[iroh][integ
 TEST_CASE("native C ABI connects to a live HTTP-over-Iroh worker", "[iroh][integration]") {
     const auto* endpoint = std::getenv("VGI_RPC_IROH_HTTP_TEST_ENDPOINT");
     if (!endpoint) SKIP("set VGI_RPC_IROH_HTTP_TEST_ENDPOINT to run the live native HTTP test");
-    auto client = HttpClient::builder(std::string("httpi://") + endpoint).build();
+    IrohTransportOptions transport;
+    if (const auto* direct = std::getenv("VGI_RPC_IROH_HTTP_TEST_DIRECT_ADDRESSES")) {
+        std::string remaining(direct);
+        while (!remaining.empty()) {
+            const auto separator = remaining.find(',');
+            const auto address = remaining.substr(0, separator);
+            if (!address.empty()) transport.direct_addresses.push_back(address);
+            if (separator == std::string::npos) break;
+            remaining.erase(0, separator + 1);
+        }
+    }
+    if (!transport.direct_addresses.empty()) {
+        transport.no_relay = true;
+    }
+    auto client = HttpClient::builder(std::string("httpi://") + endpoint)
+                      .iroh_transport_options(std::move(transport))
+                      .build();
     const auto capabilities = client.capabilities();
     REQUIRE(capabilities.accept_max_response_bytes_support);
     const auto description = client.describe();

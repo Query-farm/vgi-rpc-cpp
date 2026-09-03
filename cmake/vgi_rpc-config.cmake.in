@@ -9,13 +9,8 @@ find_dependency(ZLIB)
 find_dependency(OpenSSL COMPONENTS Crypto)
 find_dependency(CURL)
 if(@VGI_RPC_WITH_IROH_CABI@ AND NOT TARGET vgi_iroh::cabi)
-    find_path(VGI_IROH_CABI_INCLUDE_DIR vgi_iroh.h REQUIRED)
-    find_library(VGI_IROH_CABI_LIBRARY NAMES vgi_iroh_cabi REQUIRED)
-    add_library(vgi_iroh::cabi UNKNOWN IMPORTED)
-    set_target_properties(vgi_iroh::cabi PROPERTIES
-        IMPORTED_LOCATION "${VGI_IROH_CABI_LIBRARY}"
-        INTERFACE_INCLUDE_DIRECTORIES "${VGI_IROH_CABI_INCLUDE_DIR}"
-    )
+    include("${CMAKE_CURRENT_LIST_DIR}/vgi_rpc-find-iroh-cabi.cmake")
+    vgi_rpc_find_iroh_cabi()
 endif()
 # libsodium is linked PRIVATE, but a *static* vgi_rpc still names it in its
 # exported interface — CMake records private link libraries as

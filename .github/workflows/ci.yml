@@ -15,6 +15,9 @@ concurrency:
   cancel-in-progress: true
 
 env:
+  # Exact Rust source that defines the C ABI consumed by this SDK. Keep this
+  # pinned so an unrelated Rust main-branch change cannot break C++ CI.
+  VGI_RPC_IROH_RUST_REV: a38130b1fb2ff63186e0ec3e16e342c5a21ba489
   VCPKG_BINARY_SOURCES: "clear;x-aws,s3://query-farm-duckdb-vcpkg/,readwrite"
   AWS_ACCESS_KEY_ID: ${{ secrets.VCPKG_CACHING_AWS_ACCESS_KEY_ID }}
   AWS_SECRET_ACCESS_KEY: ${{ secrets.VCPKG_CACHING_AWS_SECRET_ACCESS_KEY }}
@@ -55,6 +58,43 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Check out version-matched native Iroh C ABI
+        if: runner.os == 'Linux' && runner.arch == 'X64'
+        uses: actions/checkout@v4
+        with:
+          repository: Query-farm/vgi-rpc-rust
+          ref: ${{ env.VGI_RPC_IROH_RUST_REV }}
+          path: .ci/vgi-rpc-rust
+
+      - name: Install Rust toolchain for native Iroh
+        if: runner.os == 'Linux' && runner.arch == 'X64'
+        uses: dtolnay/rust-toolchain@1.97.0
+
+      - name: Cache native Iroh build
+        if: runner.os == 'Linux' && runner.arch == 'X64'
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: .ci/vgi-rpc-rust -> target
+          key: cpp-native-iroh-x86_64-unknown-linux-gnu
+
+      - name: Build and stage version-matched native Iroh
+        if: runner.os == 'Linux' && runner.arch == 'X64'
+        working-directory: .ci/vgi-rpc-rust
+        run: |
+          set -euo pipefail
+          target=x86_64-unknown-linux-gnu
+          cargo build --locked --release --target "$target" \
+            -p vgi-iroh-cabi -p vgi-iroh-bridge
+          version=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name=="vgi-iroh-cabi") | .version')
+          scripts/package-iroh-cabi.sh \
+            "$target" "$version" "$VGI_RPC_IROH_RUST_REV" target release-assets
+          mkdir -p ../iroh-prefix
+          tar -xzf "release-assets/vgi-iroh-cabi-v${version}-${target}.tar.gz" \
+            -C ../iroh-prefix
+          echo "VGI_RPC_IROH_CABI_ROOT=$GITHUB_WORKSPACE/.ci/iroh-prefix/vgi-iroh-cabi-v${version}-${target}" \
+            >> "$GITHUB_ENV"
+
       - name: Setup Python
         if: matrix.conformance
         uses: actions/setup-python@v5
@@ -89,7 +129,7 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           brew install bison
-          echo "$(brew --prefix bison)/bin" >> $GITHUB_PATH
+          echo "$(brew --prefix bison)/bin" >> "$GITHUB_PATH"
 
       # vcpkg builds libsodium through its autotools script, which needs these
       # on the box. The runners ship libtool but not autoconf/automake, and the
@@ -112,10 +152,18 @@ jobs:
           max-size: 500M
 
       - name: Configure
-        run: >
-          cmake --preset default
-          -DCMAKE_C_COMPILER_LAUNCHER=ccache
-          -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+        run: |
+          iroh_args=()
+          if [ -n "${VGI_RPC_IROH_CABI_ROOT:-}" ]; then
+            iroh_args+=(
+              -DVGI_RPC_WITH_IROH_CABI=ON
+              -DVGI_RPC_IROH_CABI_ROOT="$VGI_RPC_IROH_CABI_ROOT"
+            )
+          fi
+          cmake --preset default \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            "${iroh_args[@]}"
 
       - name: Build
         # Hosted Linux runners repeatedly terminated while more than fifteen
@@ -134,6 +182,48 @@ jobs:
       - name: Test (unit)
         run: ctest --test-dir build --output-on-failure -E conformance
 
+      - name: Test native HTTP-over-Iroh end to end (direct, no relay)
+        if: runner.os == 'Linux' && runner.arch == 'X64'
+        run: |
+          set -euo pipefail
+          worker_log="$RUNNER_TEMP/vgi-http-worker.log"
+          bridge_log="$RUNNER_TEMP/vgi-iroh-bridge.log"
+          worker_pid=
+          bridge_pid=
+          cleanup() {
+            if [ -n "$bridge_pid" ]; then kill "$bridge_pid" 2>/dev/null || true; fi
+            if [ -n "$worker_pid" ]; then kill "$worker_pid" 2>/dev/null || true; fi
+          }
+          trap cleanup EXIT
+
+          python ../vgi-rpc/tests/serve_fixture_describe_http.py >"$worker_log" 2>&1 &
+          worker_pid=$!
+          for _ in $(seq 1 30); do
+            grep -q '^PORT:' "$worker_log" && break
+            kill -0 "$worker_pid" 2>/dev/null || break
+            sleep 1
+          done
+          port=$(sed -n 's/^PORT://p' "$worker_log" | head -n 1)
+          if [ -z "$port" ]; then cat "$worker_log"; exit 1; fi
+
+          .ci/vgi-rpc-rust/target/x86_64-unknown-linux-gnu/release/vgi-iroh-bridge \
+            --ephemeral --no-relay --print-direct-addresses \
+            --http-upstream "http://127.0.0.1:$port" >"$bridge_log" 2>&1 &
+          bridge_pid=$!
+          for _ in $(seq 1 30); do
+            grep -q '^DIRECT:' "$bridge_log" && break
+            kill -0 "$bridge_pid" 2>/dev/null || break
+            sleep 1
+          done
+          endpoint=$(grep -m1 -E '^[0-9a-f]{64}$' "$bridge_log" || true)
+          direct_addresses=$(sed -n 's/^DIRECT://p' "$bridge_log" | paste -sd, -)
+          if [ -z "$endpoint" ] || [ -z "$direct_addresses" ]; then cat "$bridge_log"; exit 1; fi
+
+          VGI_RPC_IROH_HTTP_TEST_ENDPOINT="$endpoint" \
+          VGI_RPC_IROH_HTTP_TEST_DIRECT_ADDRESSES="$direct_addresses" \
+            ctest --test-dir build --output-on-failure \
+              -R 'native C ABI connects to a live HTTP-over-Iroh worker$'
+
       # Both HTTP wire codecs are mandatory for this port. Keep this focused
       # failure ahead of the full matrix so a missing zlib feature or a codec
       # negotiation regression names itself directly.
@@ -149,8 +239,13 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           cmake --install build --prefix ${{ runner.temp }}/install
+          iroh_args=()
+          if [ -n "${VGI_RPC_IROH_CABI_ROOT:-}" ]; then
+            iroh_args+=("-DVGI_RPC_IROH_CABI_ROOT=$VGI_RPC_IROH_CABI_ROOT")
+          fi
           cmake -S tests/install_test -B ${{ runner.temp }}/install_test_build \
-            -DCMAKE_PREFIX_PATH="${{ runner.temp }}/install;$(pwd)/build/vcpkg_installed/${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}-linux"
+            -DCMAKE_PREFIX_PATH="${{ runner.temp }}/install;$(pwd)/build/vcpkg_installed/${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}-linux" \
+            "${iroh_args[@]}"
           cmake --build ${{ runner.temp }}/install_test_build
 
       - name: Test (conformance — pipe, unix, tcp, HTTP, access-log, pytest suite)

@@ -1,7 +1,14 @@
 # Native Iroh client
 
 Build with `VGI_RPC_WITH_IROH_CABI=ON` and provide the version-matched `vgi_iroh.h` and
-`vgi_iroh_cabi` library. `RpcClient::connect_iroh` with
+`vgi_iroh_cabi` library. Beginning with the first release after v0.23.3,
+[vgi-rpc-rust releases](https://github.com/Query-farm/vgi-rpc-rust/releases) provide static-library
+archives for supported native targets. Extract one and pass its prefix as
+`-DVGI_RPC_IROH_CABI_ROOT=/path/to/vgi-iroh-cabi-vX.Y.Z-target`. CMake also honors explicit
+`VGI_IROH_CABI_INCLUDE_DIR` and `VGI_IROH_CABI_LIBRARY` values for unpackaged POSIX source builds.
+When `VGI_RPC_IROH_CABI_ROOT` is set, discovery is constrained to that prefix and fails closed if its
+header, library, CMake target, or native link dependencies are incomplete.
+`RpcClient::connect_iroh` with
 `native_iroh_transport_provider()` then speaks raw `vgi-rpc/arrow-mux/1` in-process. The same C ABI
 also backs `HttpClient` for `httpi://` URLs using `iroh-http/2`. No executable is downloaded or
 spawned.

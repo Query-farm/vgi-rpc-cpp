@@ -41,6 +41,12 @@ find_package(unofficial-sodium CONFIG REQUIRED)
 option(VGI_RPC_WITH_S3 "Build the S3 external-storage backend (aws-sdk-cpp)" OFF)
 option(VGI_RPC_WITH_GCS "Build the GCS external-storage backend (google-cloud-cpp)" OFF)
 option(VGI_RPC_WITH_IROH_CABI "Link the native vgi-iroh transport C ABI" OFF)
+set(VGI_RPC_IROH_CABI_ROOT "" CACHE PATH
+    "Prefix containing a released vgi-iroh-cabi CMake package")
+set(VGI_IROH_CABI_INCLUDE_DIR "" CACHE PATH
+    "Directory containing vgi_iroh.h when using an unpackaged POSIX C ABI build")
+set(VGI_IROH_CABI_LIBRARY "" CACHE FILEPATH
+    "Native Iroh C ABI library when using an unpackaged POSIX build")
 
 if(VGI_RPC_WITH_S3)
     find_package(AWSSDK CONFIG REQUIRED COMPONENTS s3)
@@ -147,15 +153,8 @@ target_compile_definitions(vgi_rpc PRIVATE CPPHTTPLIB_ZLIB_SUPPORT)
 target_link_libraries(vgi_rpc PRIVATE ZLIB::ZLIB)
 
 if(VGI_RPC_WITH_IROH_CABI)
-    if(NOT TARGET vgi_iroh::cabi)
-        find_path(VGI_IROH_INCLUDE_DIR vgi_iroh.h REQUIRED)
-        find_library(VGI_IROH_LIBRARY NAMES vgi_iroh_cabi REQUIRED)
-        add_library(vgi_iroh::cabi UNKNOWN IMPORTED GLOBAL)
-        set_target_properties(vgi_iroh::cabi PROPERTIES
-            IMPORTED_LOCATION "${VGI_IROH_LIBRARY}"
-            INTERFACE_INCLUDE_DIRECTORIES "${VGI_IROH_INCLUDE_DIR}"
-        )
-    endif()
+    include(cmake/vgi_rpc-find-iroh-cabi.cmake)
+    vgi_rpc_find_iroh_cabi()
     target_compile_definitions(vgi_rpc PRIVATE VGI_RPC_WITH_IROH_CABI)
     # Export the stable target name, never the build host's absolute archive
     # path. Installed consumers may define vgi_iroh::cabi before find_package;
@@ -234,6 +233,7 @@ write_basic_package_version_file(
 install(FILES
     "${CMAKE_CURRENT_BINARY_DIR}/vgi_rpc-config.cmake"
     "${CMAKE_CURRENT_BINARY_DIR}/vgi_rpc-config-version.cmake"
+    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/vgi_rpc-find-iroh-cabi.cmake"
     DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/vgi_rpc
 )
 
