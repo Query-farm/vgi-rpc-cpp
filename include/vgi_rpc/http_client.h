@@ -18,6 +18,7 @@
 #include <arrow/type_fwd.h>
 
 #include "vgi_rpc/annotated_batch.h"
+#include "vgi_rpc/client.h"
 #include "vgi_rpc/client_description.h"
 #include "vgi_rpc/client_external.h"
 #include "vgi_rpc/export.h"
@@ -148,6 +149,35 @@ struct HttpClientConfig {
     int64_t accepted_max_response_bytes = 256LL * 1024 * 1024;
 };
 
+/// One HTTP/1.1 exchange carried over an authenticated `iroh-http/2` stream.
+/// The provider is a transport seam only; HttpClient retains all VGI HTTP
+/// capability, compression, retry, authentication, continuation, and sizing
+/// semantics.
+struct IrohHttpRequest {
+    std::string method;
+    std::string path;
+    std::vector<std::pair<std::string, std::string>> headers;
+    std::string body;
+    size_t max_response_bytes = 0;
+    size_t max_response_header_bytes = 64 * 1024;
+    std::function<bool()> cancel_check;
+};
+
+struct IrohHttpResponse {
+    uint16_t status = 0;
+    std::vector<std::pair<std::string, std::string>> headers;
+    std::string body;
+    std::string remote_endpoint_id;
+};
+
+using IrohHttpTransportProvider = std::function<IrohHttpResponse(
+    const IrohEndpoint&, const IrohHttpRequest&, const IrohTransportOptions&)>;
+
+/// Return the linked in-process Rust C ABI provider. It throws a structured
+/// unsupported error when VGI_RPC_WITH_IROH_CABI was not enabled.
+VGI_RPC_EXPORT IrohHttpTransportProvider native_iroh_http_transport_provider();
+VGI_RPC_EXPORT bool native_iroh_http_transport_available() noexcept;
+
 class VGI_RPC_EXPORT HttpClientError : public std::runtime_error {
 public:
     HttpClientError(std::string message, int http_status = 0);
@@ -240,6 +270,10 @@ public:
     HttpClientBuilder& client_certificate(std::string certificate_file,
                                           std::string private_key_file);
     HttpClientBuilder& tcp_proxy(std::string proxy_uri);
+    /// Configure the process-shared native endpoint used by an httpi:// base URL.
+    HttpClientBuilder& iroh_transport_options(IrohTransportOptions options);
+    /// Override the HTTP-over-Iroh transport seam, primarily for embedding and tests.
+    HttpClientBuilder& iroh_transport_provider(IrohHttpTransportProvider provider);
     HttpClientBuilder& dangerous_disable_tls_verification_for_testing(bool disabled = true);
     // External-location resolution is securely enabled by default. Override
     // limits/policy here; LOOPBACK_HTTP_TEST is only for local conformance.

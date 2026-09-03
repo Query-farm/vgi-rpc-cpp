@@ -25,6 +25,13 @@ so a configured builder can be copied and specialized without sharing mutable
 configuration. The former `HttpClient(base_url, config)` constructor remains
 as a deprecated source-compatible adapter.
 
+The same typed client accepts `httpi://<EndpointId>[/base/path]` when the
+library is built with `VGI_RPC_WITH_IROH_CABI=ON`. The URI path becomes the
+RPC prefix, and `iroh_transport_options()` supplies relay, direct-address,
+identity-key, and timeout settings. See [Native Iroh client](../native-iroh-client.md).
+HTTP-over-Iroh changes only the carrier; all behavior documented below remains
+the same.
+
 `describe()` invokes `__describe__` and returns a validated
 `ServiceDescription`. Malformed schemas, duplicate method names, and
 unsupported describe/request versions fail closed rather than producing a

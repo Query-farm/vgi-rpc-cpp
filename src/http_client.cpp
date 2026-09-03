@@ -829,16 +829,21 @@ struct ParsedBaseUrl {
     std::string value;
     bool secure = false;
     bool has_userinfo = false;
+    std::optional<IrohEndpoint> iroh_endpoint;
 };
 
 ParsedBaseUrl parse_base_url(std::string base_url) {
+    if (base_url.rfind("httpi://", 0) == 0) {
+        auto endpoint = IrohEndpoint::parse(base_url);
+        return {std::move(base_url), true, false, std::move(endpoint)};
+    }
     const size_t scheme = base_url.find("://");
     if (scheme == std::string::npos) {
-        throw std::invalid_argument("HttpClient base_url must use http:// or https://");
+        throw std::invalid_argument("HttpClient base_url must use http://, https://, or httpi://");
     }
     const std::string scheme_name = base_url.substr(0, scheme);
     if (scheme_name != "http" && scheme_name != "https") {
-        throw std::invalid_argument("HttpClient base_url must use http:// or https://");
+        throw std::invalid_argument("HttpClient base_url must use http://, https://, or httpi://");
     }
     const size_t authority_begin = scheme + 3;
     const size_t delimiter = base_url.find_first_of("/?#", authority_begin);
@@ -853,7 +858,8 @@ ParsedBaseUrl parse_base_url(std::string base_url) {
             throw std::invalid_argument("HttpClient base_url must not contain a path; use prefix");
         }
     }
-    return {std::move(base_url), scheme_name == "https", authority.find('@') != std::string::npos};
+    return {std::move(base_url), scheme_name == "https", authority.find('@') != std::string::npos,
+            std::nullopt};
 }
 
 std::string logical_request_id(const CallOptions& options) {
@@ -961,12 +967,17 @@ class HttpClientState {
 public:
     HttpClientState(ParsedBaseUrl base_url, HttpClientConfig client_config, RetryPolicy retry,
                     TlsOptions tls, HttpAuthCallback auth,
-                    std::optional<ClientExternalHttpOptions> external_options)
+                    std::optional<ClientExternalHttpOptions> external_options,
+                    IrohHttpTransportProvider httpi_provider = {},
+                    IrohTransportOptions httpi_options = {})
         : config(std::move(client_config)),
           retry_policy(std::move(retry)),
           tls_options(std::move(tls)),
           auth_callback(std::move(auth)),
-          secure_transport(base_url.secure) {
+          secure_transport(base_url.secure),
+          iroh_endpoint(std::move(base_url.iroh_endpoint)),
+          iroh_provider(std::move(httpi_provider)),
+          iroh_options(std::move(httpi_options)) {
         if (external_options) {
             external_max_upload_bytes = external_options->max_upload_bytes;
             external_http = std::make_unique<ClientExternalHttp>(*external_options);
@@ -1019,34 +1030,56 @@ public:
             throw std::invalid_argument(
                 "mTLS requires both client certificate and private key files");
         }
+        if (iroh_endpoint && (!tls_options.ca_file.empty() || has_cert ||
+                              tls_options.insecure_skip_verification_for_testing)) {
+            throw std::invalid_argument("TLS options do not apply to an httpi:// base URL");
+        }
         if (!secure_transport && (!tls_options.ca_file.empty() || has_cert ||
                                   tls_options.insecure_skip_verification_for_testing)) {
             throw std::invalid_argument("TLS options require an https:// base URL");
+        }
+        if (iroh_endpoint && config.tcp_proxy) {
+            throw std::invalid_argument("tcp_proxy does not apply to an httpi:// base URL");
+        }
+        if (iroh_endpoint && iroh_options.no_relay && !iroh_options.relay_urls.empty()) {
+            throw IrohTransportError("no_relay and relay_urls are mutually exclusive",
+                                     IrohErrorStage::PARSE, IrohErrorCategory::INVALID_INPUT,
+                                     IrohDispatchCertainty::NOT_SENT);
+        }
+        if (iroh_endpoint && (iroh_options.connect_timeout <= std::chrono::milliseconds::zero() ||
+                              iroh_options.io_timeout <= std::chrono::milliseconds::zero())) {
+            throw IrohTransportError("Iroh timeouts must be positive", IrohErrorStage::PARSE,
+                                     IrohErrorCategory::INVALID_INPUT,
+                                     IrohDispatchCertainty::NOT_SENT);
         }
         if (config.tcp_proxy) {
             socks_client = std::make_unique<SocksHttpClient>(
                 base_url.value, *config.tcp_proxy, config.connection_timeout_seconds,
                 config.read_timeout_seconds, config.write_timeout_seconds, tls_options);
         }
-        client =
-            std::make_unique<httplib::Client>(base_url.value, tls_options.client_certificate_file,
-                                              tls_options.client_private_key_file);
-        if (!client->is_valid()) {
-            throw HttpClientError(HttpClientErrorKind::TLS, "failed to initialize HTTP/TLS client",
-                                  0, {}, {});
-        }
-        client->set_keep_alive(config.keep_alive);
-        client->set_follow_location(false);
-        client->set_decompress(false);
-        client->set_connection_timeout(config.connection_timeout_seconds);
-        client->set_read_timeout(config.read_timeout_seconds);
-        client->set_write_timeout(config.write_timeout_seconds);
-        if (secure_transport) {
-            client->enable_server_certificate_verification(
-                !tls_options.insecure_skip_verification_for_testing);
-            client->enable_server_hostname_verification(
-                !tls_options.insecure_skip_verification_for_testing);
-            if (!tls_options.ca_file.empty()) client->set_ca_cert_path(tls_options.ca_file);
+        if (iroh_endpoint) {
+            if (!iroh_provider) iroh_provider = native_iroh_http_transport_provider();
+        } else {
+            client = std::make_unique<httplib::Client>(base_url.value,
+                                                       tls_options.client_certificate_file,
+                                                       tls_options.client_private_key_file);
+            if (!client->is_valid()) {
+                throw HttpClientError(HttpClientErrorKind::TLS,
+                                      "failed to initialize HTTP/TLS client", 0, {}, {});
+            }
+            client->set_keep_alive(config.keep_alive);
+            client->set_follow_location(false);
+            client->set_decompress(false);
+            client->set_connection_timeout(config.connection_timeout_seconds);
+            client->set_read_timeout(config.read_timeout_seconds);
+            client->set_write_timeout(config.write_timeout_seconds);
+            if (secure_transport) {
+                client->enable_server_certificate_verification(
+                    !tls_options.insecure_skip_verification_for_testing);
+                client->enable_server_hostname_verification(
+                    !tls_options.insecure_skip_verification_for_testing);
+                if (!tls_options.ca_file.empty()) client->set_ca_cert_path(tls_options.ca_file);
+            }
         }
         send_compressed = config.compression_level.has_value();
         if (!config.prefix.empty() && config.prefix.front() != '/') {
@@ -1072,6 +1105,106 @@ public:
                 case SocksHttpFailureKind::CANCELLED: kind = HttpClientErrorKind::CANCELLED; break;
                 case SocksHttpFailureKind::LIMIT: kind = HttpClientErrorKind::LIMIT; break;
                 case SocksHttpFailureKind::TRANSPORT: break;
+            }
+            throw HttpClientError(kind, error.what(), 0, rpc_method, request_id);
+        }
+    }
+
+    httplib::Response send_iroh_request(const std::string& http_method,
+                                        const std::string& request_path,
+                                        const httplib::Headers& headers, const std::string& body,
+                                        const CallOptions& options, const std::string& rpc_method,
+                                        const std::string& request_id) const {
+        IrohHttpRequest request;
+        request.method = http_method;
+        request.path = request_path;
+        request.body = body;
+        request.max_response_bytes = static_cast<size_t>(
+            std::min<uint64_t>(static_cast<uint64_t>(max_encoded_response_bytes),
+                               static_cast<uint64_t>(std::numeric_limits<size_t>::max())));
+        request.headers.reserve(headers.size());
+        for (const auto& [name, value] : headers) request.headers.emplace_back(name, value);
+        const auto transport_cancel = iroh_options.cancel_check;
+        if (transport_cancel || options.stop_token.stop_possible() || options.deadline) {
+            request.cancel_check = [transport_cancel, stop = options.stop_token,
+                                    deadline = options.deadline] {
+                if (stop.stop_requested()) return true;
+                if (deadline && std::chrono::steady_clock::now() >= *deadline) return true;
+                if (!transport_cancel) return false;
+                try {
+                    return transport_cancel();
+                } catch (...) {
+                    return true;
+                }
+            };
+        }
+        try {
+            auto native = iroh_provider(*iroh_endpoint, request, iroh_options);
+            check_call_active(options, rpc_method, request_id);
+            if (native.remote_endpoint_id != iroh_endpoint->endpoint_id) {
+                throw HttpClientError(
+                    HttpClientErrorKind::AUTHENTICATION,
+                    "HTTP-over-Iroh authenticated peer identity did not match the requested "
+                    "EndpointId",
+                    0, rpc_method, request_id);
+            }
+            if (native.status < 100 || native.status > 599) {
+                throw HttpClientError(HttpClientErrorKind::PROTOCOL,
+                                      "HTTP-over-Iroh returned an invalid status code", 0,
+                                      rpc_method, request_id);
+            }
+            if (native.body.size() > static_cast<size_t>(max_encoded_response_bytes)) {
+                throw HttpClientError(
+                    HttpClientErrorKind::LIMIT,
+                    "HTTP-over-Iroh response exceeds max_encoded_response_bytes (" +
+                        std::to_string(max_encoded_response_bytes) + ")",
+                    0, rpc_method, request_id);
+            }
+            size_t header_bytes = 0;
+            httplib::Response response;
+            response.status = native.status;
+            response.body = std::move(native.body);
+            for (auto& [name, value] : native.headers) {
+                if (name.empty() || name.find_first_of("\r\n") != std::string::npos ||
+                    name.find('\0') != std::string::npos ||
+                    value.find_first_of("\r\n") != std::string::npos ||
+                    value.find('\0') != std::string::npos) {
+                    throw HttpClientError(HttpClientErrorKind::PROTOCOL,
+                                          "HTTP-over-Iroh returned invalid headers",
+                                          response.status, rpc_method, request_id);
+                }
+                if (name.size() > request.max_response_header_bytes - header_bytes ||
+                    value.size() > request.max_response_header_bytes - header_bytes - name.size()) {
+                    throw HttpClientError(HttpClientErrorKind::LIMIT,
+                                          "HTTP-over-Iroh response headers exceed 65536 bytes",
+                                          response.status, rpc_method, request_id);
+                }
+                header_bytes += name.size() + value.size();
+                response.headers.emplace(std::move(name), std::move(value));
+            }
+            return response;
+        } catch (const HttpClientError&) {
+            throw;
+        } catch (const IrohTransportError& error) {
+            HttpClientErrorKind kind = HttpClientErrorKind::TRANSPORT;
+            if (deadline_expired(options)) {
+                kind = HttpClientErrorKind::TIMEOUT;
+            } else if (options.stop_token.stop_requested()) {
+                kind = HttpClientErrorKind::CANCELLED;
+            } else {
+                switch (error.category()) {
+                    case IrohErrorCategory::TIMEOUT: kind = HttpClientErrorKind::TIMEOUT; break;
+                    case IrohErrorCategory::CANCELLED: kind = HttpClientErrorKind::CANCELLED; break;
+                    case IrohErrorCategory::AUTHENTICATION:
+                        kind = HttpClientErrorKind::AUTHENTICATION;
+                        break;
+                    case IrohErrorCategory::RESOURCE_EXHAUSTED:
+                        kind = HttpClientErrorKind::LIMIT;
+                        break;
+                    case IrohErrorCategory::INVALID_INPUT:
+                    case IrohErrorCategory::PROTOCOL: kind = HttpClientErrorKind::PROTOCOL; break;
+                    default: break;
+                }
             }
             throw HttpClientError(kind, error.what(), 0, rpc_method, request_id);
         }
@@ -1190,7 +1323,12 @@ public:
             }
             check_call_active(options, method, request_id);
             httplib::Response wire_response;
-            if (socks_client) {
+            if (iroh_endpoint) {
+                headers.emplace("Content-Type", kArrowContentType);
+                wire_response = send_iroh_request("POST", request_path, headers, *payload, options,
+                                                  method, request_id);
+                response.body = std::move(wire_response.body);
+            } else if (socks_client) {
                 headers.emplace("Content-Type", kArrowContentType);
                 wire_response = send_socks_request("POST", request_path, headers, *payload, options,
                                                    method, request_id);
@@ -1529,6 +1667,12 @@ public:
             headers.emplace("VGI-Session", token);
             headers.emplace("X-Request-ID", request_id);
 
+            if (iroh_endpoint) {
+                auto options = CallOptions::with_timeout(std::chrono::milliseconds(250));
+                (void)send_iroh_request("DELETE", request_path, headers, {}, options, "__session__",
+                                        request_id);
+                return;
+            }
             if (socks_client) {
                 auto options = CallOptions::with_timeout(std::chrono::milliseconds(250));
                 (void)send_socks_request("DELETE", request_path, headers, {}, options,
@@ -1625,7 +1769,18 @@ public:
             }
             check_call_active(options, "OPTIONS", request_id);
             httplib::Response response;
-            if (socks_client) {
+            if (iroh_endpoint) {
+                try {
+                    response = send_iroh_request("OPTIONS", health_path, headers, {}, options,
+                                                 "OPTIONS", request_id);
+                } catch (const HttpClientError& error) {
+                    if (attempt + 1 < attempts && is_retryable_transport_error(error.kind()) &&
+                        !options.stop_token.stop_requested() && !deadline_expired(options)) {
+                        continue;
+                    }
+                    throw;
+                }
+            } else if (socks_client) {
                 try {
                     response = send_socks_request("OPTIONS", health_path, headers, {}, options,
                                                   "OPTIONS", request_id);
@@ -1931,6 +2086,9 @@ private:
     bool send_compressed = false;
     bool capabilities_fetched = false;
     HttpServerCapabilities server_capabilities;
+    std::optional<IrohEndpoint> iroh_endpoint;
+    IrohHttpTransportProvider iroh_provider;
+    IrohTransportOptions iroh_options;
 };
 
 RpcRemoteError::RpcRemoteError(std::string exception_type, std::string message,
@@ -1951,7 +2109,11 @@ HttpSessionLostError::HttpSessionLostError(std::string message, std::string erro
 
 class HttpClientBuilder::Impl {
 public:
-    explicit Impl(std::string base_url) : base_url(parse_base_url(std::move(base_url))) {}
+    explicit Impl(std::string raw_base_url) : base_url(parse_base_url(std::move(raw_base_url))) {
+        // For httpi:// the URI's canonical base path is the RPC prefix. A
+        // later config()/prefix() call remains an explicit override.
+        if (base_url.iroh_endpoint) config.prefix = base_url.iroh_endpoint->base_path;
+    }
 
     ParsedBaseUrl base_url;
     HttpClientConfig config;
@@ -1959,6 +2121,8 @@ public:
     TlsOptions tls_options;
     HttpAuthCallback auth_callback;
     std::optional<ClientExternalHttpOptions> external_options{ClientExternalHttpOptions{}};
+    IrohHttpTransportProvider iroh_provider;
+    IrohTransportOptions iroh_options;
 };
 
 HttpClientBuilder::HttpClientBuilder(std::string base_url)
@@ -2063,6 +2227,25 @@ HttpClientBuilder& HttpClientBuilder::tcp_proxy(std::string proxy_uri) {
     return *this;
 }
 
+HttpClientBuilder& HttpClientBuilder::iroh_transport_options(IrohTransportOptions options) {
+    if (!impl_) throw std::logic_error("HttpClientBuilder is moved from");
+    if (!impl_->base_url.iroh_endpoint) {
+        throw std::invalid_argument("Iroh transport options require an httpi:// base URL");
+    }
+    impl_->iroh_options = std::move(options);
+    return *this;
+}
+
+HttpClientBuilder& HttpClientBuilder::iroh_transport_provider(IrohHttpTransportProvider provider) {
+    if (!impl_) throw std::logic_error("HttpClientBuilder is moved from");
+    if (!impl_->base_url.iroh_endpoint) {
+        throw std::invalid_argument("Iroh transport provider requires an httpi:// base URL");
+    }
+    if (!provider) throw std::invalid_argument("Iroh HTTP transport provider must be callable");
+    impl_->iroh_provider = std::move(provider);
+    return *this;
+}
+
 HttpClientBuilder& HttpClientBuilder::dangerous_disable_tls_verification_for_testing(
     bool disabled) {
     if (!impl_) throw std::logic_error("HttpClientBuilder is moved from");
@@ -2088,7 +2271,7 @@ HttpClient HttpClientBuilder::build() const {
     if (!impl_) throw std::logic_error("HttpClientBuilder is moved from");
     return HttpClient(std::make_shared<HttpClientState>(
         impl_->base_url, impl_->config, impl_->retry_policy, impl_->tls_options,
-        impl_->auth_callback, impl_->external_options));
+        impl_->auth_callback, impl_->external_options, impl_->iroh_provider, impl_->iroh_options));
 }
 
 HttpClientBuilder HttpClient::builder(std::string base_url) {
@@ -2096,9 +2279,10 @@ HttpClientBuilder HttpClient::builder(std::string base_url) {
 }
 
 HttpClient::HttpClient(std::string base_url, HttpClientConfig config)
-    : state_(std::make_shared<HttpClientState>(parse_base_url(std::move(base_url)),
-                                               std::move(config), RetryPolicy{}, TlsOptions{},
-                                               HttpAuthCallback{}, ClientExternalHttpOptions{})) {}
+    : state_(std::make_shared<HttpClientState>(
+          parse_base_url(std::move(base_url)), std::move(config), RetryPolicy{}, TlsOptions{},
+          HttpAuthCallback{}, ClientExternalHttpOptions{}, IrohHttpTransportProvider{},
+          IrohTransportOptions{})) {}
 
 HttpClient::HttpClient(std::shared_ptr<HttpClientState> state,
                        std::shared_ptr<HttpStickySessionState> sticky_session)

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "vgi_rpc/client.h"
+#include "vgi_rpc/http_client.h"
 
 #include <arrow/buffer.h>
 #include <arrow/io/interfaces.h>
@@ -331,6 +332,170 @@ ClientTransport open_native(const std::shared_ptr<EndpointPool>& pool,
                                          std::make_shared<IrohOutputStream>(state));
 }
 
+std::string http_remote_id(const vgi_iroh_http_response* response) {
+    size_t required = 0;
+    vgi_iroh_error error{};
+    if (vgi_iroh_http_response_remote_id(response, nullptr, 0, &required, &error) != VGI_IROH_OK) {
+        throw cabi_error("HTTP remote identity", error);
+    }
+    std::string id(required, '\0');
+    if (vgi_iroh_http_response_remote_id(response, id.data(), id.size(), &required, &error) !=
+        VGI_IROH_OK) {
+        throw cabi_error("HTTP remote identity", error);
+    }
+    if (required != 65 || id.size() != 65 || id.back() != '\0') {
+        throw IrohTransportError("Iroh HTTP response returned a non-canonical EndpointId",
+                                 IrohErrorStage::READ, IrohErrorCategory::PROTOCOL,
+                                 IrohDispatchCertainty::SENT);
+    }
+    id.pop_back();
+    return id;
+}
+
+IrohHttpResponse open_native_http(const std::shared_ptr<EndpointPool>& pool,
+                                  const IrohEndpoint& remote_endpoint,
+                                  const IrohHttpRequest& request,
+                                  const IrohTransportOptions& options) {
+    if (vgi_iroh_abi_version() != VGI_IROH_ABI_VERSION) {
+        throw IrohTransportError("linked vgi-iroh C ABI version does not match this SDK",
+                                 IrohErrorStage::BIND, IrohErrorCategory::UNSUPPORTED,
+                                 IrohDispatchCertainty::NOT_SENT);
+    }
+    if (remote_endpoint.scheme != IrohEndpoint::Scheme::HTTPI || request.max_response_bytes == 0 ||
+        request.max_response_header_bytes == 0) {
+        throw IrohTransportError("invalid bounded HTTP-over-Iroh request", IrohErrorStage::PARSE,
+                                 IrohErrorCategory::INVALID_INPUT, IrohDispatchCertainty::NOT_SENT);
+    }
+    if (options.no_relay && !options.relay_urls.empty()) {
+        throw IrohTransportError("no_relay and relay_urls are mutually exclusive",
+                                 IrohErrorStage::PARSE, IrohErrorCategory::INVALID_INPUT,
+                                 IrohDispatchCertainty::NOT_SENT);
+    }
+    if (options.connect_timeout <= std::chrono::milliseconds::zero() ||
+        options.io_timeout <= std::chrono::milliseconds::zero()) {
+        throw IrohTransportError("Iroh timeouts must be positive", IrohErrorStage::PARSE,
+                                 IrohErrorCategory::INVALID_INPUT, IrohDispatchCertainty::NOT_SENT);
+    }
+    for (const auto& relay : options.relay_urls) validate_hint(relay);
+    if (options.remote_relay_url) validate_hint(*options.remote_relay_url);
+    for (const auto& address : options.direct_addresses) validate_hint(address);
+    auto endpoint = pool->get(options);
+
+    std::vector<const char*> direct_addresses;
+    direct_addresses.reserve(options.direct_addresses.size());
+    for (const auto& address : options.direct_addresses)
+        direct_addresses.push_back(address.c_str());
+    vgi_iroh_remote remote{remote_endpoint.endpoint_id.c_str(),
+                           options.remote_relay_url ? options.remote_relay_url->c_str() : nullptr,
+                           direct_addresses.empty() ? nullptr : direct_addresses.data(),
+                           direct_addresses.size()};
+    std::vector<vgi_iroh_header> headers;
+    headers.reserve(request.headers.size());
+    for (const auto& [name, value] : request.headers) {
+        headers.push_back({reinterpret_cast<const uint8_t*>(name.data()), name.size(),
+                           reinterpret_cast<const uint8_t*>(value.data()), value.size()});
+    }
+    vgi_iroh_http_request native_request{request.method.c_str(),
+                                         request.path.c_str(),
+                                         headers.empty() ? nullptr : headers.data(),
+                                         headers.size(),
+                                         reinterpret_cast<const uint8_t*>(request.body.data()),
+                                         request.body.size()};
+    vgi_iroh_http_response* raw = nullptr;
+    vgi_iroh_error error{};
+    auto cancellation = request.cancel_check;
+    const auto result = cancellation ? vgi_iroh_http_request_start_cancellable(
+                                           endpoint->endpoint, &remote, &native_request,
+                                           cancel_check, &cancellation, &raw, &error)
+                                     : vgi_iroh_http_request_start(endpoint->endpoint, &remote,
+                                                                   &native_request, &raw, &error);
+    if (result != VGI_IROH_OK) throw cabi_error("HTTP request", error);
+    std::unique_ptr<vgi_iroh_http_response, decltype(&vgi_iroh_http_response_free)> response(
+        raw, &vgi_iroh_http_response_free);
+
+    IrohHttpResponse output;
+    output.remote_endpoint_id = http_remote_id(raw);
+    if (output.remote_endpoint_id != remote_endpoint.endpoint_id) {
+        vgi_iroh_http_response_cancel(raw);
+        throw IrohTransportError(
+            "Iroh HTTP authenticated peer identity did not match the requested EndpointId",
+            IrohErrorStage::READ, IrohErrorCategory::AUTHENTICATION, IrohDispatchCertainty::SENT);
+    }
+    output.status = vgi_iroh_http_response_status(raw);
+    const size_t header_count = vgi_iroh_http_response_header_count(raw);
+    if (header_count > 1024 || header_count > request.max_response_header_bytes) {
+        vgi_iroh_http_response_cancel(raw);
+        throw IrohTransportError("Iroh HTTP response contains too many headers",
+                                 IrohErrorStage::READ, IrohErrorCategory::RESOURCE_EXHAUSTED,
+                                 IrohDispatchCertainty::SENT);
+    }
+    output.headers.reserve(header_count);
+    size_t header_bytes = 0;
+    for (size_t index = 0; index < header_count; ++index) {
+        size_t name_size = 0;
+        size_t value_size = 0;
+        if (vgi_iroh_http_response_header(raw, index, nullptr, 0, &name_size, nullptr, 0,
+                                          &value_size, &error) != VGI_IROH_OK) {
+            throw cabi_error("HTTP response header", error);
+        }
+        if (name_size > request.max_response_header_bytes - header_bytes ||
+            value_size > request.max_response_header_bytes - header_bytes - name_size) {
+            vgi_iroh_http_response_cancel(raw);
+            throw IrohTransportError("Iroh HTTP response headers exceed the configured limit",
+                                     IrohErrorStage::READ, IrohErrorCategory::RESOURCE_EXHAUSTED,
+                                     IrohDispatchCertainty::SENT);
+        }
+        std::string name(name_size, '\0');
+        std::string value(value_size, '\0');
+        if (vgi_iroh_http_response_header(raw, index, reinterpret_cast<uint8_t*>(name.data()),
+                                          name.size(), &name_size,
+                                          reinterpret_cast<uint8_t*>(value.data()), value.size(),
+                                          &value_size, &error) != VGI_IROH_OK) {
+            throw cabi_error("HTTP response header", error);
+        }
+        header_bytes += name.size() + value.size();
+        output.headers.emplace_back(std::move(name), std::move(value));
+    }
+
+    std::array<uint8_t, 64 * 1024> chunk{};
+    auto last_progress = std::chrono::steady_clock::now();
+    while (true) {
+        if (cancellation && cancel_check(&cancellation)) {
+            vgi_iroh_http_response_cancel(raw);
+            throw IrohTransportError("Iroh HTTP response read cancelled", IrohErrorStage::CANCEL,
+                                     IrohErrorCategory::CANCELLED, IrohDispatchCertainty::SENT);
+        }
+        size_t count = 0;
+        uint8_t timed_out = 0;
+        const auto read_result =
+            cancellation
+                ? vgi_iroh_http_response_read_timeout(raw, chunk.data(), chunk.size(), 50, &count,
+                                                      &timed_out, &error)
+                : vgi_iroh_http_response_read(raw, chunk.data(), chunk.size(), &count, &error);
+        if (read_result != VGI_IROH_OK) throw cabi_error("HTTP response read", error);
+        if (timed_out) {
+            if (std::chrono::steady_clock::now() - last_progress >= options.io_timeout) {
+                vgi_iroh_http_response_cancel(raw);
+                throw IrohTransportError("Iroh HTTP response exceeded its idle timeout",
+                                         IrohErrorStage::READ, IrohErrorCategory::TIMEOUT,
+                                         IrohDispatchCertainty::SENT);
+            }
+            continue;
+        }
+        if (count == 0) break;
+        if (count > request.max_response_bytes ||
+            output.body.size() > request.max_response_bytes - count) {
+            vgi_iroh_http_response_cancel(raw);
+            throw IrohTransportError("Iroh HTTP response body exceeds the configured limit",
+                                     IrohErrorStage::READ, IrohErrorCategory::RESOURCE_EXHAUSTED,
+                                     IrohDispatchCertainty::SENT);
+        }
+        output.body.append(reinterpret_cast<const char*>(chunk.data()), count);
+        last_progress = std::chrono::steady_clock::now();
+    }
+    return output;
+}
+
 }  // namespace
 #endif
 
@@ -344,6 +509,23 @@ IrohTransportProvider native_iroh_transport_provider() {
         throw IrohTransportError(
             "iroh:// requires vgi-rpc-c++ built with VGI_RPC_WITH_IROH_CABI and a version-matched "
             "vgi-iroh library",
+            IrohErrorStage::BIND, IrohErrorCategory::UNSUPPORTED, IrohDispatchCertainty::NOT_SENT);
+    };
+#endif
+}
+
+IrohHttpTransportProvider native_iroh_http_transport_provider() {
+#ifdef VGI_RPC_WITH_IROH_CABI
+    return [](const IrohEndpoint& endpoint, const IrohHttpRequest& request,
+              const IrohTransportOptions& options) {
+        return open_native_http(process_endpoint_pool(), endpoint, request, options);
+    };
+#else
+    return [](const IrohEndpoint&, const IrohHttpRequest&,
+              const IrohTransportOptions&) -> IrohHttpResponse {
+        throw IrohTransportError(
+            "httpi:// requires vgi-rpc-c++ built with VGI_RPC_WITH_IROH_CABI and a "
+            "version-matched vgi-iroh library",
             IrohErrorStage::BIND, IrohErrorCategory::UNSUPPORTED, IrohDispatchCertainty::NOT_SENT);
     };
 #endif
@@ -390,6 +572,10 @@ bool native_iroh_transport_available() noexcept {
 #else
     return false;
 #endif
+}
+
+bool native_iroh_http_transport_available() noexcept {
+    return native_iroh_transport_available();
 }
 
 }  // namespace vgi_rpc
