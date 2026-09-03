@@ -196,7 +196,8 @@ jobs:
           }
           trap cleanup EXIT
 
-          python ../vgi-rpc/tests/serve_fixture_describe_http.py >"$worker_log" 2>&1 &
+          PYTHONPATH="$GITHUB_WORKSPACE/../vgi-rpc" \
+            python ../vgi-rpc/tests/serve_fixture_describe_http.py >"$worker_log" 2>&1 &
           worker_pid=$!
           for _ in $(seq 1 30); do
             grep -q '^PORT:' "$worker_log" && break
