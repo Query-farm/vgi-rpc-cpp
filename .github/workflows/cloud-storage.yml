@@ -37,12 +37,16 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  VCPKG_BINARY_SOURCES: "clear;x-aws,s3://query-farm-duckdb-vcpkg/,readwrite"
-  AWS_ACCESS_KEY_ID: ${{ secrets.VCPKG_CACHING_AWS_ACCESS_KEY_ID }}
-  AWS_SECRET_ACCESS_KEY: ${{ secrets.VCPKG_CACHING_AWS_SECRET_ACCESS_KEY }}
-  AWS_ENDPOINT_URL: ${{ secrets.VCPKG_CACHING_AWS_ENDPOINT_URL }}
-  AWS_DEFAULT_REGION: ${{ secrets.VCPKG_CACHING_AWS_DEFAULT_REGION }}
+  # Use Cloudflare's S3-compatible R2 endpoint directly because vcpkg binary
+  # archives can exceed the Worker request-size limit. Fork PRs do not receive
+  # secrets, so disable the remote cache instead of issuing broken AWS calls.
+  VCPKG_BINARY_SOURCES: "${{ secrets.R2_ACCESS_KEY_ID != '' && secrets.R2_SECRET_KEY_ID != '' && secrets.R2_ENDPOINT != '' && 'clear;x-aws,s3://query-farm-duckdb-vcpkg/,readwrite' || 'clear' }}"
+  AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_KEY_ID }}
+  AWS_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT }}
+  AWS_DEFAULT_REGION: auto
   AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+  AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
 
 jobs:
   cloud:
