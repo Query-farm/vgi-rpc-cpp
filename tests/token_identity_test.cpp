@@ -322,6 +322,63 @@ TEST_CASE("a JWS never reaches the resolver") {
     CHECK(seen == std::vector<std::string>{"a.b"});
 }
 
+// ── The JWS shape test survives translation ───────────────────────────
+//
+// Whitespace must not be a way to walk a JWS past the guard.  The shape test
+// runs against the trimmed credential while the resolver still receives what
+// the caller sent, so trimming can only add refusals.
+//
+// This exists because the ports diverged here and the reference was the
+// accident: Python's `$` matches before a single trailing newline, so
+// "aaa.bbb.ccc\n" was refused there while Go's `\A..\z` and JavaScript's
+// unflagged `$` routed it straight to the resolver -- the one outcome the guard
+// exists to prevent.  Python was not even self-consistent about it, refusing
+// one trailing newline and admitting two.  Trimming first is the rule that
+// means the same thing in seven regex dialects, and it is the reason this
+// port's hand-rolled matcher needs no anchor special case of its own.
+
+TEST_CASE("padding does not smuggle a JWS past the guard") {
+    // No amount of surrounding whitespace makes a JWS resolvable.
+    for (const std::string& token :
+         {std::string("aaa.bbb.ccc"), std::string("aaa.bbb.ccc\n"), std::string("aaa.bbb.ccc\n\n"),
+          std::string("  aaa.bbb.ccc  "), std::string("\taaa.bbb.ccc\r\n")}) {
+        CHECK_THROWS_AS(reject_jws_shaped(token), TokenUnresolvedError);
+    }
+}
+
+TEST_CASE("a blank credential is not a credential") {
+    // Whitespace-only never reaches a resolver either.
+    for (const std::string& token :
+         {std::string(""), std::string("   "), std::string("\n"), std::string("\t\r\n")}) {
+        CHECK_THROWS_AS(reject_jws_shaped(token), TokenUnresolvedError);
+    }
+}
+
+TEST_CASE("an opaque credential still reaches the resolver") {
+    // Trimming tightens the JWS test; it must not refuse ordinary tokens.
+    for (const std::string& token : {std::string("opaque-token"), std::string("a.b.c.d"),
+                                     std::string("two.segments"), std::string("sk_live_abc123")}) {
+        CHECK_NOTHROW(reject_jws_shaped(token));
+    }
+}
+
+TEST_CASE("the resolver receives the credential unmodified") {
+    // Trimming is for the shape test only -- never for what is resolved.
+    // Rewriting a credential before resolving it would make the worker answer
+    // about a string the caller never sent.
+    std::vector<std::string> seen;
+    IdentityOptions options;
+    options.resolve_token = [&seen](const std::string& token) -> std::optional<TokenIdentity> {
+        seen.push_back(token);
+        return TokenIdentity{"p", "", 300};
+    };
+    options.introspect_principals = {"proxy"};
+    IdentityImpl impl(std::move(options));
+
+    impl.introspect_token("  padded-opaque-token  ", make_auth("proxy"));
+    CHECK(seen == std::vector<std::string>{"  padded-opaque-token  "});
+}
+
 TEST_CASE("identity_unavailable is transient, not definitive") {
     // A caller that negative-caches "unknown" must not cache this.  Cache an
     // outage and a worker restart takes the fleet down for the cache's

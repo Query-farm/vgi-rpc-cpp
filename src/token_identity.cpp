@@ -73,23 +73,34 @@ std::shared_ptr<arrow::Array> OneFloat64(double value) {
     return out;
 }
 
-/// Whether `token` looks like a JWS: three dot-separated base64url segments,
-/// the third possibly empty (an unsecured JWT).
+/// Strip leading and trailing whitespace, without copying.
+///
+/// ASCII whitespace only, which is exactly `str.strip()`'s set for the bytes a
+/// bearer credential can contain.  A credential is not text to be normalised --
+/// this view exists only so the shape test below can be run against it.
+std::string_view Trimmed(const std::string& token) {
+    constexpr std::string_view kSpace = " \t\n\v\f\r";
+    const size_t first = token.find_first_not_of(kSpace);
+    if (first == std::string::npos) return std::string_view();
+    const size_t last = token.find_last_not_of(kSpace);
+    return std::string_view(token).substr(first, last - first + 1);
+}
+
+/// Whether `candidate` looks like a JWS: three dot-separated base64url
+/// segments, the third possibly empty (an unsecured JWT).
 ///
 /// Hand-rolled rather than `std::regex`.  The input is an attacker-supplied
 /// credential, and libstdc++/libc++ implement `std::regex` with recursive
 /// backtracking that has blown the stack on adversarial input before; a linear
 /// scan cannot.  It also keeps the pattern readable next to the contract, which
 /// pins it as `^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*$`.
-bool IsJwsShaped(const std::string& token) {
-    // Python's `$` also matches immediately before a single trailing newline,
-    // and the reference uses `re.match(..., token)`.  Mirror that rather than
-    // being strictly stricter-looking but actually laxer: a credential of
-    // "a.b.c\n" is refused there and must be refused here, or this port routes
-    // a JWS onward that the reference would not.
-    std::string_view view(token);
-    if (!view.empty() && view.back() == '\n') view.remove_suffix(1);
-
+///
+/// Strictly anchored, with no special case for a trailing newline.  Anchor
+/// semantics are the least portable corner of seven regex dialects -- Python's
+/// `$` matches before one trailing newline and not two, Go's `\A..\z` and
+/// JavaScript's unflagged `$` match neither -- so the padding question is
+/// settled by the caller trimming first rather than by anything spelled here.
+bool IsJwsShaped(std::string_view view) {
     auto is_b64url = [](char c) {
         return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
                c == '_' || c == '-';
@@ -187,7 +198,20 @@ std::string check_introspector(const AuthContext& auth, const std::set<std::stri
 }
 
 void reject_jws_shaped(const std::string& token) {
-    if (token.empty() || token.size() > kMaxTokenChars || IsJwsShaped(token)) {
+    // The shape test runs against the *trimmed* credential; the resolver still
+    // receives what the caller actually sent.  Trimming here can only add
+    // refusals, never remove one, and it closes a padding bypass that would
+    // otherwise be spelled differently in every port: without it "a.b.c\n" is
+    // not JWS-shaped to a strict matcher and gets routed onward, which is
+    // precisely what this guard exists to stop.
+    //
+    // A whitespace-only credential is refused for the same reason an empty one
+    // is: it is not a credential.
+    //
+    // The length cap stays on the *original*, because the thing being bounded
+    // is what a resolver would be handed, not what is left after trimming.
+    const std::string_view candidate = Trimmed(token);
+    if (candidate.empty() || token.size() > kMaxTokenChars || IsJwsShaped(candidate)) {
         throw TokenUnresolvedError("unresolved");
     }
 }

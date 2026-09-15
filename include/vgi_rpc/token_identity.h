@@ -215,8 +215,22 @@ VGI_RPC_EXPORT std::string check_introspector(const AuthContext& auth,
 
 /// Refuse a JWS-shaped subject before it reaches a resolver.
 ///
-/// Also refuses an empty or over-long credential, and does so with the same
-/// error: unknown, expired and malformed are one answer.
+/// The shape test runs against the **whitespace-trimmed** credential, while the
+/// resolver still receives exactly what the caller sent.  Trimming can only add
+/// refusals, never remove one, and it closes a padding bypass -- without it
+/// `"a.b.c\n"` is not JWS-shaped to a strict matcher and gets routed onward,
+/// which is what this guard exists to stop.  Anchor semantics are the least
+/// portable corner of seven regex dialects, so the rule deliberately does not
+/// depend on them.
+///
+/// Trimming is for the shape test *only*.  Rewriting a credential before
+/// resolving it would make the worker answer about a string the caller never
+/// sent.
+///
+/// Also refuses an empty, whitespace-only, or over-long credential, and does so
+/// with the same error: unknown, expired and malformed are one answer.  The
+/// length cap applies to the original, since that is what a resolver would be
+/// handed.
 VGI_RPC_EXPORT void reject_jws_shaped(const std::string& token);
 
 /// Return the caller's `auth_time`, or refuse if it is missing or stale.
