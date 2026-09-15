@@ -6,6 +6,7 @@
 #include "vgi_rpc/arrow_utils.h"
 #include "vgi_rpc/metadata.h"
 #include "vgi_rpc/reflection.h"
+#include "vgi_rpc/token_identity.h"
 #include <arrow/array/builder_binary.h>
 #include "vgi_rpc/wire.h"
 #include "vgi_rpc/log_sink.h"
@@ -184,12 +185,32 @@ bool Server::serve_reflection(const std::shared_ptr<arrow::io::OutputStream>& ou
     auto refl_hash = BindingHash(kReflectionProtocolName, reflection_methods);
     if (!refl_hash.ok()) return fail("RuntimeError", refl_hash.status().ToString());
 
+    // Identity comes after reflection, so it appears in reflection's output --
+    // which is the whole reason a client can discover that this worker resolves
+    // credentials, or mints grants, or does neither, without calling anything
+    // and reading an error.  Narrowed to the methods whose hooks the deployment
+    // configured, so the hash a client compares narrows with them.
+    std::unordered_map<std::string, MethodInfo> identity_methods;
+    std::string identity_hash;
+    if (identity_ != nullptr) {
+        identity_methods = IdentityMethods(identity_->offered_methods());
+    }
+    const bool hosts_identity = !identity_methods.empty();
+    if (hosts_identity) {
+        auto hash = BindingHash(kIdentityProtocolName, identity_methods);
+        if (!hash.ok()) return fail("RuntimeError", hash.status().ToString());
+        identity_hash = *hash;
+    }
+
     arrow::Result<std::string> payload = arrow::Status::Invalid("unreachable");
     if (method_name == "list_protocols") {
-        payload = BuildProtocolList(
-            server_id_, "", REQUEST_VERSION_VALUE,
-            {ProtocolSummary{protocol_name_, protocol_version_, *app_hash},
-             ProtocolSummary{kReflectionProtocolName, "", *refl_hash}});
+        std::vector<ProtocolSummary> summaries{
+            ProtocolSummary{protocol_name_, protocol_version_, *app_hash},
+            ProtocolSummary{kReflectionProtocolName, "", *refl_hash}};
+        if (hosts_identity) {
+            summaries.push_back(ProtocolSummary{kIdentityProtocolName, "", identity_hash});
+        }
+        payload = BuildProtocolList(server_id_, "", REQUEST_VERSION_VALUE, summaries);
     } else if (method_name == "describe") {
         std::string requested;
         if (request_batch != nullptr) {
@@ -206,12 +227,16 @@ bool Server::serve_reflection(const std::shared_ptr<arrow::io::OutputStream>& ou
         } else if (requested == kReflectionProtocolName) {
             payload = BuildServiceDescription(kReflectionProtocolName, "", *refl_hash,
                                               reflection_methods);
+        } else if (hosts_identity && requested == kIdentityProtocolName) {
+            payload =
+                BuildServiceDescription(kIdentityProtocolName, "", identity_hash, identity_methods);
         } else {
             // Named, not silently empty: an empty description reads as "this
             // protocol has no methods".
+            std::string hosted = protocol_name_ + ", " + kReflectionProtocolName;
+            if (hosts_identity) hosted += std::string(", ") + kIdentityProtocolName;
             return fail("RuntimeError", "This server does not host protocol '" + requested +
-                                            "'. Hosted: [" + protocol_name_ + ", " +
-                                            kReflectionProtocolName + "]");
+                                            "'. Hosted: [" + hosted + "]");
         }
     } else {
         return fail("AttributeError",
@@ -313,6 +338,15 @@ bool Server::serve_one_with_state(const std::shared_ptr<arrow::io::InputStream>&
     // would deny the client the diagnosis it came for.
     if (get_metadata_value(custom_metadata, keys::PROTOCOL) == kReflectionProtocolName) {
         return serve_reflection(output, method_name, batch, request_id);
+    }
+
+    // 3b. Identity, likewise co-hosted and likewise routed by protocol key.
+    // Ahead of the version gate for a different reason than reflection: that
+    // gate compares against the *application* protocol's declared version, and
+    // this is a separate protocol that declares none, so gating it would refuse
+    // identity calls over a version disagreement that says nothing about them.
+    if (get_metadata_value(custom_metadata, keys::PROTOCOL) == kIdentityProtocolName) {
+        return serve_identity(output, method_name, batch, request_id, auth);
     }
 
     // 4. Application protocol version gate.

@@ -50,6 +50,7 @@ struct MethodInfo {
 };
 
 class Server;
+class IdentityImpl;
 
 // Populate `rec`'s request_data — or, when the payload would blow the writer's
 // per-record cap, its `original_request_bytes` accounting instead.  Measures
@@ -103,6 +104,13 @@ public:
     // The describe response is a snapshot captured at build() time.
     ServerBuilder& enable_describe(const std::string& protocol_name = "");
 
+    // Host vgi_rpc.Identity.v1.  Absent by default, and absent rather than
+    // routed-and-refusing when omitted: that is what keeps a dependency
+    // upgrade from growing a credential-to-identity oracle on every existing
+    // worker.  Only the methods whose hooks the deployment configured are
+    // hosted, and the protocol hash narrows with them.
+    ServerBuilder& identity(std::shared_ptr<IdentityImpl> impl);
+
     // Declare the application protocol surface version (canonical semver
     // MAJOR.MINOR.PATCH).  Surfaced in the __describe__ response under
     // vgi_rpc.protocol_version so version-aware clients can discover it.
@@ -133,6 +141,7 @@ private:
     std::string server_id_;
     std::string protocol_version_;
     std::string access_log_path_;
+    std::shared_ptr<IdentityImpl> identity_;
     bool transport_options_enabled_ = false;
     std::function<void(TransportKind)> on_serve_start_;
     int64_t access_log_max_record_bytes_ = kDefaultMaxRecordBytes;
@@ -177,6 +186,19 @@ public:
                           const std::string& method_name,
                           const std::shared_ptr<arrow::RecordBatch>& request_batch,
                           const std::string& request_id);
+
+    /// Serve one call to the co-hosted identity protocol.
+    ///
+    /// Takes the connection's AuthContext rather than reading one: every guard
+    /// here turns on *who is asking*, and a transport that cannot say has no
+    /// authenticated principal, which is the answer that fails closed.
+    bool serve_identity(const std::shared_ptr<arrow::io::OutputStream>& output,
+                        const std::string& method_name,
+                        const std::shared_ptr<arrow::RecordBatch>& request_batch,
+                        const std::string& request_id, const AuthContext& auth);
+
+    /// The hosted identity implementation, or null when the protocol is absent.
+    const std::shared_ptr<IdentityImpl>& identity() const noexcept { return identity_; }
     const std::unordered_map<std::string, MethodInfo>& methods() const noexcept { return methods_; }
     // The reason a request's declared application protocol version is
     // incompatible with this server's, or empty when it is fine.
@@ -232,7 +254,8 @@ private:
     Server(std::unordered_map<std::string, MethodInfo> methods, std::string server_id,
            std::string protocol_name, std::string protocol_hash, std::string protocol_version,
            const std::string& access_log_path, int64_t access_log_max_record_bytes,
-           std::function<void(TransportKind)> on_serve_start);
+           std::function<void(TransportKind)> on_serve_start,
+           std::shared_ptr<IdentityImpl> identity);
 
     void serve_unary(const MethodInfo& method_info, const Request& request,
                      const std::string& request_id,
@@ -278,6 +301,7 @@ private:
     std::string protocol_hash_;
     std::string protocol_version_;
     std::unique_ptr<AccessLogWriter> access_log_;
+    std::shared_ptr<IdentityImpl> identity_;
     std::function<void(TransportKind)> on_serve_start_;
     std::once_flag serve_start_once_;
     std::optional<TransportKind> transport_kind_;

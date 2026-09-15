@@ -81,6 +81,7 @@ add_library(vgi_rpc
     src/type_tokens.cpp
     src/protocol_hash.cpp
     src/reflection.cpp
+    src/token_identity.cpp
     src/access_log.cpp
     src/http_transport.cpp
     src/http_client.cpp

@@ -131,6 +131,11 @@ ServerBuilder& ServerBuilder::enable_describe(const std::string& protocol_name) 
     return *this;
 }
 
+ServerBuilder& ServerBuilder::identity(std::shared_ptr<IdentityImpl> impl) {
+    identity_ = std::move(impl);
+    return *this;
+}
+
 ServerBuilder& ServerBuilder::protocol_version(std::string version) {
     protocol_version_ = std::move(version);
     return *this;
@@ -179,10 +184,15 @@ std::unique_ptr<Server> ServerBuilder::build() {
         register_transport_options(method_map, server_id);
     }
 
+    // Identity, when the deployment configured it.  Held after the synthetic
+    // methods are registered, and hosted as its own protocol rather than as
+    // entries in this table: it is framework surface under the reserved
+    // `vgi_rpc.` prefix, and putting it in the application's method map would
+    // move the application's protocol hash.
     return std::unique_ptr<Server>(
         new Server(std::move(method_map), std::move(server_id), protocol_name_,
                    std::move(protocol_hash), protocol_version_, access_log_path_,
-                   access_log_max_record_bytes_, std::move(on_serve_start_)));
+                   access_log_max_record_bytes_, std::move(on_serve_start_), std::move(identity_)));
 }
 
 // Server
@@ -262,12 +272,14 @@ std::string Server::protocol_version_error(
 Server::Server(std::unordered_map<std::string, MethodInfo> methods, std::string server_id,
                std::string protocol_name, std::string protocol_hash, std::string protocol_version,
                const std::string& access_log_path, int64_t access_log_max_record_bytes,
-               std::function<void(TransportKind)> on_serve_start)
+               std::function<void(TransportKind)> on_serve_start,
+               std::shared_ptr<IdentityImpl> identity)
     : methods_(std::move(methods)),
       server_id_(std::move(server_id)),
       protocol_name_(std::move(protocol_name)),
       protocol_hash_(std::move(protocol_hash)),
       protocol_version_(std::move(protocol_version)),
+      identity_(std::move(identity)),
       on_serve_start_(std::move(on_serve_start)) {
     // A worker that declares a version it cannot parse would silently enforce
     // nothing, which is worse than not declaring one: the operator believes

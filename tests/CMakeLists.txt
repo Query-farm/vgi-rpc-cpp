@@ -35,6 +35,7 @@ vgi_rpc_add_test(server_test)
 vgi_rpc_add_test(shm_test)
 vgi_rpc_add_test(client_description_test)
 vgi_rpc_add_test(protocol_hash_test)
+vgi_rpc_add_test(token_identity_test)
 vgi_rpc_add_test(client_external_test)
 vgi_rpc_add_test(client_test)
 
