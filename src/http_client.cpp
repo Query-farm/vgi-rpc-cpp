@@ -2385,8 +2385,8 @@ AnnotatedBatch HttpClient::call_reflection(const std::string& method, const Anno
         state_->post(method, state_->protocol_path(kReflectionProtocolName, method),
                      encode_ipc(request, metadata, state_->request_serialization_cap()), request_id,
                      options, true, sticky_session_);
-    // Decoded like any other unary reply, externalization included: the old
-    // `__describe__` fast path was exempt from the transport's payload
+    // Decoded like any other unary reply, externalization included: the
+    // retired `__describe__` fast path was exempt from the transport's payload
     // handling only by accident of answering before dispatch.
     auto decoded =
         state_->decode(response, ResponseShape::UNARY, false, state_->external(), sticky_session_);

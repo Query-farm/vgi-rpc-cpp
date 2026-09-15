@@ -36,7 +36,7 @@ int main() {
                         arrow::schema({arrow::field("result", arrow::float64())}), {array});
                 },
                 "Add two numbers together.")
-            .enable_describe("HelloWorld")
+            .protocol("HelloWorld")
             .build();
 
     server->run();

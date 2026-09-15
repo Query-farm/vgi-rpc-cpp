@@ -447,13 +447,27 @@ bool Server::serve_identity(const std::shared_ptr<arrow::io::OutputStream>& outp
                             const std::string& method_name,
                             const std::shared_ptr<arrow::RecordBatch>& request_batch,
                             const std::string& request_id, const AuthContext& auth, bool* errored) {
+    const auto t0 = std::chrono::steady_clock::now();
     if (errored != nullptr) *errored = false;
+    // Identity is a protocol in its own right, so its calls are logged under
+    // its own name and digest.  A record filed under the application's protocol
+    // would merge credential resolution into application traffic and, worse,
+    // carry a digest that decodes against the wrong description.
+    //
+    // `identity_binding_` is empty exactly when no implementation was
+    // configured -- the protocol is then absent rather than hosted -- and that
+    // branch is refused below without a record, because there is no binding to
+    // name one after.
     auto fail = [&](const std::string& type, const std::string& message,
                     const std::string& kind = "") {
         if (errored != nullptr) *errored = true;
         auto err = Result::error(empty_schema(), type, message, server_id_, request_id, kind);
         write_ipc_stream(output, empty_schema(), {err.annotated_batch()});
         VGI_RPC_THROW_NOT_OK(output->Flush());
+        if (!identity_binding_.name.empty()) {
+            log_framework_call(identity_binding_, method_name, request_id, request_batch, t0, type,
+                               message);
+        }
         return true;
     };
 
@@ -477,8 +491,7 @@ bool Server::serve_identity(const std::shared_ptr<arrow::io::OutputStream>& outp
                                           available + "]");
     }
 
-    const auto methods = IdentityMethods(offered);
-    const auto& info = methods.at(method_name);
+    const auto& info = identity_methods_.at(method_name);
     if (request_batch == nullptr) {
         return fail("ProtocolError", "Identity request carried no parameter batch.");
     }
@@ -516,6 +529,7 @@ bool Server::serve_identity(const std::shared_ptr<arrow::io::OutputStream>& outp
     auto result = Result::value(batch);
     write_ipc_stream(output, info.result_schema, {result.annotated_batch()});
     VGI_RPC_THROW_NOT_OK(output->Flush());
+    log_framework_call(identity_binding_, method_name, request_id, request_batch, t0, "", "");
     return true;
 }
 

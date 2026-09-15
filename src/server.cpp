@@ -3,7 +3,8 @@
 
 #include "vgi_rpc/server.h"
 #include "vgi_rpc/metadata.h"
-#include "vgi_rpc/describe.h"
+#include "vgi_rpc/reflection.h"
+#include "vgi_rpc/token_identity.h"
 
 #include <array>
 #include <optional>
@@ -83,7 +84,7 @@ ServerBuilder& ServerBuilder::add_producer(
     info.input_schema = empty_schema();
     info.output_schema = std::move(output_schema);
     info.header_schema = std::move(header_schema);
-    // A stream yields batches; it has no return value.  __describe__ reports
+    // A stream yields batches; it has no return value.  Reflection reports
     // has_return=false for every stream method, producer and exchange alike.
     info.has_return = false;
     info.doc = doc;
@@ -110,7 +111,7 @@ ServerBuilder& ServerBuilder::add_exchange(
     info.input_schema = std::move(input_schema);
     info.output_schema = std::move(output_schema);
     info.header_schema = std::move(header_schema);
-    // A stream yields batches; it has no return value.  __describe__ reports
+    // A stream yields batches; it has no return value.  Reflection reports
     // has_return=false for every stream method, producer and exchange alike.
     info.has_return = false;
     info.doc = doc;
@@ -127,15 +128,6 @@ ServerBuilder& ServerBuilder::server_id(std::string id) {
 
 ServerBuilder& ServerBuilder::protocol(std::string protocol_name) {
     protocol_name_ = std::move(protocol_name);
-    return *this;
-}
-
-ServerBuilder& ServerBuilder::enable_describe(const std::string& protocol_name) {
-    describe_enabled_ = true;
-    // Kept assigning, including the empty default: introspection and routing
-    // have always been declared together here, and quietly preserving a name a
-    // previous call set would make `enable_describe()` mean two things.
-    protocol_name_ = protocol_name;
     return *this;
 }
 
@@ -178,17 +170,9 @@ std::unique_ptr<Server> ServerBuilder::build() {
         method_map[m.name] = std::move(m);
     }
 
-    // Compute protocol_hash over the user methods (before __describe__ is added)
-    // so it is available to both __describe__ and the access log.
-    std::string protocol_hash = compute_protocol_hash(protocol_name_, method_map);
-
-    if (describe_enabled_) {
-        register_describe(method_map, protocol_name_, server_id, protocol_version_);
-    }
-
     if (transport_options_enabled_) {
-        // Registered after __describe__ so neither synthetic method appears in
-        // the other's output — they are framework surface, not service surface.
+        // Framework surface, not service surface: `IsApplicationMethod` keeps
+        // it out of the protocol hash and out of every description.
         register_transport_options(method_map, server_id);
     }
 
@@ -197,10 +181,10 @@ std::unique_ptr<Server> ServerBuilder::build() {
     // entries in this table: it is framework surface under the reserved
     // `vgi_rpc.` prefix, and putting it in the application's method map would
     // move the application's protocol hash.
-    return std::unique_ptr<Server>(
-        new Server(std::move(method_map), std::move(server_id), protocol_name_,
-                   std::move(protocol_hash), protocol_version_, access_log_path_,
-                   access_log_max_record_bytes_, std::move(on_serve_start_), std::move(identity_)));
+    return std::unique_ptr<Server>(new Server(std::move(method_map), std::move(server_id),
+                                              protocol_name_, protocol_version_, access_log_path_,
+                                              access_log_max_record_bytes_,
+                                              std::move(on_serve_start_), std::move(identity_)));
 }
 
 // Server
@@ -277,15 +261,36 @@ std::string Server::protocol_version_error(
                       declared + ".");
 }
 
+namespace {
+
+// Fingerprint one binding, or refuse to build a server that cannot state its
+// own protocol hash.
+//
+// Thrown rather than deferred because the alternatives are both worse: an
+// unhashable protocol answers `list_protocols` with an error on the first call
+// a client makes, and leaves the access log with no digest at all for every
+// record before it.  The only cause is an Arrow type with no canonical token,
+// which is a property of the registration, known here.
+std::string binding_hash_or_throw(const std::string& name,
+                                  const std::unordered_map<std::string, MethodInfo>& methods) {
+    auto hash = BindingHash(name, methods);
+    if (!hash.ok()) {
+        throw std::invalid_argument("Cannot compute the protocol hash for '" + name +
+                                    "': " + hash.status().ToString());
+    }
+    return *hash;
+}
+
+}  // namespace
+
 Server::Server(std::unordered_map<std::string, MethodInfo> methods, std::string server_id,
-               std::string protocol_name, std::string protocol_hash, std::string protocol_version,
+               std::string protocol_name, std::string protocol_version,
                const std::string& access_log_path, int64_t access_log_max_record_bytes,
                std::function<void(TransportKind)> on_serve_start,
                std::shared_ptr<IdentityImpl> identity)
     : methods_(std::move(methods)),
       server_id_(std::move(server_id)),
       protocol_name_(std::move(protocol_name)),
-      protocol_hash_(std::move(protocol_hash)),
       protocol_version_(std::move(protocol_version)),
       identity_(std::move(identity)),
       on_serve_start_(std::move(on_serve_start)) {
@@ -298,10 +303,26 @@ Server::Server(std::unordered_map<std::string, MethodInfo> methods, std::string 
             "': expected canonical semver MAJOR.MINOR.PATCH with non-negative integers "
             "and no leading zeros (no prereleases or build metadata).");
     }
+
+    // Fingerprint every hosted binding once.  Reflection describes itself with
+    // no methods of its own: they are framework-owned rather than registered,
+    // so the honest hash is over an empty method set.  Identity narrows to the
+    // methods whose hooks the deployment configured, so the hash a client
+    // compares narrows with them.
+    application_binding_ = {protocol_name_, binding_hash_or_throw(protocol_name_, methods_)};
+    reflection_binding_ = {kReflectionProtocolName,
+                           binding_hash_or_throw(kReflectionProtocolName, {})};
+    if (identity_ != nullptr) {
+        identity_methods_ = IdentityMethods(identity_->offered_methods());
+    }
+    if (!identity_methods_.empty()) {
+        identity_binding_ = {kIdentityProtocolName,
+                             binding_hash_or_throw(kIdentityProtocolName, identity_methods_)};
+    }
+
     if (!access_log_path.empty()) {
-        access_log_ =
-            std::make_unique<AccessLogWriter>(access_log_path, server_id_, protocol_name_,
-                                              protocol_hash_, access_log_max_record_bytes);
+        access_log_ = std::make_unique<AccessLogWriter>(access_log_path, server_id_,
+                                                        access_log_max_record_bytes);
     }
 }
 

@@ -512,97 +512,66 @@ TEST_CASE("ServerBuilder: null schemas in add_exchange throw", "[server]") {
         std::invalid_argument);
 }
 
-// ── Describe Introspection Tests ─────────────────────────────────────
+// ── The retirement of __describe__ ───────────────────────────────────
+//
+// A stale caller used to get "Unknown method: '__describe__'", which is true
+// and useless: it cannot be told apart from "this server was built without
+// introspection", and the two need opposite fixes -- update the client, or
+// reconfigure the server.  So the refusal names where introspection went, and
+// a stale client is fixable from the error text alone.
 
-TEST_CASE("describe: lists registered methods", "[server][describe]") {
-    auto schema = arrow::schema({arrow::field("value", arrow::utf8())});
+namespace {
 
-    ServerBuilder builder;
-    builder.add_unary("echo", schema, schema, [](const Request& req, CallContext&) -> Result {
-        return Result::void_result();
-    });
-    builder.add_void("noop", empty_schema(), [](const Request&, CallContext&) {});
-    builder.add_producer("produce", empty_schema(), schema,
-                         [](const Request&, CallContext&) -> Stream { return {}; });
-    builder.enable_describe("test_protocol");
-    auto server = builder.build();
-
-    // Call __describe__
-    auto request_buf =
-        make_valid_request(DESCRIBE_METHOD_NAME, empty_schema(), make_empty_batch(empty_schema()));
-    auto response_buf = run_request(*server, request_buf);
-    auto contents = read_response(response_buf);
-
-    // Find the data batch with method information
-    bool found_data = false;
+/// The `vgi_rpc.log_message` a server attached to its error reply.
+std::string log_message_of(const IpcStreamContents& contents) {
     for (const auto& ab : contents.batches) {
-        if (classify_batch(ab) == BatchType::DATA && ab.batch->num_rows() > 0) {
-            found_data = true;
-            auto name_col = ab.batch->GetColumnByName("name");
-            REQUIRE(name_col != nullptr);
-
-            // Collect all method names
-            auto str_arr = std::dynamic_pointer_cast<arrow::StringArray>(name_col);
-            REQUIRE(str_arr != nullptr);
-            std::vector<std::string> methods;
-            for (int64_t i = 0; i < str_arr->length(); ++i) {
-                methods.push_back(str_arr->GetString(i));
-            }
-
-            // Should contain echo, noop, produce
-            REQUIRE(std::find(methods.begin(), methods.end(), "echo") != methods.end());
-            REQUIRE(std::find(methods.begin(), methods.end(), "noop") != methods.end());
-            REQUIRE(std::find(methods.begin(), methods.end(), "produce") != methods.end());
-
-            // __describe__ itself should NOT be listed
-            REQUIRE(std::find(methods.begin(), methods.end(), DESCRIBE_METHOD_NAME) ==
-                    methods.end());
-
-            // Check protocol_name in custom_metadata
-            if (ab.custom_metadata) {
-                auto proto_idx = ab.custom_metadata->FindKey(keys::PROTOCOL_NAME);
-                if (proto_idx >= 0) {
-                    REQUIRE(ab.custom_metadata->value(proto_idx) == "test_protocol");
-                }
-            }
-        }
+        if (ab.custom_metadata == nullptr) continue;
+        const auto index = ab.custom_metadata->FindKey(keys::LOG_MESSAGE);
+        if (index >= 0) return ab.custom_metadata->value(index);
     }
-    REQUIRE(found_data);
+    return "";
 }
 
-TEST_CASE("describe: method types are correct", "[server][describe]") {
-    auto schema = arrow::schema({arrow::field("value", arrow::utf8())});
+}  // namespace
 
-    ServerBuilder builder;
-    builder.add_unary("my_unary", schema, schema,
-                      [](const Request&, CallContext&) -> Result { return Result::void_result(); });
-    builder.add_producer("my_stream", empty_schema(), schema,
-                         [](const Request&, CallContext&) -> Stream { return {}; });
-    builder.enable_describe();
-    auto server = builder.build();
+TEST_CASE("__describe__ is refused with the name of its replacement", "[server][describe]") {
+    auto server = make_echo_server();
+    auto contents = read_response(
+        run_request(*server, make_valid_request(RETIRED_DESCRIBE_METHOD, empty_schema(),
+                                                make_empty_batch(empty_schema()))));
 
-    auto request_buf =
-        make_valid_request(DESCRIBE_METHOD_NAME, empty_schema(), make_empty_batch(empty_schema()));
-    auto response_buf = run_request(*server, request_buf);
-    auto contents = read_response(response_buf);
+    REQUIRE(get_error_type(contents) == "MethodNotImplementedError");
+    const std::string message = log_message_of(contents);
+    // The three things a stale client needs: the protocol, and both of its
+    // entry points in the order they are called.  Asserted individually
+    // because a refusal that named only the protocol would still leave the
+    // caller guessing at the method names.
+    REQUIRE(message.find(kReflectionProtocolName) != std::string::npos);
+    REQUIRE(message.find("list_protocols") != std::string::npos);
+    REQUIRE(message.find("describe") != std::string::npos);
+    REQUIRE(message.find("retired") != std::string::npos);
+}
 
-    for (const auto& ab : contents.batches) {
-        if (classify_batch(ab) == BatchType::DATA && ab.batch->num_rows() > 0) {
-            auto name_col =
-                std::dynamic_pointer_cast<arrow::StringArray>(ab.batch->GetColumnByName("name"));
-            auto type_col = std::dynamic_pointer_cast<arrow::StringArray>(
-                ab.batch->GetColumnByName("method_type"));
-            REQUIRE(name_col != nullptr);
-            REQUIRE(type_col != nullptr);
+TEST_CASE("only __describe__ is special-cased among reserved names", "[server][describe]") {
+    // Every other reserved name keeps the plain capability answer, which is
+    // what a client probing for an optional method needs: a reply pointing at
+    // reflection would send it to look for something reflection never had.
+    auto server = make_echo_server();
+    auto contents =
+        read_response(run_request(*server, make_valid_request("__not_a_method__", empty_schema(),
+                                                              make_empty_batch(empty_schema()))));
+    REQUIRE_FALSE(get_error_type(contents).empty());
+    REQUIRE(log_message_of(contents).find(kReflectionProtocolName) == std::string::npos);
+}
 
-            for (int64_t i = 0; i < name_col->length(); ++i) {
-                auto name = name_col->GetString(i);
-                auto type = type_col->GetString(i);
-                if (name == "my_unary") REQUIRE(type == "unary");
-                if (name == "my_stream") REQUIRE(type == "stream");
-            }
-        }
-    }
+TEST_CASE("the retirement message names the protocol that exists", "[server][describe]") {
+    // RETIRED_DESCRIBE_MESSAGE spells the protocol name rather than composing
+    // it from kReflectionProtocolName, because a constexpr concatenation is
+    // more machinery than the sentence is worth.  The cost of spelling it is
+    // that the two can drift apart silently, pointing a stale client at a
+    // protocol this server does not host -- so the pair is pinned here.
+    REQUIRE(std::string(RETIRED_DESCRIBE_MESSAGE).find(kReflectionProtocolName) !=
+            std::string::npos);
 }
 
 // ── The routing key on the raw transports ────────────────────────────
@@ -684,19 +653,20 @@ TEST_CASE("serve_one: a routing key naming another protocol is refused", "[serve
 
 TEST_CASE("serve_one: reserved methods need no routing key", "[server]") {
     // `__name__` methods are server-level surface owned by no protocol, so
-    // there is nothing for them to name -- and `__describe__` in particular is
-    // how a client that got the routing wrong finds out what this server
-    // speaks, which requiring a routing key first would take away.
+    // there is nothing for them to name.  `__transport_options__` is the
+    // reserved method this server actually hosts, so the case is about routing
+    // rather than about a method that is absent either way.
     ServerBuilder builder;
+    builder.protocol("RoutedService");
+    builder.enable_transport_options();
     builder.add_unary("echo", arrow::schema({arrow::field("value", arrow::utf8())}),
                       arrow::schema({arrow::field("value", arrow::utf8())}),
                       [](const Request&, CallContext&) { return Result::void_result(); });
-    builder.enable_describe("RoutedService");
     auto server = builder.build();
 
-    auto contents =
-        read_response(run_request(*server, make_valid_request(DESCRIBE_METHOD_NAME, empty_schema(),
-                                                              make_empty_batch(empty_schema()))));
+    auto contents = read_response(
+        run_request(*server, make_valid_request(TRANSPORT_OPTIONS_METHOD_NAME, empty_schema(),
+                                                make_empty_batch(empty_schema()))));
     REQUIRE(get_error_type(contents).empty());
 }
 

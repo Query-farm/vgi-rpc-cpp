@@ -58,9 +58,19 @@ VGI_RPC_THROW_NOT_OK(builder.Append(42.0));
 
 ```cpp
 inline constexpr const char* REQUEST_VERSION_VALUE = "1";
-inline constexpr const char* DESCRIBE_VERSION_VALUE = "2";
-inline constexpr const char* DESCRIBE_METHOD_NAME = "__describe__";
+inline constexpr const char* DESCRIBE_VERSION_VALUE = "4";
+inline constexpr const char* RETIRED_DESCRIBE_METHOD = "__describe__";
 ```
+
+`DESCRIBE_VERSION_VALUE` is the format `ServiceDescription` presents to a
+caller, not a wire value: the wire format is `vgi_rpc.Reflection.v1`, whose
+version rides its protocol name.
+
+`RETIRED_DESCRIBE_METHOD` exists only so a server can refuse `__describe__`
+with `RETIRED_DESCRIBE_MESSAGE`, which names `vgi_rpc.Reflection.v1` and its two
+entry points. A stale client told merely "unknown method" cannot tell "retired"
+from "this server was built without introspection", and those need opposite
+fixes.
 
 ### Helper Functions
 

@@ -77,7 +77,6 @@ add_library(vgi_rpc
     src/server.cpp
     src/pipe_transport.cpp
     src/socket_transport.cpp
-    src/describe.cpp
     src/type_tokens.cpp
     src/protocol_hash.cpp
     src/reflection.cpp

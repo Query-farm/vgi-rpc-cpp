@@ -2014,7 +2014,7 @@ int main(int argc, char** argv) {
     if (!transport_kind_probe && !polymorphic_stream_probe && !http_concurrency_probe) {
         builder.protocol_version("2.0.0");
     }
-    builder.enable_describe("ConformanceService");
+    builder.protocol("ConformanceService");
     // We implement SHM, so we must answer the handshake: a worker that stays
     // silent is treated as "no SHM" and clients never negotiate it.
     builder.enable_transport_options();

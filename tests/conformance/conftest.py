@@ -562,10 +562,11 @@ def conformance_describe(
     cpp_transport: Any,
     conformance_http_port: int,
 ) -> Any:
-    """``ServiceDescription`` obtained by calling ``__describe__`` over the wire.
+    """``ServiceDescription`` obtained over ``vgi_rpc.Reflection.v1``.
 
-    Against the real worker rather than an in-process stand-in, which is the
-    point: introspection has to be right on the transport it ships on.
+    Two round trips -- ``list_protocols``, then ``describe`` -- against the real
+    worker rather than an in-process stand-in, which is the point: introspection
+    has to be right on the transport it ships on.
     """
     from vgi_rpc.http import http_introspect
     from vgi_rpc.introspect import introspect

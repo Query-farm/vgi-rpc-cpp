@@ -70,14 +70,6 @@ ServerBuilder& server_id(std::string id);
 
 Set a deterministic server ID. Defaults to `random_hex(12)` if not set.
 
-#### `enable_describe`
-
-```cpp
-ServerBuilder& enable_describe(const std::string& protocol_name = "");
-```
-
-Enable the `__describe__` introspection method. The describe response is a snapshot captured at `build()` time.
-
 #### `build`
 
 ```cpp

@@ -255,9 +255,9 @@ RoutedRequest route_path(const std::string& path, const std::string& hosted_prot
         routed.error = RouteError::PROTOCOL_NOT_SUPPORTED;
     }
     // A reserved name under a protocol namespace is deliberately *not* refused
-    // here.  `{prefix}/{protocol}/__describe__` is a protocol that is hosted
-    // and a method it does not have, which is `method_not_implemented` -- the
-    // documented capability-probe answer, and what the reference gives.
+    // here.  `{prefix}/{protocol}/__transport_options__` is a protocol that is
+    // hosted and a method it does not have, which is `method_not_implemented`
+    // -- the documented capability-probe answer, and what the reference gives.
     // Refusing it as "no route" would collapse that distinction one layer too
     // early; the method lookup makes it, by requiring the name's kind to match
     // the route's.
@@ -1378,8 +1378,8 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
     // the same requests, for the same reason.
     //
     // The synthetic `__`-prefixed methods are exempt: they are framework
-    // surface, and `__describe__` in particular is how a mismatched client
-    // finds out what this server speaks.
+    // surface rather than the application's, so a disagreement about the
+    // application's version says nothing about them.
     if (!is_exchange_ep) {
         const std::string wire_method = get_metadata_value(custom_metadata, keys::METHOD);
         if (wire_method != method_name) {
@@ -1518,7 +1518,15 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
         it != rpc_.methods().end() &&
         IsApplicationMethod(method_name) == (routed.target == RouteTarget::APPLICATION);
     if (!addressable) {
-        fail(404, "MethodNotImplementedError", "Unknown method: '" + method_name + "'",
+        // `__describe__` is *retired* rather than merely absent, and from the
+        // caller's side those look identical while needing opposite fixes --
+        // update the client, or reconfigure the server.  Saying which one it is
+        // makes a stale client fixable from the error text alone.  Only this
+        // name is special-cased; every other reserved name keeps the plain
+        // capability answer a probe depends on.
+        fail(404, "MethodNotImplementedError",
+             method_name == RETIRED_DESCRIBE_METHOD ? std::string(RETIRED_DESCRIBE_MESSAGE)
+                                                    : "Unknown method: '" + method_name + "'",
              ERROR_KIND_METHOD_NOT_IMPLEMENTED);
         return;
     }

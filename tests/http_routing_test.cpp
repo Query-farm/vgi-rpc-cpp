@@ -61,11 +61,12 @@ public:
     RoutingServer() {
         ServerBuilder builder;
         builder.add_unary("echo", value_schema(), value_schema(), echo_handler);
-        // Declares the routing key *and* registers a reserved `__describe__`,
-        // so the reserved-vs-namespaced cases below have a real reserved method
-        // to be wrong about. Without one they would pass against a server that
-        // simply has no such method either way.
-        builder.enable_describe(kProtocol);
+        // Declares the routing key *and* registers a reserved
+        // `__transport_options__`, so the reserved-vs-namespaced cases below
+        // have a real reserved method to be wrong about. Without one they would
+        // pass against a server that simply has no such method either way.
+        builder.protocol(kProtocol);
+        builder.enable_transport_options();
         server_ = builder.build();
 
         HttpConfig cfg;
@@ -254,12 +255,31 @@ TEST_CASE("a reserved name is not a protocol's method", "[http-routing]") {
     // `method_not_implemented` and not "no route": the protocol *is* hosted,
     // and a capability probe depends on being told which of the two it hit.
     RoutingServer server;
-    auto flat = post(server.port(), "/vgi/__describe__",
-                     request_body("__describe__", std::nullopt, /*empty_params=*/true));
+    auto flat =
+        post(server.port(), "/vgi/__transport_options__",
+             request_body(TRANSPORT_OPTIONS_METHOD_NAME, std::nullopt, /*empty_params=*/true));
     CHECK(flat.status == 200);
 
-    auto namespaced = post(server.port(), std::string("/vgi/") + kProtocol + "/__describe__",
-                           request_body("__describe__", kProtocol, /*empty_params=*/true));
+    auto namespaced =
+        post(server.port(), std::string("/vgi/") + kProtocol + "/__transport_options__",
+             request_body(TRANSPORT_OPTIONS_METHOD_NAME, kProtocol, /*empty_params=*/true));
     CHECK(namespaced.status == 404);
     CHECK(has_error_kind(namespaced.body, ERROR_KIND_METHOD_NOT_IMPLEMENTED));
+}
+
+TEST_CASE("__describe__ is refused with the name of its replacement", "[http-routing]") {
+    // Over HTTP as on the raw transports: a stale client told only "unknown
+    // method" cannot tell "retired" from "this server was built without
+    // introspection", and the two need opposite fixes.  Both shapes answer the
+    // same way, because a stale client may have either address baked in.
+    RoutingServer server;
+    for (const std::string& path :
+         {std::string("/vgi/__describe__"), std::string("/vgi/") + kProtocol + "/__describe__"}) {
+        auto res = post(server.port(), path,
+                        request_body("__describe__", std::nullopt, /*empty_params=*/true));
+        CHECK(res.status == 404);
+        CHECK(has_error_kind(res.body, ERROR_KIND_METHOD_NOT_IMPLEMENTED));
+        CHECK(res.body.find(kReflectionProtocolName) != std::string::npos);
+        CHECK(res.body.find("list_protocols") != std::string::npos);
+    }
 }

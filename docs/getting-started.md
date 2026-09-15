@@ -85,4 +85,4 @@ Create a minimal server with a single unary method:
 --8<-- "examples/getting_started.cpp"
 ```
 
-The server reads Arrow IPC requests from stdin and writes responses to stdout. Use `enable_describe()` to register the built-in `__describe__` introspection method, which lets clients discover available methods and their schemas.
+The server reads Arrow IPC requests from stdin and writes responses to stdout. Use `protocol()` to declare the routing key clients address the server by; introspection needs no flag, because every server co-hosts `vgi_rpc.Reflection.v1`, whose `list_protocols` and `describe` methods let clients discover what is hosted and each protocol's method schemas.

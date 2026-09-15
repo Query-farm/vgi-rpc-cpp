@@ -140,12 +140,11 @@ arrow::Result<std::shared_ptr<arrow::RecordBatch>> MakeOneRowBatch(
 
 /// Whether a method belongs to the application protocol rather than the framework.
 ///
-/// `__describe__` and `__transport_options__` are registered in this port's
-/// method table like any other handler, but they are *server-level* surface --
-/// reserved names that belong to no protocol. Describing them as part of the
-/// application protocol would make this port's description, and therefore its
-/// hash, disagree with every other port, none of which has them in a protocol's
-/// method table at all.
+/// `__transport_options__` is registered in this port's method table like any
+/// other handler, but it is *server-level* surface -- a reserved name that
+/// belongs to no protocol. Describing it as part of the application protocol
+/// would make this port's description, and therefore its hash, disagree with
+/// every other port, none of which has it in a protocol's method table at all.
 
 bool IsApplicationMethod(const std::string& name) {
   return name.rfind("__", 0) != 0;

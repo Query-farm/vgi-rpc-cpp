@@ -24,6 +24,27 @@ inline constexpr int64_t kDefaultMaxRecordBytes = 1048576;
 
 // One completed-call access-log record (pipe/subprocess transport fields).
 struct AccessRecord {
+    // The protocol that owns the dispatched method, and that protocol's
+    // canonical digest.
+    //
+    // docs/access-log-spec.md §3 makes `protocol` the wire name of the owning
+    // protocol -- "not a server-wide default" -- and `protocol_hash` "the
+    // registry key when decoding archived records".  A framework endpoint owned
+    // by no protocol (`__transport_options__`) logs the server's primary, which
+    // the spec prescribes rather than tolerates.
+    //
+    // Both are constructor arguments, and the writer keeps no copy to fall back
+    // on, so an emit site cannot leave them to a server-wide default by
+    // omission.  That omission is the failure this pair exists to prevent, and
+    // it is the only one in the whole area that fails *silently*: a record
+    // naming one protocol and carrying another's digest is well-formed, passes
+    // the schema, and feeds a plausible dashboard while a consumer decodes it
+    // against the wrong description.
+    AccessRecord(std::string owning_protocol, std::string owning_protocol_hash)
+        : protocol(std::move(owning_protocol)), protocol_hash(std::move(owning_protocol_hash)) {}
+
+    std::string protocol;
+    std::string protocol_hash;
     std::string method;
     bool is_stream = false;
     std::string status = "ok";  // "ok" | "error"
@@ -50,8 +71,11 @@ VGI_RPC_EXPORT int64_t base64_encoded_length(int64_t len);
 // are serialized so threaded HTTP dispatch cannot interleave JSON records.
 class VGI_RPC_EXPORT AccessLogWriter {
 public:
-    AccessLogWriter(const std::string& path, std::string server_id, std::string protocol_name,
-                    std::string protocol_hash, int64_t max_record_bytes = kDefaultMaxRecordBytes);
+    // No protocol identity here on purpose: it belongs to the binding that owns
+    // the dispatched method, which only the emit site knows.  A writer-held
+    // default is how three ports came to stamp every record with their primary.
+    AccessLogWriter(const std::string& path, std::string server_id,
+                    int64_t max_record_bytes = kDefaultMaxRecordBytes);
 
     bool enabled() const noexcept { return enabled_; }
     int64_t max_record_bytes() const noexcept { return max_record_bytes_; }
@@ -68,8 +92,6 @@ private:
     bool enabled_ = false;
     std::ofstream out_;
     std::string server_id_;
-    std::string protocol_name_;
-    std::string protocol_hash_;
     int64_t max_record_bytes_ = kDefaultMaxRecordBytes;
     std::mutex mutex_;
 };

@@ -107,7 +107,7 @@ int main() {
                           arrow::schema({arrow::field("factor", arrow::float64())}),
                           scale_input_schema(), scale_output_schema(), make_scale,
                           "Scale input values by a factor")
-            .enable_describe("StreamingExample")
+            .protocol("StreamingExample")
             .build();
 
     server->run();

@@ -3,11 +3,12 @@
 
 /// Client-side decoding of discovery replies.
 ///
-/// Two encodings meet here.  `ServiceDescription` is a *client-side view* --
-/// the shape a caller wants -- and was only ever a wire format by accident of
-/// there being one encoding.  `vgi_rpc.Reflection.v1` is the wire format now,
-/// and `decode_service_description` adapts it into that same view, which is
-/// what lets every existing call site move to reflection unchanged.
+/// `ServiceDescription` is a *client-side view* -- the shape a caller wants --
+/// and was only ever a wire format by accident of there being one encoding.
+/// `vgi_rpc.Reflection.v1` is the wire format, the only one, and
+/// `decode_service_description` adapts it into that same view, which is what
+/// let every existing call site move to reflection unchanged.  The retired
+/// `__describe__` batch decoder is gone with the method it decoded.
 ///
 /// Decoding is deliberately *tolerant*, and that is normative rather than
 /// convenient: fields are read by name, unknown columns are ignored, and an
@@ -55,14 +56,6 @@ struct ServiceDescription {
 
     const MethodDescription* method(const std::string& name) const noexcept;
 };
-
-/// Parse and validate one version-4 __describe__ data batch. Throws
-/// std::runtime_error for an invalid response rather than returning a partial
-/// description that a generated or dynamic client could misinterpret.
-///
-/// Retired wire format, kept only as the decoder for this port's own legacy
-/// `__describe__` handler; new callers go through reflection.
-VGI_RPC_EXPORT ServiceDescription parse_service_description(const AnnotatedBatch& response);
 
 /// One hosted protocol, as `vgi_rpc.Reflection.v1` reports it.
 ///

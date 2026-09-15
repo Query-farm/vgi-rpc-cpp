@@ -125,6 +125,31 @@ double elapsed_ms_since(std::chrono::steady_clock::time_point t0) {
 
 }  // anonymous namespace
 
+void Server::log_framework_call(const ProtocolIdentity& owner, const std::string& method,
+                                const std::string& request_id,
+                                const std::shared_ptr<arrow::RecordBatch>& request_batch,
+                                std::chrono::steady_clock::time_point started,
+                                const std::string& error_type, const std::string& error_message) {
+    if (!access_log_ || !access_log_->enabled()) return;
+    // `owner`, not this server's primary.  Reflection and identity are
+    // protocols in their own right; filing their calls under the application's
+    // name merges two protocols' traffic into one series, and pairing that name
+    // with the application's digest sends a consumer to the wrong description
+    // entirely.
+    AccessRecord rec(owner.name, owner.hash);
+    rec.method = method;
+    rec.request_id = request_id;
+    rec.is_stream = false;
+    rec.status = error_type.empty() ? "ok" : "error";
+    rec.error_type = error_type;
+    rec.error_message = error_message;
+    rec.duration_ms = elapsed_ms_since(started);
+    // A malformed request can be refused before a batch was ever decoded, and
+    // a record with no payload beats no record at all.
+    if (request_batch != nullptr) fill_request_data(*access_log_, rec, request_batch);
+    access_log_->emit(rec);
+}
+
 void Server::run() {
 #ifdef _WIN32
     // Windows opens the standard streams in text mode, which rewrites CRLF and
@@ -169,48 +194,35 @@ bool Server::serve_reflection(const std::shared_ptr<arrow::io::OutputStream>& ou
                               const std::string& method_name,
                               const std::shared_ptr<arrow::RecordBatch>& request_batch,
                               const std::string& request_id, bool* errored) {
+    const auto t0 = std::chrono::steady_clock::now();
     if (errored != nullptr) *errored = false;
     auto fail = [&](const std::string& type, const std::string& message) {
         if (errored != nullptr) *errored = true;
         auto err = Result::error(empty_schema(), type, message, server_id_, request_id);
         write_ipc_stream(output, empty_schema(), {err.annotated_batch()});
         VGI_RPC_THROW_NOT_OK(output->Flush());
+        log_framework_call(reflection_binding_, method_name, request_id, request_batch, t0, type,
+                           message);
         return true;
     };
 
-    auto app_hash = BindingHash(protocol_name_, methods_);
-    if (!app_hash.ok()) return fail("RuntimeError", app_hash.status().ToString());
-    // Reflection describes itself with no methods of its own in the table: they
-    // are framework-owned rather than registered, so the honest hash is over an
-    // empty method set.
-    const std::unordered_map<std::string, MethodInfo> reflection_methods;
-    auto refl_hash = BindingHash(kReflectionProtocolName, reflection_methods);
-    if (!refl_hash.ok()) return fail("RuntimeError", refl_hash.status().ToString());
-
-    // Identity comes after reflection, so it appears in reflection's output --
-    // which is the whole reason a client can discover that this worker resolves
-    // credentials, or mints grants, or does neither, without calling anything
-    // and reading an error.  Narrowed to the methods whose hooks the deployment
-    // configured, so the hash a client compares narrows with them.
-    std::unordered_map<std::string, MethodInfo> identity_methods;
-    std::string identity_hash;
-    if (identity_ != nullptr) {
-        identity_methods = IdentityMethods(identity_->offered_methods());
-    }
-    const bool hosts_identity = !identity_methods.empty();
-    if (hosts_identity) {
-        auto hash = BindingHash(kIdentityProtocolName, identity_methods);
-        if (!hash.ok()) return fail("RuntimeError", hash.status().ToString());
-        identity_hash = *hash;
-    }
+    // The bindings were fingerprinted once, at construction.  The digest a
+    // client reads here is therefore the same string the access log files the
+    // call under -- which is what makes `protocol_hash` usable as a registry
+    // key rather than a number that happens to be near the right one.
+    const bool hosts_identity = !identity_binding_.name.empty();
 
     arrow::Result<std::string> payload = arrow::Status::Invalid("unreachable");
     if (method_name == "list_protocols") {
         std::vector<ProtocolSummary> summaries{
-            ProtocolSummary{protocol_name_, protocol_version_, *app_hash},
-            ProtocolSummary{kReflectionProtocolName, "", *refl_hash}};
+            ProtocolSummary{protocol_name_, protocol_version_, application_binding_.hash},
+            ProtocolSummary{kReflectionProtocolName, "", reflection_binding_.hash}};
+        // Identity comes after reflection, so it appears in reflection's output
+        // -- which is the whole reason a client can discover that this worker
+        // resolves credentials, or mints grants, or does neither, without
+        // calling anything and reading an error.
         if (hosts_identity) {
-            summaries.push_back(ProtocolSummary{kIdentityProtocolName, "", identity_hash});
+            summaries.push_back(ProtocolSummary{kIdentityProtocolName, "", identity_binding_.hash});
         }
         payload = BuildProtocolList(server_id_, "", REQUEST_VERSION_VALUE, summaries);
     } else if (method_name == "describe") {
@@ -224,14 +236,17 @@ bool Server::serve_reflection(const std::shared_ptr<arrow::io::OutputStream>& ou
             }
         }
         if (requested == protocol_name_) {
-            payload = BuildServiceDescription(protocol_name_, protocol_version_, *app_hash,
-                                              methods_);
+            payload = BuildServiceDescription(protocol_name_, protocol_version_,
+                                              application_binding_.hash, methods_);
         } else if (requested == kReflectionProtocolName) {
-            payload = BuildServiceDescription(kReflectionProtocolName, "", *refl_hash,
-                                              reflection_methods);
-        } else if (hosts_identity && requested == kIdentityProtocolName) {
+            // Reflection describes itself with no methods of its own in the
+            // table: they are framework-owned rather than registered, so the
+            // honest description is over an empty method set.
             payload =
-                BuildServiceDescription(kIdentityProtocolName, "", identity_hash, identity_methods);
+                BuildServiceDescription(kReflectionProtocolName, "", reflection_binding_.hash, {});
+        } else if (hosts_identity && requested == kIdentityProtocolName) {
+            payload = BuildServiceDescription(kIdentityProtocolName, "", identity_binding_.hash,
+                                              identity_methods_);
         } else {
             // Named, not silently empty: an empty description reads as "this
             // protocol has no methods".
@@ -259,6 +274,7 @@ bool Server::serve_reflection(const std::shared_ptr<arrow::io::OutputStream>& ou
     auto result = Result::value(out_batch);
     write_ipc_stream(output, schema, {result.annotated_batch()});
     VGI_RPC_THROW_NOT_OK(output->Flush());
+    log_framework_call(reflection_binding_, method_name, request_id, request_batch, t0, "", "");
     return true;
 }
 
@@ -404,8 +420,8 @@ bool Server::serve_one_with_state(const std::shared_ptr<arrow::io::InputStream>&
 
     // 4. Application protocol version gate.
     // The synthetic `__`-prefixed methods are exempt: they are framework
-    // surface, and `__describe__` in particular is how a mismatched client
-    // finds out what this server speaks.
+    // surface rather than the application's, so a disagreement about the
+    // application's version says nothing about them.
     if (method_name.rfind("__", 0) != 0) {
         if (auto reason = protocol_version_error(custom_metadata); !reason.empty()) {
             auto error_result = Result::error(empty_schema(), "ProtocolVersionError", reason,
@@ -418,6 +434,22 @@ bool Server::serve_one_with_state(const std::shared_ptr<arrow::io::InputStream>&
 
     // 5. Look up handler
     auto it = methods_.find(method_name);
+    if (it == methods_.end() && method_name == RETIRED_DESCRIBE_METHOD) {
+        // Named explicitly because `__describe__` is *retired* rather than
+        // merely absent, and from the caller's side those look identical while
+        // needing opposite fixes -- update the client, or reconfigure the
+        // server.  A stale client told only "unknown method" has no way to
+        // learn that introspection moved to a protocol; one told where it went
+        // is fixable from the error text alone.  Only this name is
+        // special-cased: every other reserved name keeps the plain capability
+        // answer, which is what a client probing for an optional method needs.
+        auto error_result =
+            Result::error(empty_schema(), "MethodNotImplementedError", RETIRED_DESCRIBE_MESSAGE,
+                          server_id_, request_id, ERROR_KIND_METHOD_NOT_IMPLEMENTED);
+        write_ipc_stream(output, empty_schema(), {error_result.annotated_batch()});
+        VGI_RPC_THROW_NOT_OK(output->Flush());
+        return true;
+    }
     if (it == methods_.end()) {
         std::vector<std::string> names;
         for (const auto& [name, _] : methods_) {
@@ -564,7 +596,11 @@ bool Server::serve_unary_impl(const MethodInfo& method_info, const Request& requ
     VGI_RPC_THROW_NOT_OK(output->Flush());
 
     if (access_log_ && access_log_->enabled()) {
-        AccessRecord rec;
+        // The application binding owns everything in `methods_`.  The one
+        // exception is `__transport_options__`, a framework endpoint owned by no
+        // protocol -- which the spec says logs the server's primary, so it is
+        // right here by prescription rather than by omission.
+        AccessRecord rec(application_binding_.name, application_binding_.hash);
         rec.method = method_info.name;
         rec.request_id = request_id;
         rec.is_stream = false;
@@ -831,7 +867,9 @@ void Server::serve_stream(const MethodInfo& method_info, const Request& request,
     drain_reader(input_reader);
 
     if (access_log_ && access_log_->enabled()) {
-        AccessRecord rec;
+        // Streams are application surface only: neither framework protocol
+        // hosts one.
+        AccessRecord rec(application_binding_.name, application_binding_.hash);
         rec.method = method_info.name;
         rec.request_id = request_id;
         rec.is_stream = true;

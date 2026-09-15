@@ -58,7 +58,6 @@ inline constexpr const char* SHM_SEGMENT_SIZE = "vgi_rpc.shm_segment_size";
 inline constexpr const char* TRANSPORT_PREFIX = "vgi_rpc.transport.";
 inline constexpr const char* TRANSPORT_SHM = "vgi_rpc.transport.shm";
 inline constexpr const char* PROTOCOL_NAME = "vgi_rpc.protocol_name";
-inline constexpr const char* DESCRIBE_VERSION = "vgi_rpc.describe_version";
 inline constexpr const char* PROTOCOL_HASH = "vgi_rpc.protocol_hash";
 inline constexpr const char* PROTOCOL_VERSION = "vgi_rpc.protocol_version";
 inline constexpr const char* CANCEL = "vgi_rpc.cancel";
@@ -100,8 +99,33 @@ inline constexpr const char* kReflectionProtocolName = "vgi_rpc.Reflection.v1";
 
 // Protocol constants
 inline constexpr const char* REQUEST_VERSION_VALUE = "1";
+
+/// The introspection format `ServiceDescription` presents to a caller.
+///
+/// Vestigial as a wire value: the wire format is `vgi_rpc.Reflection.v1`, whose
+/// version rides its protocol name.  Kept because `ServiceDescription` is a
+/// client-side *view*, and a caller that branches on the shape it was handed
+/// still needs a number for it.
 inline constexpr const char* DESCRIBE_VERSION_VALUE = "4";
-inline constexpr const char* DESCRIBE_METHOD_NAME = "__describe__";
+
+/// Retired in the multi-service revamp, and kept only so the refusal can say
+/// where introspection went.
+///
+/// A stale client told merely "no such method" cannot tell "retired" from "this
+/// server was built without introspection", and the two need opposite fixes:
+/// update the client, or reconfigure the server.  Naming it here is what lets
+/// dispatch answer the first without inventing a whole capability table.
+inline constexpr const char* RETIRED_DESCRIBE_METHOD = "__describe__";
+
+/// What a server answers a `__describe__` request with.
+///
+/// Spelled out rather than assembled at the call site because two transports
+/// refuse it and a stale client must get the same sentence from either.
+inline constexpr const char* RETIRED_DESCRIBE_MESSAGE =
+    "'__describe__' was retired. Introspection is now the 'vgi_rpc.Reflection.v1' protocol: "
+    "call 'list_protocols' for what this server hosts, then 'describe' for one protocol's "
+    "methods.";
+
 inline constexpr const char* TRANSPORT_OPTIONS_METHOD_NAME = "__transport_options__";
 
 // Empty schema — used for void results, protocol errors, producer tick input

@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <chrono>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -45,12 +46,26 @@ struct MethodInfo {
     std::shared_ptr<arrow::Schema> header_schema;  // nullptr if no header
     std::function<Stream(const Request&, CallContext&)> stream_factory;
     // true = exchange (bidi), false = producer.  Used to pick the stream
-    // dispatch shape; not surfaced in __describe__ (which reports null).
+    // dispatch shape; reflection reports it as `stream_kind`.
     bool is_exchange = false;
 };
 
 class Server;
 class IdentityImpl;
+
+/// One hosted protocol's wire name and canonical digest, carried together.
+///
+/// Together because an access record that names one protocol and carries
+/// another's digest is worse than either field being wrong alone:
+/// docs/access-log-spec.md §3 makes `protocol_hash` "the registry key when
+/// decoding archived records", so such a record is decoded against the wrong
+/// description -- and it is well-formed, passes the schema, and looks right.
+/// Splitting the pair across two lookups is how that divergence arose in the
+/// reference, so here there is one lookup and it returns both.
+struct VGI_RPC_EXPORT ProtocolIdentity {
+    std::string name;
+    std::string hash;
+};
 
 // Populate `rec`'s request_data — or, when the payload would blow the writer's
 // per-record cap, its `original_request_bytes` accounting instead.  Measures
@@ -116,11 +131,6 @@ public:
     // wrong place.
     ServerBuilder& protocol(std::string protocol_name);
 
-    // Enable __describe__ introspection.
-    // The describe response is a snapshot captured at build() time.  Passing a
-    // name here also declares it as the routing key, as protocol() does.
-    ServerBuilder& enable_describe(const std::string& protocol_name = "");
-
     // Host vgi_rpc.Identity.v1.  Absent by default, and absent rather than
     // routed-and-refusing when omitted: that is what keeps a dependency
     // upgrade from growing a credential-to-identity oracle on every existing
@@ -129,8 +139,8 @@ public:
     ServerBuilder& identity(std::shared_ptr<IdentityImpl> impl);
 
     // Declare the application protocol surface version (canonical semver
-    // MAJOR.MINOR.PATCH).  Surfaced in the __describe__ response under
-    // vgi_rpc.protocol_version so version-aware clients can discover it.
+    // MAJOR.MINOR.PATCH).  Reported by `vgi_rpc.Reflection.v1` as
+    // `protocol_version` so version-aware clients can discover it.
     ServerBuilder& protocol_version(std::string version);
 
     // Install an optional process-local lifecycle hook.  It runs once, with
@@ -152,7 +162,6 @@ private:
     void check_duplicate(const std::string& name) const;
 
     std::vector<MethodInfo> methods_;
-    bool describe_enabled_ = false;
     bool built_ = false;
     std::string protocol_name_;
     std::string server_id_;
@@ -275,11 +284,26 @@ private:
         std::shared_ptr<ShmSegment> call_shm;
     };
 
+    // The protocol hash is not a parameter: a Server computes the canonical
+    // digest of every binding it hosts, which is the same value reflection
+    // reports.  Passing one in is what let the access log carry a digest the
+    // wire never advertised.
     Server(std::unordered_map<std::string, MethodInfo> methods, std::string server_id,
-           std::string protocol_name, std::string protocol_hash, std::string protocol_version,
+           std::string protocol_name, std::string protocol_version,
            const std::string& access_log_path, int64_t access_log_max_record_bytes,
            std::function<void(TransportKind)> on_serve_start,
            std::shared_ptr<IdentityImpl> identity);
+
+    // Emit one access record for a unary call to a co-hosted framework
+    // protocol.  `owner` is the binding that owns the method, never this
+    // server's primary: reflection and identity are protocols in their own
+    // right, and a record filed under the application's name merges two
+    // protocols' traffic with nothing to show it happened.
+    void log_framework_call(const ProtocolIdentity& owner, const std::string& method,
+                            const std::string& request_id,
+                            const std::shared_ptr<arrow::RecordBatch>& request_batch,
+                            std::chrono::steady_clock::time_point started,
+                            const std::string& error_type, const std::string& error_message);
 
     void serve_unary(const MethodInfo& method_info, const Request& request,
                      const std::string& request_id,
@@ -322,8 +346,20 @@ private:
     std::unordered_map<std::string, MethodInfo> methods_;
     std::string server_id_;
     std::string protocol_name_;
-    std::string protocol_hash_;
     std::string protocol_version_;
+
+    // Every binding this server hosts, fingerprinted once at construction.
+    //
+    // One computation feeds both the `list_protocols` reply and the access
+    // log, so the digest an operator reads out of an archived record is the
+    // same string a client compared against -- which is the only way the hash
+    // is usable as a registry key.  `identity_binding_.name` is empty when no
+    // identity implementation was configured, because the protocol is then
+    // absent rather than hosted-and-empty.
+    ProtocolIdentity application_binding_;
+    ProtocolIdentity reflection_binding_;
+    ProtocolIdentity identity_binding_;
+    std::unordered_map<std::string, MethodInfo> identity_methods_;
     std::unique_ptr<AccessLogWriter> access_log_;
     std::shared_ptr<IdentityImpl> identity_;
     std::function<void(TransportKind)> on_serve_start_;

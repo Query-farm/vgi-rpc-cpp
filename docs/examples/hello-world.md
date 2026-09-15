@@ -16,4 +16,4 @@ The simplest possible vgi-rpc server: a single unary method that adds two number
 
 **Error handling** — `VGI_RPC_THROW_NOT_OK()` checks Arrow status codes and throws `std::runtime_error` on failure. `unwrap()` does the same for `arrow::Result<T>`.
 
-**Introspection** — `.enable_describe("HelloWorld")` registers the `__describe__` method, allowing clients to discover this server's methods and schemas at runtime.
+**Introspection** — `.protocol("HelloWorld")` declares the routing key. Discovery comes from the co-hosted `vgi_rpc.Reflection.v1` protocol, which every server hosts: `list_protocols` reports what is here, and `describe` returns one protocol's methods and schemas.

@@ -82,11 +82,8 @@ std::string utc_timestamp_ms() {
 }  // namespace
 
 AccessLogWriter::AccessLogWriter(const std::string& path, std::string server_id,
-                                 std::string protocol_name, std::string protocol_hash,
                                  int64_t max_record_bytes)
     : server_id_(std::move(server_id)),
-      protocol_name_(std::move(protocol_name)),
-      protocol_hash_(std::move(protocol_hash)),
       max_record_bytes_(max_record_bytes > 0 ? max_record_bytes : kDefaultMaxRecordBytes) {
     if (path.empty()) return;
     out_.open(path, std::ios::out | std::ios::app);
@@ -105,10 +102,11 @@ void AccessLogWriter::emit(const AccessRecord& rec) {
     j["timestamp"] = utc_timestamp_ms();
     j["level"] = "INFO";
     j["logger"] = "vgi_rpc.access";
-    j["message"] = protocol_name_ + "." + rec.method + (rec.status == "ok" ? " ok" : " error");
+    j["message"] = rec.protocol + "." + rec.method + (rec.status == "ok" ? " ok" : " error");
     j["server_id"] = server_id_;
-    j["protocol"] = protocol_name_;
-    j["protocol_hash"] = protocol_hash_;
+    // The owning binding's, never a server-wide default -- see AccessRecord.
+    j["protocol"] = rec.protocol;
+    j["protocol_hash"] = rec.protocol_hash;
     j["method"] = rec.method;
     j["method_type"] = rec.is_stream ? "stream" : "unary";
     j["principal"] = "";

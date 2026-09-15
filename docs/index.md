@@ -30,7 +30,7 @@ Define RPC methods with typed C++20 handlers using Arrow schemas. The framework 
 - **Producer streams** for server-initiated batch data flows
 - **Exchange streams** for bidirectional batch processing
 - **Client-directed logging** at configurable levels
-- **Introspection** via optional `__describe__` method
+- **Introspection** via the co-hosted `vgi_rpc.Reflection.v1` protocol
 - **Error handling** — exceptions automatically converted to protocol error responses
 - **Builder pattern** — fluent `ServerBuilder` API for registering methods
 - **Access log** — JSONL records per call, with the spec's field-shedding size cap

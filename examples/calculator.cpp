@@ -69,7 +69,7 @@ int main() {
                     return make_double_result(a / b);
                 },
                 "Divide a by b. Raises error if b is zero.")
-            .enable_describe("Calculator")
+            .protocol("Calculator")
             .build();
 
     server->run();
