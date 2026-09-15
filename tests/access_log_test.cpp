@@ -178,9 +178,9 @@ TEST_CASE("a reflection call is filed under vgi_rpc.Reflection.v1", "[access-log
     REQUIRE(record.has_value());
     CHECK(record->value("protocol", "") == std::string(kReflectionProtocolName));
 
-    // Reflection hosts no registered methods of its own, so its canonical
-    // description is over an empty method set.
-    auto expected = BindingHash(kReflectionProtocolName, {});
+    // Reflection's canonical description covers the two methods it answers,
+    // the same table `describe` reports.
+    auto expected = BindingHash(kReflectionProtocolName, ReflectionMethods());
     REQUIRE(expected.ok());
     CHECK(record->value("protocol_hash", "") == *expected);
 

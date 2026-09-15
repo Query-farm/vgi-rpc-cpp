@@ -35,6 +35,20 @@ VGI_RPC_EXPORT bool UnaryHasReturn(const MethodInfo& info);
 /// The stream kind, or "" for a unary method.
 VGI_RPC_EXPORT std::string StreamKindFor(const MethodInfo& info);
 
+/// The reflection protocol's own method table.
+///
+/// Built from the same `MethodInfo` shape every other protocol uses, so the
+/// hash and the description read one table rather than two hand-kept copies
+/// that can drift.  Reflection is not special-cased: it appears in its own
+/// `list_protocols` output, and `describe("vgi_rpc.Reflection.v1")` must return
+/// the two methods it answers -- a client that discovers a server the
+/// documented way learns how to call reflection from reflection itself.
+///
+/// `handler` is left empty: these are dispatched by `Server::serve_reflection`,
+/// which answers them from the server's own binding table rather than through
+/// the generic handler signature.
+VGI_RPC_EXPORT std::unordered_map<std::string, MethodInfo> ReflectionMethods();
+
 /// One protocol's canonical fingerprint.
 VGI_RPC_EXPORT arrow::Result<std::string> BindingHash(
     const std::string& name, const std::unordered_map<std::string, MethodInfo>& methods);

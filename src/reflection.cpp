@@ -163,6 +163,42 @@ std::string StreamKindFor(const MethodInfo& info) {
   return info.is_exchange ? "exchange" : "producer";
 }
 
+std::unordered_map<std::string, MethodInfo> ReflectionMethods() {
+  // The single `result: binary` column every structured return in this
+  // framework uses.  Shared by both methods, so the ProtocolList and
+  // ServiceDescription payloads can evolve without moving the protocol hash.
+  static const auto result_schema = arrow::schema({BinaryField("result")});
+
+  std::unordered_map<std::string, MethodInfo> methods;
+
+  {
+    MethodInfo info;
+    info.name = "describe";
+    info.method_type = MethodType::UNARY;
+    info.params_schema = arrow::schema({Utf8Field("protocol")});
+    info.result_schema = result_schema;
+    info.has_return = true;
+    info.doc = "Return one protocol's full description.";
+    methods[info.name] = std::move(info);
+  }
+
+  {
+    MethodInfo info;
+    info.name = "list_protocols";
+    info.method_type = MethodType::UNARY;
+    // Present and empty, not absent: the canonical description distinguishes a
+    // method taking no parameters from one whose parameters are unstated, and
+    // `list_protocols` takes none.
+    info.params_schema = arrow::schema({});
+    info.result_schema = result_schema;
+    info.has_return = true;
+    info.doc = "Return every protocol this server hosts.";
+    methods[info.name] = std::move(info);
+  }
+
+  return methods;
+}
+
 arrow::Result<std::string> BindingHash(
     const std::string& name, const std::unordered_map<std::string, MethodInfo>& methods) {
   std::vector<HashMethod> entries;

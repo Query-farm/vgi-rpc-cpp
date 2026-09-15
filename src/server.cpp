@@ -304,14 +304,16 @@ Server::Server(std::unordered_map<std::string, MethodInfo> methods, std::string 
             "and no leading zeros (no prereleases or build metadata).");
     }
 
-    // Fingerprint every hosted binding once.  Reflection describes itself with
-    // no methods of its own: they are framework-owned rather than registered,
-    // so the honest hash is over an empty method set.  Identity narrows to the
-    // methods whose hooks the deployment configured, so the hash a client
-    // compares narrows with them.
+    // Fingerprint every hosted binding once.  Reflection is fingerprinted over
+    // the two methods it answers, exactly like any other protocol: they are
+    // framework-owned rather than user-registered, but the table is what
+    // `describe` reports and what the hash covers, so an empty one would be a
+    // protocol lying about itself.  Identity narrows to the methods whose hooks
+    // the deployment configured, so the hash a client compares narrows with
+    // them.
     application_binding_ = {protocol_name_, binding_hash_or_throw(protocol_name_, methods_)};
     reflection_binding_ = {kReflectionProtocolName,
-                           binding_hash_or_throw(kReflectionProtocolName, {})};
+                           binding_hash_or_throw(kReflectionProtocolName, ReflectionMethods())};
     if (identity_ != nullptr) {
         identity_methods_ = IdentityMethods(identity_->offered_methods());
     }

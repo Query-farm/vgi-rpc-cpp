@@ -239,11 +239,12 @@ bool Server::serve_reflection(const std::shared_ptr<arrow::io::OutputStream>& ou
             payload = BuildServiceDescription(protocol_name_, protocol_version_,
                                               application_binding_.hash, methods_);
         } else if (requested == kReflectionProtocolName) {
-            // Reflection describes itself with no methods of its own in the
-            // table: they are framework-owned rather than registered, so the
-            // honest description is over an empty method set.
-            payload =
-                BuildServiceDescription(kReflectionProtocolName, "", reflection_binding_.hash, {});
+            // Self-description is not special-cased: reflection reports the two
+            // methods it answers, so a client that found it through
+            // `list_protocols` can learn to call the protocol it is already
+            // calling.
+            payload = BuildServiceDescription(kReflectionProtocolName, "", reflection_binding_.hash,
+                                              ReflectionMethods());
         } else if (hosts_identity && requested == kIdentityProtocolName) {
             payload = BuildServiceDescription(kIdentityProtocolName, "", identity_binding_.hash,
                                               identity_methods_);

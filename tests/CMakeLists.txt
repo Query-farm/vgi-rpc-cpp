@@ -35,6 +35,7 @@ vgi_rpc_add_test(server_test)
 vgi_rpc_add_test(shm_test)
 vgi_rpc_add_test(client_description_test)
 vgi_rpc_add_test(protocol_hash_test)
+vgi_rpc_add_test(reflection_test)
 vgi_rpc_add_test(access_log_test)
 target_compile_definitions(access_log_test PRIVATE
     VGI_RPC_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/.."
