@@ -46,8 +46,10 @@
 #include <algorithm>
 #include <cctype>
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <ctime>
+#include <exception>
 #include <functional>
 #include <iostream>
 #include <limits>
@@ -99,7 +101,91 @@ struct HttpStreamSession {
     std::string aad;  // identity this stream was opened under
     std::optional<int64_t> response_limit_bytes;
     std::optional<int64_t> preferred_response_bytes;
+    // The access log's stream_id for this call, minted at /init and carried
+    // here so every continuation files under the same one.  Deliberately not
+    // the cursor: the cursor is a resumption handle whose lifetime is the
+    // registry entry's, and the one thing stream_id must survive is the
+    // registry entry going away on the terminal turn.
+    std::string stream_id;
 };
+
+// One access record for one HTTP turn, filed when the turn's scope exits --
+// however it exits.
+//
+// `handle_rpc`'s stream paths leave from a dozen places: a factory that threw,
+// a body over the wire budget, an externalized payload over the hard cap, a
+// cancel, a handler that raised, the ordinary success.  An emit statement in
+// front of each is an emit statement someone forgets in front of the
+// thirteenth -- and a missing stream record is precisely the failure this area
+// is about, because a log with no stream records reads as clean rather than as
+// absent.  Filing from a destructor makes "every exit" structural instead of a
+// thing to remember.
+class TurnRecord {
+public:
+    // `rec` is built by the caller, which is what keeps the owning-binding
+    // requirement at the emit site: this class never names a protocol.
+    TurnRecord(AccessLogWriter* log, AccessRecord rec)
+        : log_(log != nullptr && log->enabled() ? log : nullptr),
+          rec_(std::move(rec)),
+          started_(std::chrono::steady_clock::now()),
+          entered_uncaught_(std::uncaught_exceptions()) {}
+
+    TurnRecord(const TurnRecord&) = delete;
+    TurnRecord& operator=(const TurnRecord&) = delete;
+
+    ~TurnRecord() {
+        if (log_ == nullptr) return;
+        if (std::uncaught_exceptions() > entered_uncaught_ && rec_.status == "ok") {
+            // Leaving by exception rather than by a return.  Not every throw on
+            // these paths is funnelled into an error body -- an IPC write that
+            // fails inside `build_body` unwinds straight out to cpp-httplib's
+            // exception handler -- and a record that still says `ok` is worse
+            // than no record: it is the one an operator trusts while chasing
+            // the 500 it describes.
+            rec_.status = "error";
+            rec_.error_type = "RpcError";
+            rec_.error_message = "unhandled exception during dispatch";
+            rec_.has_response_state = false;
+        }
+        rec_.duration_ms =
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started_)
+                .count();
+        try {
+            log_->emit(rec_);
+        } catch (...) {
+            // Destructors run during unwinding; a second exception out of one
+            // is std::terminate.  A lost record is the lesser loss.
+        }
+    }
+
+    AccessRecord& record() noexcept { return rec_; }
+
+    void failed(const std::string& type, const std::string& message) {
+        rec_.status = "error";
+        rec_.error_type = type;
+        rec_.error_message = message;
+        // A refused turn handed back no usable continuation, whatever the
+        // handler had produced before the refusal.
+        rec_.has_response_state = false;
+    }
+
+private:
+    AccessLogWriter* log_;
+    AccessRecord rec_;
+    std::chrono::steady_clock::time_point started_;
+    int entered_uncaught_;
+};
+
+// The plaintext stream state this port hands a client.
+//
+// C++ stream states are live handles rather than serializable values, so what
+// travels is the registry cursor and the cursor *is* the state token -- in
+// plaintext, with no AEAD layer for §4.4's "decrypted" to strip.  Logging it
+// is what distinguishes a turn that handed back a continuation from the
+// terminal one that did not.
+std::string state_b64(const std::string& token) {
+    return base64_encode(reinterpret_cast<const uint8_t*>(token.data()), token.size());
+}
 
 // ---------------------------------------------------------------------------
 // Protocol routing
@@ -386,12 +472,22 @@ std::shared_ptr<arrow::KeyValueMetadata> init_metadata(const std::string& cursor
 using CycleExternalizer = std::function<std::shared_ptr<arrow::KeyValueMetadata>(
     const std::vector<AnnotatedBatch>&, const std::shared_ptr<arrow::Schema>&)>;
 
+// What a turn did wrong, when it did.  A bare `bool` was enough to set the
+// error header, but an access record needs the class and the message too --
+// and an error record with neither is the record an operator is reading the
+// log to find.
+struct TurnFailure {
+    bool failed = false;
+    std::string type;
+    std::string message;
+};
+
 bool run_producer_turns(const std::shared_ptr<arrow::ipc::RecordBatchWriter>& writer,
                         const std::shared_ptr<StreamState>& state,
                         const std::shared_ptr<arrow::Schema>& schema, CallContext& ctx,
-                        const std::string& server_id, const std::string& request_id, bool* errored,
-                        const CycleExternalizer& externalize, const AnnotatedBatch& input,
-                        std::optional<int64_t> response_limit_bytes,
+                        const std::string& server_id, const std::string& request_id,
+                        TurnFailure* failure, const CycleExternalizer& externalize,
+                        const AnnotatedBatch& input, std::optional<int64_t> response_limit_bytes,
                         std::optional<int64_t> preferred_response_bytes) {
     OutputCollector oc(schema, /*producer=*/true, server_id, request_id, response_limit_bytes,
                        preferred_response_bytes);
@@ -401,7 +497,11 @@ bool run_producer_turns(const std::shared_ptr<arrow::ipc::RecordBatchWriter>& wr
         auto md = make_error_metadata(exception_type_of(e), e.what(), server_id, request_id,
                                       error_kind_of(e));
         VGI_RPC_THROW_NOT_OK(writer->WriteRecordBatch(*make_empty_batch(schema), md));
-        if (errored) *errored = true;
+        if (failure) {
+            failure->failed = true;
+            failure->type = exception_type_of(e);
+            failure->message = e.what();
+        }
         return true;
     }
     // The pointer replaces the *whole* transition — log batches included —
@@ -1456,15 +1556,35 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
         return;
     }
 
+    // The binding every record from here down is filed under.  Application
+    // methods and their streams are its own; `__upload_url__` is a framework
+    // endpoint owned by no protocol, which docs/access-log-spec.md §3 says logs
+    // the server's primary -- prescribed, not a default fallen back on.  The
+    // two framework protocols returned above, and they file under their own.
+    const ProtocolIdentity& owner = rpc_.application_binding();
+
     // Synthetic method: vends upload/download URL pairs so a client can
     // externalize an outgoing batch the server would otherwise refuse at 413.
     // Present only when a backend is configured, so a client that discovers
     // upload-URL support can rely on the route existing.
     if (method_name == "__upload_url__" && is_init) {
         if (!storage_) {
+            // The route does not exist on this server, so nothing was
+            // dispatched and there is no call to file -- same shape as the
+            // reference, which never registers the route at all.
             fail(404, "AttributeError", "Upload URLs are not configured");
             return;
         }
+        AccessRecord rec(owner.name, owner.hash);
+        rec.method = method_name;
+        rec.request_id = request_id;
+        rec.is_stream = false;
+        AccessLogWriter* upload_log = rpc_.access_log();
+        if (upload_log != nullptr && upload_log->enabled()) {
+            fill_request_data(*upload_log, rec, batch);
+        }
+        TurnRecord turn(upload_log, std::move(rec));
+
         int64_t count = 1;
         if (auto col = batch->GetColumnByName("count");
             col && col->length() > 0 && col->type()->id() == arrow::Type::INT64) {
@@ -1497,14 +1617,16 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
             });
             if (response_limit && static_cast<int64_t>(body.size()) > *response_limit) {
                 res.set_header(RPC_ERROR_HEADER, "true");
-                body = error_body(schema, "ResponseTooLargeError",
-                                  "method '" + method_name + "' exceeds max_response_bytes (" +
-                                      std::to_string(body.size()) + " > " +
-                                      std::to_string(*response_limit) + ")",
-                                  rpc_.server_id(), request_id);
+                const std::string msg =
+                    "method '" + method_name + "' exceeds max_response_bytes (" +
+                    std::to_string(body.size()) + " > " + std::to_string(*response_limit) + ")";
+                turn.failed("ResponseTooLargeError", msg);
+                body =
+                    error_body(schema, "ResponseTooLargeError", msg, rpc_.server_id(), request_id);
             }
             set_arrow_content(req, res, std::move(body));
         } catch (const std::exception& e) {
+            turn.failed("RuntimeError", std::string("cannot vend upload URLs: ") + e.what());
             fail(500, "RuntimeError", std::string("cannot vend upload URLs: ") + e.what());
         }
         return;
@@ -1667,10 +1789,28 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
 
     // ---- Stream init ----
     if (is_init) {
+        // Minted before the factory runs, so a stream that dies in its factory
+        // is still one identifiable call rather than an unlabelled error.
+        const std::string stream_id = random_hex(32);
+        AccessRecord rec(owner.name, owner.hash);
+        rec.method = method_name;
+        rec.request_id = request_id;
+        rec.is_stream = true;
+        rec.stream_id = stream_id;
+        AccessLogWriter* stream_log = rpc_.access_log();
+        // request_data rides the init record and only the init record: it is
+        // what distinguishes an init from a continuation without keying off a
+        // method name.
+        if (stream_log != nullptr && stream_log->enabled()) {
+            fill_request_data(*stream_log, rec, request.batch());
+        }
+        TurnRecord turn(stream_log, std::move(rec));
+
         Stream stream;
         try {
             stream = method_info.stream_factory(request, ctx);
         } catch (const std::exception& e) {
+            turn.failed(exception_type_of(e), e.what());
             res.status = 200;
             res.set_header(RPC_ERROR_HEADER, "true");
             apply_sticky();
@@ -1706,7 +1846,7 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
         // semantics and returns no rows.
         const bool is_exchange = method_info.is_exchange &&
                                  dynamic_cast<const ProducerState*>(stream.state.get()) == nullptr;
-        bool errored = false;
+        TurnFailure failure;
         int64_t externalized = 0;
         auto externalize = [&](const std::vector<AnnotatedBatch>& batches,
                                const std::shared_ptr<arrow::Schema>& schema) {
@@ -1736,6 +1876,10 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
                 session->aad = stream_scope;
                 session->response_limit_bytes = response_limit;
                 session->preferred_response_bytes = preferred_response;
+                session->stream_id = stream_id;
+                // A token went out, so this turn is not the terminal one.
+                turn.record().response_state_b64 = state_b64(cursor);
+                turn.record().has_response_state = true;
                 std::lock_guard<std::mutex> registry_lock(streams_mutex_);
                 streams_[cursor] = std::move(session);
             } else {
@@ -1750,7 +1894,7 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
                 }
                 const bool finished = run_producer_turns(
                     writer, stream.state, output_schema, ctx, rpc_.server_id(), request_id,
-                    &errored, externalize, AnnotatedBatch::data(make_empty_batch(empty_schema())),
+                    &failure, externalize, AnnotatedBatch::data(make_empty_batch(empty_schema())),
                     response_limit, preferred_response);
                 if (!finished) {
                     VGI_RPC_THROW_NOT_OK(writer->WriteRecordBatch(
@@ -1764,6 +1908,12 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
                     session->aad = stream_scope;
                     session->response_limit_bytes = response_limit;
                     session->preferred_response_bytes = preferred_response;
+                    session->stream_id = stream_id;
+                    // Same here: a producer that ran to exhaustion inside
+                    // /init registers nothing and hands back no token, and the
+                    // absent response_state is what says so.
+                    turn.record().response_state_b64 = state_b64(cursor);
+                    turn.record().has_response_state = true;
                     std::lock_guard<std::mutex> registry_lock(streams_mutex_);
                     streams_[cursor] = std::move(session);
                 }
@@ -1782,14 +1932,17 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
             res.status = 200;
             res.set_header(RPC_ERROR_HEADER, "true");
             apply_sticky();
+            const std::string msg =
+                "Externalised payload exceeds max_externalized_response_bytes (" +
+                std::to_string(externalized) + " > " +
+                std::to_string(cfg_.max_externalized_response_bytes) + ") for method '" +
+                method_name + "'";
+            // The registry entry the body advertised has just been erased, so
+            // the token it carried resumes nothing: `failed` withdraws the
+            // response_state with it.
+            turn.failed("RpcError", msg);
             set_arrow_content(
-                req, res,
-                error_body(output_schema, "RpcError",
-                           "Externalised payload exceeds max_externalized_response_bytes (" +
-                               std::to_string(externalized) + " > " +
-                               std::to_string(cfg_.max_externalized_response_bytes) +
-                               ") for method '" + method_name + "'",
-                           rpc_.server_id(), request_id));
+                req, res, error_body(output_schema, "RpcError", msg, rpc_.server_id(), request_id));
             return;
         }
         if (response_limit && static_cast<int64_t>(body.size()) > *response_limit) {
@@ -1800,17 +1953,20 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
             res.status = 200;
             res.set_header(RPC_ERROR_HEADER, "true");
             apply_sticky();
-            set_arrow_content(
-                req, res,
-                error_body(output_schema, "ResponseTooLargeError",
-                           "method '" + method_name + "' exceeds max_response_bytes (" +
-                               std::to_string(body.size()) + " > " +
-                               std::to_string(*response_limit) + ")",
-                           rpc_.server_id(), request_id));
+            const std::string msg = "method '" + method_name + "' exceeds max_response_bytes (" +
+                                    std::to_string(body.size()) + " > " +
+                                    std::to_string(*response_limit) + ")";
+            turn.failed("ResponseTooLargeError", msg);
+            set_arrow_content(req, res,
+                              error_body(output_schema, "ResponseTooLargeError", msg,
+                                         rpc_.server_id(), request_id));
             return;
         }
         res.status = 200;
-        if (errored) res.set_header(RPC_ERROR_HEADER, "true");
+        if (failure.failed) {
+            turn.failed(failure.type, failure.message);
+            res.set_header(RPC_ERROR_HEADER, "true");
+        }
         apply_sticky();
         set_arrow_content(req, res, body);
         return;
@@ -1887,7 +2043,29 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
     }
     auto output_schema = sess->output_schema;
 
+    // Everything above this line refuses a continuation *before* it becomes a
+    // turn -- an unresolvable cursor, another caller's stream, a missing call
+    // token.  Those are the middleware short-circuits docs/access-log-spec.md
+    // §4.7 records as producing no record in the reference either; the log
+    // starts where dispatch does.
+    AccessRecord rec(owner.name, owner.hash);
+    rec.method = sess->method_name;
+    rec.request_id = request_id;
+    rec.is_stream = true;
+    // The init's id, not this turn's cursor: reassembling a call's turns is
+    // the whole reason the field exists.
+    rec.stream_id = sess->stream_id;
+    // request_data is the init record's alone -- carrying it again on every
+    // continuation is how a stream's records stop being distinguishable.  The
+    // state this turn resumed from goes in its place.
+    rec.request_state_b64 = state_b64(cursor);
+    rec.has_request_state = true;
+    TurnRecord turn(rpc_.access_log(), std::move(rec));
+
     if (custom_metadata && custom_metadata->FindKey(keys::CANCEL) >= 0) {
+        // Matches the pipe transport: a cancelled stream is flagged rather
+        // than failed, because nothing went wrong -- the client stopped.
+        turn.record().cancelled = true;
         try {
             sess->state->on_cancel(ctx);
         } catch (...) {
@@ -1904,11 +2082,12 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
         });
         if (response_limit && static_cast<int64_t>(body.size()) > *response_limit) {
             res.set_header(RPC_ERROR_HEADER, "true");
-            body = error_body(output_schema, "ResponseTooLargeError",
-                              "method '" + sess->method_name + "' exceeds max_response_bytes (" +
-                                  std::to_string(body.size()) + " > " +
-                                  std::to_string(*response_limit) + ")",
-                              rpc_.server_id(), request_id);
+            const std::string msg = "method '" + sess->method_name +
+                                    "' exceeds max_response_bytes (" + std::to_string(body.size()) +
+                                    " > " + std::to_string(*response_limit) + ")";
+            turn.failed("ResponseTooLargeError", msg);
+            body = error_body(output_schema, "ResponseTooLargeError", msg, rpc_.server_id(),
+                              request_id);
         }
         set_arrow_content(req, res, std::move(body));
         return;
@@ -1920,6 +2099,7 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
             auto sit = streams_.find(cursor);
             if (sit != streams_.end() && sit->second == sess) streams_.erase(sit);
         }
+        turn.failed(exception_type_of(e), e.what());
         res.status = 200;
         res.set_header(RPC_ERROR_HEADER, "true");
         apply_sticky();
@@ -1946,14 +2126,13 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
         res.status = 200;
         res.set_header(RPC_ERROR_HEADER, "true");
         apply_sticky();
-        set_arrow_content(
-            req, res,
-            error_body(output_schema, "RpcError",
-                       "Externalised payload exceeds max_externalized_response_bytes (" +
-                           std::to_string(externalized) + " > " +
-                           std::to_string(cfg_.max_externalized_response_bytes) + ") for method '" +
-                           sess->method_name + "'",
-                       rpc_.server_id(), request_id));
+        const std::string msg = "Externalised payload exceeds max_externalized_response_bytes (" +
+                                std::to_string(externalized) + " > " +
+                                std::to_string(cfg_.max_externalized_response_bytes) +
+                                ") for method '" + sess->method_name + "'";
+        turn.failed("RpcError", msg);
+        set_arrow_content(req, res,
+                          error_body(output_schema, "RpcError", msg, rpc_.server_id(), request_id));
         return true;
     };
 
@@ -1980,6 +2159,10 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
                 }
                 write_ipc_stream(out, output_schema, batches);
             });
+            // An exchange turn always hands the cursor back: the stream ends
+            // when the client stops asking, not when the server says so.
+            turn.record().response_state_b64 = state_b64(cursor);
+            turn.record().has_response_state = true;
             if (response_limit && static_cast<int64_t>(body.size()) > *response_limit) {
                 {
                     std::lock_guard<std::mutex> registry_lock(streams_mutex_);
@@ -1989,13 +2172,13 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
                 res.status = 200;
                 res.set_header(RPC_ERROR_HEADER, "true");
                 apply_sticky();
-                set_arrow_content(
-                    req, res,
-                    error_body(output_schema, "ResponseTooLargeError",
-                               "method '" + sess->method_name + "' exceeds max_response_bytes (" +
-                                   std::to_string(body.size()) + " > " +
-                                   std::to_string(*response_limit) + ")",
-                               rpc_.server_id(), request_id));
+                const std::string msg =
+                    "method '" + sess->method_name + "' exceeds max_response_bytes (" +
+                    std::to_string(body.size()) + " > " + std::to_string(*response_limit) + ")";
+                turn.failed("ResponseTooLargeError", msg);
+                set_arrow_content(req, res,
+                                  error_body(output_schema, "ResponseTooLargeError", msg,
+                                             rpc_.server_id(), request_id));
                 return;
             }
             res.status = 200;
@@ -2003,16 +2186,19 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
             set_arrow_content(req, res, body);
         } else {
             bool finished = false;
-            bool errored = false;
+            TurnFailure failure;
             std::string body = build_body([&](const std::shared_ptr<arrow::io::OutputStream>& out) {
                 auto writer = unwrap(arrow::ipc::MakeStreamWriter(out, output_schema));
                 finished = run_producer_turns(writer, sess->state, output_schema, ctx,
-                                              rpc_.server_id(), request_id, &errored, externalize,
+                                              rpc_.server_id(), request_id, &failure, externalize,
                                               AnnotatedBatch::with_metadata(batch, custom_metadata),
                                               response_limit, preferred_response);
                 if (!finished) {
                     VGI_RPC_THROW_NOT_OK(writer->WriteRecordBatch(*make_empty_batch(output_schema),
                                                                   cursor_metadata(cursor)));
+                    // Non-terminal: a further token went out with this turn.
+                    turn.record().response_state_b64 = state_b64(cursor);
+                    turn.record().has_response_state = true;
                 }
                 VGI_RPC_THROW_NOT_OK(writer->Close());
             });
@@ -2026,13 +2212,13 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
                 res.status = 200;
                 res.set_header(RPC_ERROR_HEADER, "true");
                 apply_sticky();
-                set_arrow_content(
-                    req, res,
-                    error_body(output_schema, "ResponseTooLargeError",
-                               "method '" + sess->method_name + "' exceeds max_response_bytes (" +
-                                   std::to_string(body.size()) + " > " +
-                                   std::to_string(*response_limit) + ")",
-                               rpc_.server_id(), request_id));
+                const std::string msg =
+                    "method '" + sess->method_name + "' exceeds max_response_bytes (" +
+                    std::to_string(body.size()) + " > " + std::to_string(*response_limit) + ")";
+                turn.failed("ResponseTooLargeError", msg);
+                set_arrow_content(req, res,
+                                  error_body(output_schema, "ResponseTooLargeError", msg,
+                                             rpc_.server_id(), request_id));
                 return;
             }
             if (finished) {
@@ -2041,7 +2227,10 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
                 if (sit != streams_.end() && sit->second == sess) streams_.erase(sit);
             }
             res.status = 200;
-            if (errored) res.set_header(RPC_ERROR_HEADER, "true");
+            if (failure.failed) {
+                turn.failed(failure.type, failure.message);
+                res.set_header(RPC_ERROR_HEADER, "true");
+            }
             apply_sticky();
             set_arrow_content(req, res, body);
         }

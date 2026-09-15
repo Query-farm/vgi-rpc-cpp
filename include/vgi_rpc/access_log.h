@@ -56,6 +56,15 @@ struct AccessRecord {
     bool cancelled = false;        // client cancelled a stream
     std::string request_data_b64;  // base64 IPC of the request batch
     bool has_request_data = false;
+    // Base64 of the *decrypted* stream state, in this server's own encoding,
+    // per docs/access-log-spec.md §4.4: `request_state` on a continuation,
+    // `response_state` on an init and on any continuation that handed a
+    // further token back -- absent on the terminal one, which is what makes
+    // "this stream is over" readable from the record alone.
+    std::string request_state_b64;
+    bool has_request_state = false;
+    std::string response_state_b64;
+    bool has_response_state = false;
     // Set instead of request_data_b64 when the payload was too large to carry.
     // Reports the character length of the base64 string that was dropped.
     int64_t original_request_bytes = -1;

@@ -130,6 +130,10 @@ void AccessLogWriter::emit(const AccessRecord& rec) {
         j["stream_id"] = rec.stream_id;
         if (rec.cancelled) j["cancelled"] = true;
     }
+    // Plaintext, never the sealed token: a log reader must be able to decode
+    // the state without holding the server's token_key.
+    if (rec.has_request_state) j["request_state"] = rec.request_state_b64;
+    if (rec.has_response_state) j["response_state"] = rec.response_state_b64;
     if (rec.has_request_data) {
         j["request_data"] = rec.request_data_b64;
     } else if (rec.original_request_bytes >= 0) {

@@ -19,8 +19,17 @@ if _explicit_path:
     sys.path.insert(0, _explicit_path)
     _vgi_rpc_path = _explicit_path
 else:
-    _vgi_rpc_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "vgi-rpc")
+    # Sibling checkouts, most-current first.  `vgi-rpc-python` is the canonical
+    # reference; `vgi-rpc` is what CI clones it *into*, and is also the name a
+    # stale `main` checkout carries on a developer machine -- so it goes last,
+    # after the one that cannot be the stale tree.
+    _here = os.path.dirname(os.path.abspath(__file__))
+    _candidates = [os.path.join(_here, "..", name) for name in ("vgi-rpc-python", "vgi-rpc")]
     if importlib.util.find_spec("vgi_rpc") is None:
+        _vgi_rpc_path = next(
+            (path for path in _candidates if os.path.isdir(os.path.join(path, "vgi_rpc"))),
+            _candidates[-1],
+        )
         sys.path.insert(0, _vgi_rpc_path)
     else:
         _vgi_rpc_path = os.path.dirname(importlib.util.find_spec("vgi_rpc").origin)

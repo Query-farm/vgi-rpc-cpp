@@ -232,6 +232,27 @@ public:
 
     /// The hosted identity implementation, or null when the protocol is absent.
     const std::shared_ptr<IdentityImpl>& identity() const noexcept { return identity_; }
+
+    /// The binding that owns this server's application surface.
+    ///
+    /// Public because a transport that drives dispatch itself has to name an
+    /// owning binding to build an access record at all, and the one thing it
+    /// must not do is invent one.  Every application method and every stream
+    /// belongs here; so do the framework endpoints owned by no protocol
+    /// (`__transport_options__`, `__upload_url__`), which
+    /// docs/access-log-spec.md §3 prescribes log the server's primary rather
+    /// than merely tolerating it.
+    const ProtocolIdentity& application_binding() const noexcept { return application_binding_; }
+
+    /// The configured access-log writer, or nullptr when none was configured.
+    ///
+    /// Public because HTTP drives a stream's turns itself: `serve_stream` never
+    /// runs there, so the Server never sees an `init` or a continuation and
+    /// cannot file their records.  Handing the writer out cannot reintroduce
+    /// the server-wide protocol default this area exists to prevent -- the
+    /// writer holds no protocol identity, and `AccessRecord` has no default
+    /// constructor, so a caller still has to name a binding to build a record.
+    AccessLogWriter* access_log() noexcept { return access_log_.get(); }
     const std::unordered_map<std::string, MethodInfo>& methods() const noexcept { return methods_; }
     // The reason a request's declared application protocol version is
     // incompatible with this server's, or empty when it is fine.
