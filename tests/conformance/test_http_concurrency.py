@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
-from typing import Protocol
+from typing import ClassVar, Protocol
 
 import httpx2
 from conftest import spawn_http
@@ -14,6 +14,12 @@ from vgi_rpc.http import http_connect
 
 
 class _ConcurrencyService(Protocol):
+    # The worker hosts every probe method under its one application protocol,
+    # so this must name that protocol rather than itself.  Left undeclared the
+    # reference derives the routing key from the class name and the worker --
+    # correctly -- refuses a protocol it does not host.
+    protocol_name: ClassVar[str] = "ConformanceService"
+
     def rendezvous(self, tag: int) -> int: ...
 
 

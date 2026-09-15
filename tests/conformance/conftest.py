@@ -23,7 +23,7 @@ import sys
 import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, ClassVar, Protocol
 
 import pytest
 
@@ -309,6 +309,12 @@ def conformance_transport_kind_probes() -> Iterator[
     """Expose real wire probes for every C++ server transport."""
 
     class _KindProbe(Protocol):
+        # The worker hosts every probe method under its one application protocol,
+        # so this must name that protocol rather than itself.  Left undeclared the
+        # reference derives the routing key from the class name and the worker --
+        # correctly -- refuses a protocol it does not host.
+        protocol_name: ClassVar[str] = "ConformanceService"
+
         def report_transport_kind(self) -> str: ...
 
     import shutil

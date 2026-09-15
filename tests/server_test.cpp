@@ -604,3 +604,111 @@ TEST_CASE("describe: method types are correct", "[server][describe]") {
         }
     }
 }
+
+// ── The routing key on the raw transports ────────────────────────────
+//
+// Here the metadata field is the *only* carrier, so an absent key really is
+// unroutable -- and with reflection and identity co-hosted, letting it through
+// would land the request on whichever protocol the dispatcher reached first
+// rather than telling the caller.  HTTP answers the opposite way, on purpose:
+// there the path segment has already resolved the binding.  Getting the two the
+// right way round is the whole point, so both directions are pinned.
+
+namespace {
+
+std::string error_kind_of_response(const IpcStreamContents& contents) {
+    for (const auto& ab : contents.batches) {
+        if (ab.custom_metadata == nullptr) continue;
+        const auto index = ab.custom_metadata->FindKey(keys::ERROR_KIND);
+        if (index >= 0) return ab.custom_metadata->value(index);
+    }
+    return "";
+}
+
+/// An echo server that declares a routing key, and therefore requires one.
+std::unique_ptr<Server> make_routed_server() {
+    auto schema = arrow::schema({arrow::field("value", arrow::utf8())});
+    ServerBuilder builder;
+    builder.protocol("RoutedService");
+    builder.add_unary("echo", schema, schema, [](const Request& req, CallContext&) -> Result {
+        arrow::StringBuilder sb;
+        REQUIRE(sb.Append(req.get<std::string>("value")).ok());
+        return Result::value(req.schema(), {*sb.Finish()});
+    });
+    return builder.build();
+}
+
+std::shared_ptr<arrow::Buffer> routed_request(const std::string& method,
+                                              std::optional<std::string> protocol) {
+    auto schema = arrow::schema({arrow::field("value", arrow::utf8())});
+    arrow::StringBuilder sb;
+    REQUIRE(sb.Append("hi").ok());
+    auto batch = arrow::RecordBatch::Make(schema, 1, {*sb.Finish()});
+    auto md = std::make_shared<arrow::KeyValueMetadata>();
+    md->Append(keys::METHOD, method);
+    md->Append(keys::REQUEST_VERSION, REQUEST_VERSION_VALUE);
+    if (protocol) md->Append(keys::PROTOCOL, *protocol);
+    return make_request_buffer(schema, batch, md);
+}
+
+}  // namespace
+
+TEST_CASE("serve_one: the routing key is required when a protocol is declared", "[server]") {
+    auto server = make_routed_server();
+
+    auto named = read_response(run_request(*server, routed_request("echo", "RoutedService")));
+    REQUIRE(get_error_type(named).empty());
+
+    auto absent = read_response(run_request(*server, routed_request("echo", std::nullopt)));
+    REQUIRE(get_error_type(absent) == "ProtocolNotSpecifiedError");
+    REQUIRE(error_kind_of_response(absent) == ERROR_KIND_PROTOCOL_NOT_SPECIFIED);
+}
+
+TEST_CASE("serve_one: a routing key naming another protocol is refused", "[server]") {
+    // Distinct from "no key at all", and distinct again from an absent method:
+    // three conditions, three answers, because a client acts differently on
+    // each.
+    auto server = make_routed_server();
+    auto contents = read_response(run_request(*server, routed_request("echo", "SomethingElse")));
+    REQUIRE(get_error_type(contents) == "ProtocolNotSupportedError");
+    REQUIRE(error_kind_of_response(contents) == ERROR_KIND_PROTOCOL_NOT_SUPPORTED);
+    // The request-supplied name never reaches the message.
+    for (const auto& ab : contents.batches) {
+        if (ab.custom_metadata == nullptr) continue;
+        const auto index = ab.custom_metadata->FindKey(keys::LOG_MESSAGE);
+        if (index >= 0) {
+            REQUIRE(ab.custom_metadata->value(index).find("SomethingElse") == std::string::npos);
+        }
+    }
+}
+
+TEST_CASE("serve_one: reserved methods need no routing key", "[server]") {
+    // `__name__` methods are server-level surface owned by no protocol, so
+    // there is nothing for them to name -- and `__describe__` in particular is
+    // how a client that got the routing wrong finds out what this server
+    // speaks, which requiring a routing key first would take away.
+    ServerBuilder builder;
+    builder.add_unary("echo", arrow::schema({arrow::field("value", arrow::utf8())}),
+                      arrow::schema({arrow::field("value", arrow::utf8())}),
+                      [](const Request&, CallContext&) { return Result::void_result(); });
+    builder.enable_describe("RoutedService");
+    auto server = builder.build();
+
+    auto contents =
+        read_response(run_request(*server, make_valid_request(DESCRIBE_METHOD_NAME, empty_schema(),
+                                                              make_empty_batch(empty_schema()))));
+    REQUIRE(get_error_type(contents).empty());
+}
+
+TEST_CASE("serve_one: a server that declares no protocol requires no routing key", "[server]") {
+    // It has no key to match, and exactly one namespace with no name for it.
+    // Requiring one would make every pre-multi-service server unaddressable in
+    // exchange for a check it could never pass.
+    auto server = make_echo_server();
+    auto schema = arrow::schema({arrow::field("value", arrow::utf8())});
+    arrow::StringBuilder sb;
+    REQUIRE(sb.Append("hi").ok());
+    auto batch = arrow::RecordBatch::Make(schema, 1, {*sb.Finish()});
+    auto contents = read_response(run_request(*server, make_valid_request("echo", schema, batch)));
+    REQUIRE(get_error_type(contents).empty());
+}

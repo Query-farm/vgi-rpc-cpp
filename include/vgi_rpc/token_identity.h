@@ -63,11 +63,20 @@ namespace vgi_rpc {
 /// cannot register a protocol that impersonates it.
 inline constexpr const char* kIdentityProtocolName = "vgi_rpc.Identity.v1";
 
-/// Cap on a credential we will even attempt to resolve.
+/// Cap on a credential we will even attempt to resolve, in **UTF-8 bytes**.
 ///
 /// Anything longer is not a bearer token; refusing early keeps a resolver from
 /// being handed megabytes.
-inline constexpr size_t kMaxTokenChars = 4096;
+///
+/// The unit is the whole point of the name.  The ports measured this three
+/// different ways -- codepoints, UTF-16 code units, and bytes -- so the same
+/// credential was over the cap in one port and under it in another, which is a
+/// guard that does not hold at the boundary between them.  Bytes won: it is
+/// what a transport actually carries, and it is the only unit every port can
+/// compute without first deciding what a character is.  `std::string::size()`
+/// was already bytes here, so C++ needed no behaviour change -- only a name
+/// that says which unit it meant.
+inline constexpr size_t kMaxTokenBytes = 4096;
 
 /// Introspections allowed per caller per window, unless configured otherwise.
 inline constexpr int kDefaultIntrospectRateLimit = 20;

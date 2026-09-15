@@ -84,6 +84,11 @@ inline constexpr const char* ERROR_KIND = "vgi_rpc.error_kind";
 inline constexpr const char* ERROR_KIND_SESSION_LOST = "session_lost";
 inline constexpr const char* ERROR_KIND_SERVER_DRAINING = "server_draining";
 inline constexpr const char* ERROR_KIND_METHOD_NOT_IMPLEMENTED = "method_not_implemented";
+// Routing outcomes a client depends on telling apart: "you do not speak this
+// protocol" is a different answer from "you speak it but lack this method",
+// and a capability probe reads both.
+inline constexpr const char* ERROR_KIND_PROTOCOL_NOT_SUPPORTED = "protocol_not_supported";
+inline constexpr const char* ERROR_KIND_PROTOCOL_NOT_SPECIFIED = "protocol_not_specified";
 
 /// The wire name of the reflection protocol.
 ///

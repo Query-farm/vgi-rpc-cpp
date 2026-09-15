@@ -24,7 +24,9 @@
 #include "vgi_rpc/metadata.h"
 #include "vgi_rpc/output_collector.h"
 #include "vgi_rpc/proxy_proof.h"
+#include "vgi_rpc/reflection.h"
 #include "vgi_rpc/session.h"
+#include "vgi_rpc/token_identity.h"
 #include "vgi_rpc/wire.h"
 #include "request_contract.h"
 
@@ -42,6 +44,7 @@
 #include <zlib.h>
 
 #include <algorithm>
+#include <cctype>
 #include <array>
 #include <cstdint>
 #include <ctime>
@@ -97,6 +100,179 @@ struct HttpStreamSession {
     std::optional<int64_t> response_limit_bytes;
     std::optional<int64_t> preferred_response_bytes;
 };
+
+// ---------------------------------------------------------------------------
+// Protocol routing
+//
+// On HTTP the protocol rides twice: in `vgi_rpc.protocol` and as a path
+// segment, `{prefix}/{protocol}/{method}`.  The metadata field is canonical --
+// it is the only carrier on stdio, unix and named pipes -- and the path segment
+// is a required *faithful projection*, present so an edge device can act on the
+// protocol without parsing Arrow.  Disagreement is refused, because unspecified
+// it is the Content-Length/Transfer-Encoding shape: the edge applies policy to
+// one protocol while the worker dispatches another.
+// ---------------------------------------------------------------------------
+
+/// Which surface a request path resolved to.
+enum class RouteTarget {
+    RESERVED,     ///< A flat server-level `__name__`, owned by no protocol.
+    APPLICATION,  ///< This server's application protocol.
+    REFLECTION,   ///< vgi_rpc.Reflection.v1.
+    IDENTITY,     ///< vgi_rpc.Identity.v1.
+};
+
+/// Why a path could not be routed.  Distinct because a client depends on the
+/// difference: "I do not speak that protocol" and "I speak it but not that
+/// method" are different answers, and a capability probe reads both.
+enum class RouteError {
+    NONE,
+    NOT_FOUND,               ///< Unroutable shape, or a `%` in the protocol segment.
+    PROTOCOL_NOT_SUPPORTED,  ///< Well-formed name, not hosted here.
+};
+
+struct RoutedRequest {
+    RouteError error = RouteError::NONE;
+    RouteTarget target = RouteTarget::RESERVED;
+    std::string protocol;  ///< Empty for a reserved, server-level path.
+    std::string method;
+    bool is_init = false;
+    bool is_exchange = false;
+};
+
+/// Whether `name` is a server-level reserved name rather than a protocol's.
+bool is_reserved_method(const std::string& name) {
+    return name.size() > 4 && name.rfind("__", 0) == 0 &&
+           name.compare(name.size() - 2, 2, "__") == 0;
+}
+
+/// Whether `name` matches the protocol grammar: `[A-Za-z_][A-Za-z0-9_.]*`,
+/// at most 255 bytes UTF-8.
+///
+/// Checked *before* the name is looked up, so a request-supplied string never
+/// reaches an error message, a log field or a metric label.
+bool is_protocol_name(const std::string& name) {
+    if (name.empty() || name.size() > 255) return false;
+    const auto lead = static_cast<unsigned char>(name[0]);
+    if (!(std::isalpha(lead) || lead == '_')) return false;
+    return std::all_of(name.begin() + 1, name.end(),
+                       [](unsigned char c) { return std::isalnum(c) || c == '_' || c == '.'; });
+}
+
+/// The request target with its query stripped, *undecoded*.
+///
+/// cpp-httplib percent-decodes `req.path` before a handler ever sees it, so
+/// routing on `req.path` would make the percent ban below unenforceable: `%56`
+/// would arrive as `V` and compare equal to a name nobody sent.  Every port hit
+/// this in its own dialect -- Go's `ServeMux` and Java's `getPathInfo()` decode
+/// too, and .NET decodes client-side -- so the raw target is the only input
+/// that can be trusted to say what was on the wire.
+std::string raw_target_path(const httplib::Request& req) {
+    std::string target = req.target;
+    if (const size_t query = target.find('?'); query != std::string::npos) target.erase(query);
+    return target;
+}
+
+std::vector<std::string> split_path(const std::string& path) {
+    std::vector<std::string> segments;
+    size_t start = 0;
+    while (start <= path.size()) {
+        const size_t slash = path.find('/', start);
+        const size_t end = slash == std::string::npos ? path.size() : slash;
+        segments.emplace_back(path.substr(start, end - start));
+        if (slash == std::string::npos) break;
+        start = slash + 1;
+    }
+    return segments;
+}
+
+/// Resolve one already-prefix-stripped path into a routing decision.
+///
+/// `hosted_protocol` is this server's application protocol name, empty when it
+/// declared none -- such a server has no routing key to namespace its methods
+/// under, so it keeps serving them at the flat `{prefix}/{method}` shape.
+RoutedRequest route_path(const std::string& path, const std::string& hosted_protocol,
+                         bool hosts_identity) {
+    RoutedRequest routed;
+    auto not_found = [&]() {
+        routed.error = RouteError::NOT_FOUND;
+        return routed;
+    };
+
+    auto segments = split_path(path);
+    if (segments.empty() || segments.front().empty()) return not_found();
+
+    auto take_suffix = [&](size_t index) {
+        if (index >= segments.size()) return true;
+        if (index + 1 != segments.size()) return false;
+        if (segments[index] == "init") {
+            routed.is_init = true;
+            return true;
+        }
+        if (segments[index] == "exchange") {
+            routed.is_exchange = true;
+            return true;
+        }
+        return false;
+    };
+
+    // Reserved names stay flat: they belong to the server rather than to any
+    // one protocol, so there is no protocol to namespace them under.
+    if (is_reserved_method(segments.front())) {
+        routed.target = RouteTarget::RESERVED;
+        routed.method = segments.front();
+        if (!take_suffix(1)) return not_found();
+        return routed;
+    }
+
+    if (segments.size() < 2 || segments[1].empty()) return not_found();
+    const std::string& protocol = segments.front();
+    // Refused without decoding, and before the grammar check: the charset never
+    // requires percent-encoding, so a percent sign is a bug or an attempt to
+    // have the edge and the worker read different strings.  Compare raw bytes;
+    // never decoded-against-raw.
+    //
+    // Given the grammar below, this is strictly redundant -- `%` is not in
+    // `[A-Za-z0-9_.]`, so any name carrying one is refused either way, and no
+    // test can separate the two.  It is kept because it is the check that
+    // survives the grammar widening, and because the thing that actually has
+    // to be right here is the *input*: route on the raw target, since a
+    // decoded path would have turned `%52outeProbe` into a name nobody sent
+    // long before either check ran.
+    if (protocol.find('%') != std::string::npos) return not_found();
+    if (!is_protocol_name(protocol)) return not_found();
+
+    routed.protocol = protocol;
+    routed.method = segments[1];
+    if (!take_suffix(2)) return not_found();
+
+    if (protocol == kReflectionProtocolName) {
+        routed.target = RouteTarget::REFLECTION;
+    } else if (protocol == kIdentityProtocolName && hosts_identity) {
+        routed.target = RouteTarget::IDENTITY;
+    } else if (!hosted_protocol.empty() && protocol == hosted_protocol) {
+        routed.target = RouteTarget::APPLICATION;
+    } else {
+        routed.error = RouteError::PROTOCOL_NOT_SUPPORTED;
+    }
+    // A reserved name under a protocol namespace is deliberately *not* refused
+    // here.  `{prefix}/{protocol}/__describe__` is a protocol that is hosted
+    // and a method it does not have, which is `method_not_implemented` -- the
+    // documented capability-probe answer, and what the reference gives.
+    // Refusing it as "no route" would collapse that distinction one layer too
+    // early; the method lookup makes it, by requiring the name's kind to match
+    // the route's.
+    return routed;
+}
+
+/// The associated data a stream's tokens are sealed under.
+///
+/// The identity that opened the stream, plus the protocol it was routed to.
+/// Binding the protocol is what makes a cross-protocol continuation fail the
+/// tag check and be refused exactly as an invalid token, rather than resuming
+/// somebody else's cursor under a policy that was never applied to it.
+std::string stream_aad(const std::string& identity_aad, const std::string& protocol) {
+    return identity_aad + std::string(1, '\x1f') + protocol;
+}
 
 std::optional<int64_t> min_limit(std::optional<int64_t> left, std::optional<int64_t> right) {
     if (left && right) return std::min(*left, *right);
@@ -1094,26 +1270,26 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
         return;
     }
 
-    // Route: /{method}, /{method}/init, /{method}/exchange.
-    std::string path = strip_prefix(req.path);
+    // Route: {protocol}/{method}[/init|/exchange], or a flat reserved __name__.
+    // On the *raw* target, never `req.path` — see raw_target_path().
+    std::string path = strip_prefix(raw_target_path(req));
     if (!path.empty() && path[0] == '/') path.erase(0, 1);
-    bool is_init = false, is_exchange_ep = false;
-    std::string method_name = path;
-    if (path.size() > 5 && path.substr(path.size() - 5) == "/init") {
-        is_init = true;
-        method_name = path.substr(0, path.size() - 5);
-    } else if (path.size() > 9 && path.substr(path.size() - 9) == "/exchange") {
-        is_exchange_ep = true;
-        method_name = path.substr(0, path.size() - 9);
-    }
+    const RoutedRequest routed = route_path(path, rpc_.protocol_name(), rpc_.identity() != nullptr);
+    const bool is_init = routed.is_init;
+    const bool is_exchange_ep = routed.is_exchange;
+    const std::string& method_name = routed.method;
 
-    auto fail = [&](int status, const char* type, const std::string& msg) {
+    auto fail = [&](int status, const char* type, const std::string& msg, const char* kind = "") {
         res.status = status;
         res.set_header(RPC_ERROR_HEADER, "true");
-        set_arrow_content(req, res,
-                          error_body(empty_schema(), type, msg, rpc_.server_id(), request_id));
+        set_arrow_content(
+            req, res, error_body(empty_schema(), type, msg, rpc_.server_id(), request_id, kind));
     };
 
+    // The client's declared response budget is a header-level contract, checked
+    // before anything is dispatched -- and therefore before routing, so that a
+    // request which is malformed in both ways is told about the one it can fix
+    // without guessing a route first.
     std::optional<int64_t> accepted_response_limit;
     if (const auto error = parse_accepted_response_limit(req, accepted_response_limit)) {
         fail(400, "ValueError", *error);
@@ -1126,6 +1302,19 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
                                   ? std::optional<int64_t>(cfg_.preferred_response_bytes)
                                   : std::nullopt;
     preferred_response = min_limit(preferred_response, response_limit);
+
+    if (routed.error == RouteError::NOT_FOUND) {
+        // The path itself is not addressable. The offending segment is
+        // deliberately absent from the message: it is request-supplied, and a
+        // routing failure must not be a way to get a chosen string into a log.
+        fail(404, "AttributeError", "No RPC route for this path");
+        return;
+    }
+    if (routed.error == RouteError::PROTOCOL_NOT_SUPPORTED) {
+        fail(404, "ProtocolNotSupportedError", "This server does not host the named protocol",
+             ERROR_KIND_PROTOCOL_NOT_SUPPORTED);
+        return;
+    }
 
     auto body_buf = arrow::Buffer::Wrap(request_body.data(), request_body.size());
     auto reader = std::make_shared<arrow::io::BufferReader>(body_buf);
@@ -1156,6 +1345,33 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
     auto& batch = first.batch;
     auto& custom_metadata = first.custom_metadata;
 
+    // The two carriers must agree.  The metadata field is canonical -- it is the
+    // only one on stdio, unix and named pipes -- and the path segment is its
+    // required projection, there so an edge device can act on the protocol
+    // without parsing Arrow.  Left unchecked this is the
+    // Content-Length/Transfer-Encoding shape: the edge applies policy to one
+    // protocol while the worker dispatches another.
+    //
+    // *Absent* is accepted here, and only here.  The plan says the key is
+    // required on every request; on HTTP the path segment already resolved the
+    // binding, and the shared conformance harness actively tests the permissive
+    // reading -- its recovery probe requires a 200 for a namespaced request
+    // carrying no routing key.  What that gives up is stated plainly in the
+    // spec: requiring the key is what would make a *path rewrite* by an
+    // intermediary detectable, since an intermediary that rewrites the path
+    // cannot touch the metadata.  Accepting absent means routing on the
+    // projection alone in exactly that case.  Raw transports still require it,
+    // where metadata is the only carrier.
+    if (routed.target != RouteTarget::RESERVED) {
+        const std::string wire_protocol = get_metadata_value(custom_metadata, keys::PROTOCOL);
+        if (!wire_protocol.empty() && wire_protocol != routed.protocol) {
+            fail(400, "ProtocolNotSupportedError",
+                 "Request routing key disagrees with the protocol in its path",
+                 ERROR_KIND_PROTOCOL_NOT_SUPPORTED);
+            return;
+        }
+    }
+
     // Stream /exchange continuations carry the state tokens instead of the
     // request_version metadata, so only the initial request is version-checked.
     // The application protocol version rides the same metadata and is gated on
@@ -1177,12 +1393,67 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
             fail(400, "VersionError", "Unsupported or missing request version, expected '1'.");
             return;
         }
-        if (method_name.rfind("__", 0) != 0) {
+        // The gate compares against the *application* protocol's declared
+        // version.  Reflection is exempt because it is what a
+        // version-mismatched client calls to learn what mismatched; identity is
+        // exempt because it declares no version of its own, so gating it would
+        // refuse identity calls over a disagreement that says nothing about
+        // them.
+        if (routed.target == RouteTarget::APPLICATION) {
             if (auto reason = rpc_.protocol_version_error(custom_metadata); !reason.empty()) {
                 fail(400, "ProtocolVersionError", reason);
                 return;
             }
         }
+    }
+
+    // ---- Co-hosted framework protocols ----
+    //
+    // Reached the same way as anything else: by routing key, through the same
+    // dispatch, subject to the same caps.  Reflection in particular is not a
+    // special path -- it is `{prefix}/vgi_rpc.Reflection.v1/{method}`.
+    if (routed.target == RouteTarget::REFLECTION || routed.target == RouteTarget::IDENTITY) {
+        const bool reflection = routed.target == RouteTarget::REFLECTION;
+        std::set<std::string> offered;
+        if (reflection) {
+            offered = {"describe", "list_protocols"};
+        } else {
+            offered = rpc_.identity()->offered_methods();
+        }
+        // Hosted-but-absent is 404 `method_not_implemented`, deliberately
+        // distinct from an unhosted protocol: a client probing for an optional
+        // method must be able to tell the two apart.  Both framework protocols
+        // are unary-only, so a stream endpoint under one is equally absent.
+        if (offered.count(method_name) == 0 || is_init || is_exchange_ep) {
+            fail(404, "MethodNotImplementedError", "Protocol has no such method",
+                 ERROR_KIND_METHOD_NOT_IMPLEMENTED);
+            return;
+        }
+
+        auto buf_out = unwrap(arrow::io::BufferOutputStream::Create());
+        bool errored = false;
+        if (reflection) {
+            rpc_.serve_reflection(buf_out, method_name, batch, request_id, &errored);
+        } else {
+            rpc_.serve_identity(buf_out, method_name, batch, request_id, resolved.auth, &errored);
+        }
+        std::string body = buffer_to_string(unwrap(buf_out->Finish()));
+        if (response_limit && static_cast<int64_t>(body.size()) > *response_limit) {
+            res.status = 200;
+            res.set_header(RPC_ERROR_HEADER, "true");
+            set_arrow_content(
+                req, res,
+                error_body(empty_schema(), "ResponseTooLargeError",
+                           "method '" + method_name + "' exceeds max_response_bytes (" +
+                               std::to_string(body.size()) + " > " +
+                               std::to_string(*response_limit) + ")",
+                           rpc_.server_id(), request_id));
+            return;
+        }
+        res.status = 200;
+        if (errored) res.set_header(RPC_ERROR_HEADER, "true");
+        set_arrow_content(req, res, std::move(body));
+        return;
     }
 
     // Synthetic method: vends upload/download URL pairs so a client can
@@ -1239,9 +1510,16 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
         return;
     }
 
+    // One method, one address.  A reserved `__name__` resolves only on the flat
+    // server-level route and an application method only under its protocol, so
+    // neither is reachable by the other's shape.
     auto it = rpc_.methods().find(method_name);
-    if (it == rpc_.methods().end()) {
-        fail(404, "AttributeError", "Unknown method: '" + method_name + "'");
+    const bool addressable =
+        it != rpc_.methods().end() &&
+        IsApplicationMethod(method_name) == (routed.target == RouteTarget::APPLICATION);
+    if (!addressable) {
+        fail(404, "MethodNotImplementedError", "Unknown method: '" + method_name + "'",
+             ERROR_KIND_METHOD_NOT_IMPLEMENTED);
         return;
     }
     const auto& method_info = it->second;
@@ -1253,6 +1531,13 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
         }
     }
     Request request(batch, custom_metadata);
+
+    // What a stream's tokens are sealed under: the identity that opened it,
+    // plus the protocol it was routed to.  A continuation must stay on the
+    // protocol its stream started on, and binding the protocol here is what
+    // makes a cross-protocol one fail the tag check rather than resume a
+    // cursor under a policy that was never applied to it.
+    const std::string stream_scope = stream_aad(aad, routed.protocol);
 
     auto log_sink = std::make_shared<LogSink>(rpc_.server_id(), request_id);
     CallContext ctx(log_sink, rpc_.server_id(), request_id, TransportKind::HTTP);
@@ -1394,7 +1679,8 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
         const std::string call_token = crypto::base64url_encode(
             // NUL-separated, built explicitly: `name + "\x00" + cursor` would
             // append an empty C string and silently drop the separator.
-            crypto::aead_seal(cfg_.token_key, method_name + std::string(1, '\0') + cursor, aad));
+            crypto::aead_seal(cfg_.token_key, method_name + std::string(1, '\0') + cursor,
+                              stream_scope));
         auto output_schema = stream.output_schema;
         auto input_schema = stream.input_schema;
         // Asked of the state the factory built, not of how the method was
@@ -1439,7 +1725,7 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
                 session->input_schema = input_schema;
                 session->is_exchange = true;
                 session->method_name = method_name;
-                session->aad = aad;
+                session->aad = stream_scope;
                 session->response_limit_bytes = response_limit;
                 session->preferred_response_bytes = preferred_response;
                 std::lock_guard<std::mutex> registry_lock(streams_mutex_);
@@ -1467,7 +1753,7 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
                     session->input_schema = input_schema;
                     session->is_exchange = false;
                     session->method_name = method_name;
-                    session->aad = aad;
+                    session->aad = stream_scope;
                     session->response_limit_bytes = response_limit;
                     session->preferred_response_bytes = preferred_response;
                     std::lock_guard<std::mutex> registry_lock(streams_mutex_);
@@ -1547,9 +1833,13 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
         fail(400, "ProtocolError", "Unknown or missing stream state token");
         return;
     }
-    // A stream is bound to the identity that opened it for the same reason a
-    // session is: otherwise a second caller could resume the first's cursor.
-    if (sess->aad != aad) {
+    // A stream is bound to the identity *and the protocol* it was opened
+    // under.  Identity, for the same reason a session is: otherwise a second
+    // caller could resume the first's cursor.  Protocol, because a
+    // continuation must stay where its stream started -- and this check runs
+    // before the call-state cache lookup below, so the cache-hit path, where
+    // the call token is never opened at all, is covered by it too.
+    if (sess->aad != stream_scope) {
         fail(400, "ProtocolError", "Unknown or missing stream state token");
         return;
     }
@@ -1572,7 +1862,7 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
         bool resolved = false;
         if (!call_token.empty()) {
             if (auto raw = crypto::base64url_decode(call_token)) {
-                if (auto opened = crypto::aead_open(cfg_.token_key, *raw, aad)) {
+                if (auto opened = crypto::aead_open(cfg_.token_key, *raw, stream_scope)) {
                     const size_t sep = opened->find('\0');
                     resolved = sep != std::string::npos &&
                                opened->substr(0, sep) == sess->method_name &&
@@ -1962,6 +2252,7 @@ void HttpServer::run() {
         return;
     }
     std::cout << "PORT:" << bound << std::endl;
+    if (cfg_.on_listen) cfg_.on_listen(bound);
     svr.listen_after_bind();
 }
 

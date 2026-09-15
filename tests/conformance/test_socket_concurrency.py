@@ -10,7 +10,7 @@ import sys
 import tempfile
 from concurrent.futures import ThreadPoolExecutor, wait
 from contextlib import ExitStack
-from typing import Protocol
+from typing import ClassVar, Protocol
 
 import pytest
 from conftest import _spawn_listener
@@ -18,6 +18,12 @@ from vgi_rpc.rpc import tcp_connect, unix_connect
 
 
 class _ConcurrencyService(Protocol):
+    # The worker hosts every probe method under its one application protocol,
+    # so this must name that protocol rather than itself.  Left undeclared the
+    # reference derives the routing key from the class name and the worker --
+    # correctly -- refuses a protocol it does not host.
+    protocol_name: ClassVar[str] = "ConformanceService"
+
     protocol_version = "2.0.0"
 
     def rendezvous(self, tag: int) -> int: ...

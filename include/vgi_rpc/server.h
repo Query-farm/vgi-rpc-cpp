@@ -100,8 +100,25 @@ public:
     // pipe, which is also conformant.
     ServerBuilder& enable_transport_options(bool enabled = true);
 
+    // Declare this server's application protocol -- its routing key.
+    //
+    // Requests name the protocol they address and dispatch resolves the pair
+    // `(protocol, method)`, so this is what makes the application's methods
+    // addressable: over HTTP they are served at `{prefix}/{protocol}/{method}`,
+    // and on the raw transports a request must carry the name in
+    // `vgi_rpc.protocol`.  The major version belongs in the name
+    // (`MyService.v2`), which is what lets two majors be served side by side.
+    //
+    // A server that declares none keeps the pre-multi-service shape: flat
+    // `{prefix}/{method}` routes, and no routing key required.  There is then
+    // exactly one namespace and no name for it -- workable, but an
+    // intermediary that rebuilds a request cannot be told it landed in the
+    // wrong place.
+    ServerBuilder& protocol(std::string protocol_name);
+
     // Enable __describe__ introspection.
-    // The describe response is a snapshot captured at build() time.
+    // The describe response is a snapshot captured at build() time.  Passing a
+    // name here also declares it as the routing key, as protocol() does.
     ServerBuilder& enable_describe(const std::string& protocol_name = "");
 
     // Host vgi_rpc.Identity.v1.  Absent by default, and absent rather than
@@ -182,20 +199,27 @@ public:
     const std::string& protocol_name() const noexcept { return protocol_name_; }
 
     /// Serve one call to the co-hosted reflection protocol.
+    ///
+    /// `errored`, when supplied, reports whether the reply carries an error
+    /// batch rather than a result. The raw transports do not need it -- the
+    /// error rides the stream either way -- but HTTP answers 200 for both and
+    /// distinguishes them only by the `X-VGI-RPC-Error` header.
     bool serve_reflection(const std::shared_ptr<arrow::io::OutputStream>& output,
                           const std::string& method_name,
                           const std::shared_ptr<arrow::RecordBatch>& request_batch,
-                          const std::string& request_id);
+                          const std::string& request_id, bool* errored = nullptr);
 
     /// Serve one call to the co-hosted identity protocol.
     ///
     /// Takes the connection's AuthContext rather than reading one: every guard
     /// here turns on *who is asking*, and a transport that cannot say has no
     /// authenticated principal, which is the answer that fails closed.
+    /// `errored` reports an error reply, for the same reason as above.
     bool serve_identity(const std::shared_ptr<arrow::io::OutputStream>& output,
                         const std::string& method_name,
                         const std::shared_ptr<arrow::RecordBatch>& request_batch,
-                        const std::string& request_id, const AuthContext& auth);
+                        const std::string& request_id, const AuthContext& auth,
+                        bool* errored = nullptr);
 
     /// The hosted identity implementation, or null when the protocol is absent.
     const std::shared_ptr<IdentityImpl>& identity() const noexcept { return identity_; }

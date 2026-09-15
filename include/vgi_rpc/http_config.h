@@ -156,6 +156,15 @@ struct HttpConfig {
     int64_t hosting_max_request_bytes = -1;
     int64_t hosting_max_response_bytes = -1;
     int64_t preferred_response_bytes = -1;
+
+    // Called once with the bound port, before the accept loop starts.
+    //
+    // `port = 0` picks a free one, and printing `PORT:<n>` to stdout is a CLI
+    // affordance rather than an API: an embedder -- or a test -- that starts
+    // the server on a background thread otherwise has no way to learn which
+    // port it got.  Runs on the serving thread; keep it short.  Stays at the
+    // end for positional aggregate source compatibility.
+    std::function<void(int)> on_listen;
 };
 
 }  // namespace vgi_rpc

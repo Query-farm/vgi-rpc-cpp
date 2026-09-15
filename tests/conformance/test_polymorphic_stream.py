@@ -11,7 +11,7 @@ import shutil
 import sys
 import tempfile
 from collections.abc import Iterator
-from typing import Protocol
+from typing import ClassVar, Protocol
 
 import pyarrow as pa
 import pytest
@@ -29,6 +29,12 @@ from vgi_rpc.rpc import (
 
 
 class _PolymorphicService(Protocol):
+    # The worker hosts every probe method under its one application protocol,
+    # so this must name that protocol rather than itself.  Left undeclared the
+    # reference derives the routing key from the class name and the worker --
+    # correctly -- refuses a protocol it does not host.
+    protocol_name: ClassVar[str] = "ConformanceService"
+
     def polymorphic_stream(self, as_producer: bool) -> Stream[StreamState]: ...
 
 

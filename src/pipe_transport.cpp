@@ -168,8 +168,10 @@ void Server::run() {
 bool Server::serve_reflection(const std::shared_ptr<arrow::io::OutputStream>& output,
                               const std::string& method_name,
                               const std::shared_ptr<arrow::RecordBatch>& request_batch,
-                              const std::string& request_id) {
+                              const std::string& request_id, bool* errored) {
+    if (errored != nullptr) *errored = false;
     auto fail = [&](const std::string& type, const std::string& message) {
+        if (errored != nullptr) *errored = true;
         auto err = Result::error(empty_schema(), type, message, server_id_, request_id);
         write_ipc_stream(output, empty_schema(), {err.annotated_batch()});
         VGI_RPC_THROW_NOT_OK(output->Flush());
@@ -347,6 +349,57 @@ bool Server::serve_one_with_state(const std::shared_ptr<arrow::io::InputStream>&
     // identity calls over a version disagreement that says nothing about them.
     if (get_metadata_value(custom_metadata, keys::PROTOCOL) == kIdentityProtocolName) {
         return serve_identity(output, method_name, batch, request_id, auth);
+    }
+
+    // 3c. The routing key, required here.
+    //
+    // On stdio, unix and named pipes the metadata field is the *only* carrier,
+    // so an absent key really is unroutable -- and with reflection and identity
+    // co-hosted, letting it through would land the request on whichever
+    // protocol the dispatcher reached first rather than telling the caller.
+    // That is the mis-routing the rule exists to prevent, and it is why the
+    // answer here differs from HTTP's: there the path segment has already
+    // resolved the binding, so absent is accepted (see handle_rpc, and spec
+    // §5c for what that relaxation gives up).
+    //
+    // The three answers are distinct because a client depends on the
+    // difference: no key at all, a key naming a protocol this server does not
+    // host, and a hosted protocol missing the method are three different
+    // things to do about it.
+    //
+    // Reserved `__name__` methods are exempt: they are server-level surface
+    // owned by no protocol, so there is nothing for them to name.  So is a
+    // server that declared no protocol name -- it has no key to match, and
+    // exactly one namespace with no name for it.  `ServerBuilder::protocol()`
+    // declares one and turns the check on.
+    if (IsApplicationMethod(method_name) && !protocol_name_.empty()) {
+        const std::string wire_protocol = get_metadata_value(custom_metadata, keys::PROTOCOL);
+        if (wire_protocol.empty()) {
+            auto error_result = Result::error(
+                empty_schema(), "ProtocolNotSpecifiedError",
+                "Request carries no 'vgi_rpc.protocol' routing key. Every request must name "
+                "the protocol it addresses. This server hosts: ['" +
+                    protocol_name_ + "', '" + kReflectionProtocolName + "']" +
+                    (identity_ != nullptr ? std::string(" and '") + kIdentityProtocolName + "'"
+                                          : std::string()) +
+                    ".",
+                server_id_, request_id, ERROR_KIND_PROTOCOL_NOT_SPECIFIED);
+            write_ipc_stream(output, empty_schema(), {error_result.annotated_batch()});
+            VGI_RPC_THROW_NOT_OK(output->Flush());
+            return true;
+        }
+        if (wire_protocol != protocol_name_) {
+            // The request-supplied name is deliberately not echoed: a routing
+            // failure must not be a way to get a chosen string into a log.
+            auto error_result =
+                Result::error(empty_schema(), "ProtocolNotSupportedError",
+                              "This server does not host the named protocol. It hosts: '" +
+                                  protocol_name_ + "'.",
+                              server_id_, request_id, ERROR_KIND_PROTOCOL_NOT_SUPPORTED);
+            write_ipc_stream(output, empty_schema(), {error_result.annotated_batch()});
+            VGI_RPC_THROW_NOT_OK(output->Flush());
+            return true;
+        }
     }
 
     // 4. Application protocol version gate.

@@ -125,8 +125,16 @@ ServerBuilder& ServerBuilder::server_id(std::string id) {
     return *this;
 }
 
+ServerBuilder& ServerBuilder::protocol(std::string protocol_name) {
+    protocol_name_ = std::move(protocol_name);
+    return *this;
+}
+
 ServerBuilder& ServerBuilder::enable_describe(const std::string& protocol_name) {
     describe_enabled_ = true;
+    // Kept assigning, including the empty default: introspection and routing
+    // have always been declared together here, and quietly preserving a name a
+    // previous call set would make `enable_describe()` mean two things.
     protocol_name_ = protocol_name;
     return *this;
 }

@@ -244,7 +244,7 @@ TEST_CASE("refusal precedes the resolver") {
 // took, tell it even when the message is identical.
 TEST_CASE("authorization is checked before the subject credential is touched") {
     IdentityImpl impl(introspect_only());
-    const std::string oversize(kMaxTokenChars + 1, 'x');
+    const std::string oversize(kMaxTokenBytes + 1, 'x');
 
     for (const std::string& token : {std::string(""), oversize, std::string("aaa.bbb.ccc")}) {
         CHECK_THROWS_AS(impl.introspect_token(token, make_auth("mallory")),
@@ -284,7 +284,7 @@ TEST_CASE("introspection rejections are uniform") {
     // Unknown, malformed and over-long are one answer.  Distinguishing them
     // would confirm that a guessed credential exists.
     IdentityImpl impl(introspect_only());
-    const std::string oversize(kMaxTokenChars + 1, 'x');
+    const std::string oversize(kMaxTokenBytes + 1, 'x');
     for (const std::string& token : {std::string(""), std::string("unknown"), oversize}) {
         try {
             impl.introspect_token(token, make_auth("proxy"));
@@ -869,4 +869,143 @@ TEST_CASE("identity is describable through reflection when hosted") {
     REQUIRE(index >= 0);
     CHECK_THAT(missing.batches[0].custom_metadata->value(index),
                ContainsSubstring("does not host protocol"));
+}
+
+// ── The guards, probed so a rejection can only have come from a guard ──
+//
+// Uniform rejections make the obvious guard test vacuous.  An over-long
+// credential is also an unknown one, so probing `introspect_token` with a
+// credential the resolver happens not to know cannot distinguish "the cap
+// refused it" from "the cap let it through and the resolver refused it".  Both
+// answer `token_unresolved`, identically, by design.
+//
+// So: a hook that resolves *anything*.  A rejection can then only have come
+// from a guard, and the second assertion -- that the hook was never reached --
+// is the half that fails when a guard is skipped.  Each case below was
+// mutation-checked by breaking its guard on purpose and confirming the test
+// went red.
+
+namespace {
+
+/// Options whose resolver succeeds for every credential, recording each one.
+IdentityOptions resolves_anything(std::vector<std::string>& seen) {
+    IdentityOptions options;
+    options.resolve_token = [&seen](const std::string& token) -> std::optional<TokenIdentity> {
+        seen.push_back(token);
+        return TokenIdentity{"resolved", "any-key", 300};
+    };
+    options.introspect_principals = {"proxy"};
+    return options;
+}
+
+/// Options whose minter succeeds for every caller, recording each one.
+IdentityOptions mints_for_anyone(std::vector<std::string>& seen) {
+    IdentityOptions options;
+    options.mint_grant = [&seen](const std::string& principal, const std::string&,
+                                 const std::vector<std::string>&,
+                                 int64_t ttl_seconds) -> IssuedGrant {
+        seen.push_back(principal);
+        return IssuedGrant{"grant", now_seconds() + static_cast<double>(ttl_seconds), "g"};
+    };
+    return options;
+}
+
+}  // namespace
+
+TEST_CASE("the JWS trap refuses, and the resolver is never reached") {
+    std::vector<std::string> seen;
+    IdentityImpl impl(resolves_anything(seen));
+
+    // Proves the probe is live: an opaque credential of the same length does
+    // resolve, so a refusal below is the guard and not the fixture.
+    CHECK(impl.introspect_token("aaa-bbb-ccc", make_auth("proxy")).principal == "resolved");
+    seen.clear();
+
+    CHECK_THROWS_AS(impl.introspect_token("aaa.bbb.ccc", make_auth("proxy")), TokenUnresolvedError);
+    CHECK(seen.empty());
+}
+
+TEST_CASE("the length cap refuses, and the resolver is never reached") {
+    std::vector<std::string> seen;
+    IdentityImpl impl(resolves_anything(seen));
+
+    CHECK(impl.introspect_token(std::string(kMaxTokenBytes, 'x'), make_auth("proxy")).principal ==
+          "resolved");
+    seen.clear();
+
+    CHECK_THROWS_AS(impl.introspect_token(std::string(kMaxTokenBytes + 1, 'x'), make_auth("proxy")),
+                    TokenUnresolvedError);
+    CHECK(seen.empty());
+}
+
+TEST_CASE("the length cap counts UTF-8 bytes, not codepoints") {
+    // The unit is what the ports disagreed about: codepoints in Python and
+    // Rust, UTF-16 code units in Java, C# and TypeScript, bytes in Go and C++.
+    // Bytes won, so a credential that is over the cap in bytes and comfortably
+    // under it in codepoints must be refused -- otherwise the same credential
+    // is admitted by one port and refused by the next, which is a guard that
+    // does not hold at the boundary between them.
+    std::vector<std::string> seen;
+    IdentityImpl impl(resolves_anything(seen));
+
+    // U+00E9, two bytes each.  Half the cap in codepoints, one byte over it.
+    std::string multibyte;
+    for (size_t i = 0; i < kMaxTokenBytes / 2; ++i) multibyte += "\xc3\xa9";
+    multibyte += "x";
+    CHECK(multibyte.size() == kMaxTokenBytes + 1);
+
+    CHECK_THROWS_AS(impl.introspect_token(multibyte, make_auth("proxy")), TokenUnresolvedError);
+    CHECK(seen.empty());
+
+    // And exactly at the cap in bytes it still resolves, so the case above is
+    // the cap and not some unrelated objection to non-ASCII.
+    multibyte.pop_back();
+    CHECK(multibyte.size() == kMaxTokenBytes);
+    CHECK(impl.introspect_token(multibyte, make_auth("proxy")).principal == "resolved");
+}
+
+TEST_CASE("the allowlist refuses, and the resolver is never reached") {
+    std::vector<std::string> seen;
+    IdentityImpl impl(resolves_anything(seen));
+
+    CHECK_THROWS_AS(impl.introspect_token("anything", make_auth("mallory")),
+                    IntrospectionRefusedError);
+    CHECK(seen.empty());
+
+    // An unauthenticated caller is off the allowlist however it is spelled.
+    CHECK_THROWS_AS(impl.introspect_token("anything", make_auth("proxy", /*authenticated=*/false)),
+                    IntrospectionRefusedError);
+    CHECK(seen.empty());
+}
+
+TEST_CASE("the rate limit refuses, and the resolver is never reached") {
+    std::vector<std::string> seen;
+    auto options = resolves_anything(seen);
+    options.introspect_rate_limit = 1;
+    IdentityImpl impl(std::move(options));
+
+    CHECK(impl.introspect_token("first", make_auth("proxy")).principal == "resolved");
+    CHECK(seen.size() == 1);
+
+    CHECK_THROWS_AS(impl.introspect_token("second", make_auth("proxy")), IntrospectionRefusedError);
+    CHECK(seen.size() == 1);
+}
+
+TEST_CASE("the freshness check refuses, and the minter is never reached") {
+    std::vector<std::string> seen;
+    IdentityImpl impl(mints_for_anyone(seen));
+
+    // Live probe: a recently authenticated caller does get a grant.
+    CHECK(impl.issue_grant("p", {}, 60, make_auth("alice", true, now_seconds() - 10)).token ==
+          "grant");
+    CHECK(seen == std::vector<std::string>{"alice"});
+    seen.clear();
+
+    // No auth_time at all, and an auth_time too old: both refused, and neither
+    // reaches the minter.
+    CHECK_THROWS_AS(impl.issue_grant("p", {}, 60, make_auth("alice")), StaleAuthError);
+    CHECK(seen.empty());
+    CHECK_THROWS_AS(impl.issue_grant("p", {}, 60, make_auth("alice", true, now_seconds() - 5000)),
+                    StaleAuthError);
+    CHECK(seen.empty());
 }

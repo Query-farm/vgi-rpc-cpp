@@ -2,13 +2,28 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """Quick conformance test against the C++ worker."""
+import importlib.util
 import os
 import sys
-_vgi_rpc_path = os.environ.get(
-    "VGI_RPC_PYTHON_PATH",
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "vgi-rpc"),
-)
-sys.path.insert(0, _vgi_rpc_path)
+
+# Prefer whatever `vgi_rpc` the configured interpreter already resolves -- an
+# installed or editable reference is the one the rest of the conformance
+# tooling drives, and it is kept current.  The sibling-checkout path is a
+# *fallback* for an interpreter that has none, not an override: inserted
+# unconditionally it shadowed an up-to-date install with whatever release
+# happened to be checked out next door, and the suite then silently tested the
+# worker against a stale protocol.  An explicit VGI_RPC_PYTHON_PATH still wins,
+# because someone who sets it means it.
+_explicit_path = os.environ.get("VGI_RPC_PYTHON_PATH")
+if _explicit_path:
+    sys.path.insert(0, _explicit_path)
+    _vgi_rpc_path = _explicit_path
+else:
+    _vgi_rpc_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "vgi-rpc")
+    if importlib.util.find_spec("vgi_rpc") is None:
+        sys.path.insert(0, _vgi_rpc_path)
+    else:
+        _vgi_rpc_path = os.path.dirname(importlib.util.find_spec("vgi_rpc").origin)
 
 try:
     from vgi_rpc.rpc import SubprocessTransport, RpcConnection, AnnotatedBatch, RpcError

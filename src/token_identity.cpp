@@ -252,7 +252,7 @@ void reject_jws_shaped(const std::string& token) {
     // The length cap stays on the *original*, because the thing being bounded
     // is what a resolver would be handed, not what is left after trimming.
     const std::string_view candidate = Trimmed(token);
-    if (candidate.empty() || token.size() > kMaxTokenChars || IsJwsShaped(candidate)) {
+    if (candidate.empty() || token.size() > kMaxTokenBytes || IsJwsShaped(candidate)) {
         throw TokenUnresolvedError("unresolved");
     }
 }
@@ -446,9 +446,11 @@ std::unordered_map<std::string, MethodInfo> IdentityMethods(const std::set<std::
 bool Server::serve_identity(const std::shared_ptr<arrow::io::OutputStream>& output,
                             const std::string& method_name,
                             const std::shared_ptr<arrow::RecordBatch>& request_batch,
-                            const std::string& request_id, const AuthContext& auth) {
+                            const std::string& request_id, const AuthContext& auth, bool* errored) {
+    if (errored != nullptr) *errored = false;
     auto fail = [&](const std::string& type, const std::string& message,
                     const std::string& kind = "") {
+        if (errored != nullptr) *errored = true;
         auto err = Result::error(empty_schema(), type, message, server_id_, request_id, kind);
         write_ipc_stream(output, empty_schema(), {err.annotated_batch()});
         VGI_RPC_THROW_NOT_OK(output->Flush());
