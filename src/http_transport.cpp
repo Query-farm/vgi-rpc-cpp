@@ -81,6 +81,13 @@ constexpr const char* SESSION_HEADER = "VGI-Session";
 constexpr const char* SESSION_ACCEPT_HEADER = "VGI-Session-Accept";
 constexpr const char* SESSION_CLOSE_HEADER = "VGI-Session-Close";
 constexpr const char* PRINCIPAL_HEADER = "X-Conformance-Principal";
+// Carries the `auth_time` claim for the identity conformance fixture, placed in
+// the claim map **verbatim and unparsed**.  Parsing it here and dropping what
+// will not parse would collapse "the credential carries an unusable auth_time"
+// into "it carries none at all" -- two different refusals with the same
+// `stale_auth` kind, so the test would stay green while the property it names
+// went untested.  The guard is what parses; the fixture only transports.
+constexpr const char* AUTH_TIME_HEADER = "X-Conformance-Auth-Time";
 constexpr const char* AUTH_REASON_REQUEST_HEADER = "X-Conformance-Auth-Reason";
 
 // Fixture constants for the token-introspection group.  The shared suite posts
@@ -646,7 +653,8 @@ std::optional<std::string> gzip_compress(const std::string& body) {
 constexpr const char* kAllowedRequestHeaders =
     "content-type, accept, accept-encoding, authorization, x-request-id, "
     "x-vgi-accept-encoding, vgi-session, vgi-session-accept, vgi-proxy-proof, "
-    "vgi-accept-max-response-bytes, x-conformance-principal, x-conformance-auth-reason";
+    "vgi-accept-max-response-bytes, x-conformance-principal, x-conformance-auth-time, "
+    "x-conformance-auth-reason";
 
 // Headers that ride failure and session responses, which OPTIONS /health
 // never advertises.  A check derived from advertisements structurally cannot
@@ -1074,6 +1082,14 @@ AuthIdentity HttpServer::identify(const httplib::Request& req) const {
             id.authenticated = true;
             id.domain = "conformance";
             id.principal = principal;
+            // `vgi_rpc.Identity.v1`'s freshness guard reads this claim, and the
+            // identity conformance fixture is the only way six ports get a
+            // deterministic `auth_time` without each standing up an IdP.
+            // Absent header means no claim at all -- which is a different
+            // refusal from an unusable one, and the guard tells them apart.
+            if (req.has_header(AUTH_TIME_HEADER)) {
+                id.claims["auth_time"] = req.get_header_value(AUTH_TIME_HEADER);
+            }
         }
     }
     return id;
@@ -1085,7 +1101,10 @@ HttpServer::ResolvedHttpIdentity HttpServer::resolve_http_identity(
     AuthContext auth = AuthContext::anonymous();
     auth.authenticated = application.authenticated;
     auth.domain = application.domain;
-    if (application.authenticated) auth.principal = application.principal;
+    if (application.authenticated) {
+        auth.principal = application.principal;
+        auth.claims = application.claims;
+    }
     if (cfg_.peer_identity_providers.empty()) return {std::move(auth), PeerEvidenceSet{}};
 
     if (cfg_.peer_identity_resolution_timeout <= std::chrono::milliseconds::zero()) {

@@ -45,6 +45,12 @@ struct AuthIdentity {
     bool authenticated = false;
     std::string domain;
     std::string principal;
+    // Claims the credential carried.  Only `vgi_rpc.Identity.v1`'s freshness
+    // guard reads one today (`auth_time`), and it must see the value exactly as
+    // presented: a transport that parsed and dropped what would not parse would
+    // turn "carries an unusable auth_time" into "carries none", which is a
+    // different refusal for the same reason code.
+    nlohmann::json claims = nlohmann::json::object();
 };
 
 struct HttpConfig {

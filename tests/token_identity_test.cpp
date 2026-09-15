@@ -806,6 +806,72 @@ TEST_CASE("an identity refusal carries its error_kind onto the wire") {
           "token_unresolved");
 }
 
+TEST_CASE("an anonymous raw transport cannot mint over the wire") {
+    // The third leg of the end-to-end dispatch check, and the one that is not
+    // implied by the two above.  IDENTITY_CONFORMANCE_FIXTURE.md §7 records a
+    // framework bug in the reference that left `vgi_rpc.Identity.v1`
+    // *completely uncallable on every transport* since it landed, invisible
+    // because every identity test there constructed the implementation
+    // directly and handed it a context it had built itself.  Nothing called
+    // the protocol end to end, so nothing noticed that the dispatch path never
+    // supplied the caller's identity.
+    //
+    // This port dispatches identity through `Server::serve_identity`, which
+    // takes the connection's `AuthContext` explicitly rather than resolving
+    // ctx-taking method names out of a per-server map, so it cannot have that
+    // bug in the same shape.  The assertion still has to be made on the wire:
+    // a dispatch path that supplied an *empty* context would refuse everything
+    // and look identical to a working guard from the outside.  Paired with the
+    // two cases above -- where an allowlisted caller resolves and a
+    // non-allowlisted one on the same transport does not -- an empty context
+    // is distinguishable from a working allowlist.
+    auto server = server_with(std::make_shared<IdentityImpl>(mint_only()));
+    auto schema = arrow::schema({arrow::field("purpose", arrow::utf8(), /*nullable=*/false),
+                                 arrow::field("scopes",
+                                              arrow::list(arrow::field("item", arrow::utf8(),
+                                                                       /*nullable=*/true)),
+                                              /*nullable=*/false),
+                                 arrow::field("ttl_seconds", arrow::int64(), /*nullable=*/false)});
+    arrow::StringBuilder purpose;
+    REQUIRE(purpose.Append("conformance").ok());
+    std::shared_ptr<arrow::Array> purpose_column;
+    REQUIRE(purpose.Finish(&purpose_column).ok());
+    arrow::ListBuilder scopes(arrow::default_memory_pool(),
+                              std::make_shared<arrow::StringBuilder>());
+    REQUIRE(scopes.Append().ok());
+    std::shared_ptr<arrow::Array> scopes_column;
+    REQUIRE(scopes.Finish(&scopes_column).ok());
+    arrow::Int64Builder ttl;
+    REQUIRE(ttl.Append(60).ok());
+    std::shared_ptr<arrow::Array> ttl_column;
+    REQUIRE(ttl.Finish(&ttl_column).ok());
+    auto request = identity_request(
+        "issue_grant", schema,
+        arrow::RecordBatch::Make(schema, 1, {purpose_column, scopes_column, ttl_column}));
+
+    // Pipe, Unix and TCP carry no authenticated principal at all, so minting
+    // fails closed for free -- the same rule that stops a grant minting another
+    // grant, since neither carries an `auth_time`.
+    CHECK(wire_error_kind(round_trip(*server, request, AuthContext::anonymous())) == "stale_auth");
+
+    // ...and the same request on the same transport *does* mint once the
+    // connection carries a freshly authenticated principal, so the refusal
+    // above is the freshness guard rather than a dispatch path that never
+    // supplies an identity.
+    auto minted = round_trip(*server, request, make_auth("alice", true, now_seconds()));
+    REQUIRE(minted.batches.size() == 1);
+    CHECK(wire_error_kind(minted).empty());
+    auto column = std::static_pointer_cast<arrow::BinaryArray>(minted.batches[0].batch->column(0));
+    auto payload = column->GetString(0);
+    auto payload_source =
+        std::make_shared<arrow::io::BufferReader>(arrow::Buffer::FromString(std::move(payload)));
+    auto decoded = read_ipc_stream(payload_source);
+    REQUIRE(decoded.has_value());
+    REQUIRE(decoded->batches.size() == 1);
+    CHECK(std::static_pointer_cast<arrow::StringArray>(decoded->batches[0].batch->column(0))
+              ->GetString(0) == "grant-for-alice");
+}
+
 TEST_CASE("an unhosted identity method is absent rather than refusing") {
     // The deployment configured no minter, so `issue_grant` is not hosted: the
     // client is told the method does not exist, which is what makes reflection

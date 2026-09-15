@@ -6,6 +6,7 @@
 
 #include "vgi_rpc/server.h"
 #include "vgi_rpc/stream.h"
+#include "vgi_rpc/token_identity.h"
 #include "vgi_rpc/metadata.h"
 #include "vgi_rpc/wire.h"
 #include "vgi_rpc/arrow_utils.h"
@@ -1463,6 +1464,131 @@ static std::shared_ptr<arrow::Schema> params(std::vector<std::shared_ptr<arrow::
     return arrow::schema(std::move(fields));
 }
 
+// =========================================================================
+// vgi_rpc.Identity.v1 conformance fixture
+// =========================================================================
+//
+// The fixed deployment policy of IDENTITY_CONFORMANCE_FIXTURE.md, which every
+// port configures identically.  Identity is almost entirely *guards*, and
+// every guard reads deployment policy -- who may introspect, what a credential
+// resolves to, whether a grant is minted, how recently the caller
+// authenticated.  Against a worker whose allowlist and hooks are unknown no
+// cross-port assertion exists, because every answer is explicable as policy.
+// So the policy is pinned.
+//
+// Two rules shape the values below and both matter more than they look.
+//
+// **The resolver resolves almost everything.**  Rejections are deliberately
+// uniform -- unknown, expired, malformed and over-long are one answer -- so an
+// over-long credential is *also* an unknown one, and a cap test that probes
+// with a credential the resolver does not know cannot distinguish "the cap
+// refused it" from "the cap let it through and the resolver refused it".
+// Delete the cap and such a test stays green.  With a resolver that answers
+// for whatever it is handed, a rejection can only have come from a guard, and
+// a guard that fails to fire produces a *success*, which uniformity cannot
+// disguise.
+//
+// **Both hooks are pure functions of their arguments.**  No clock, no counter,
+// no shared state: this worker must answer identically on the first call and
+// the thousandth, and on a runtime that dispatches the two methods on
+// different threads.  The one value that would otherwise need a clock -- a
+// grant's `expires_at` -- is a fixed constant, so the wire value can be
+// asserted exactly rather than within a tolerance.  `ttl_seconds` is therefore
+// ignored: it is a *request*, the returned `expires_at` is authoritative.
+//
+// WARNING: the authentication this fixture relies on is two request headers
+// (X-Conformance-Principal and X-Conformance-Auth-Time) and is therefore
+// trivially spoofable by anyone who can reach the port.  It exists so six
+// language ports get a deterministic authenticated caller without each
+// standing up an identity provider.  It is a test fixture and must never be
+// deployed.
+namespace identity_fixture {
+
+constexpr const char* kIntrospectorPrincipal = "conformance-introspector";
+constexpr int kIntrospectRateLimit = 100000;
+constexpr double kMaxAuthAge = 900.0;
+
+constexpr const char* kSubjectPrincipal = "subject@conformance.example";
+constexpr const char* kSubjectTokenName = "conformance-subject";
+constexpr int64_t kSubjectTtl = 300;
+
+constexpr const char* kTokenUnknown = "conformance-unknown-token";
+constexpr const char* kTokenUnavailable = "conformance-unavailable-token";
+constexpr const char* kTokenZeroTtl = "conformance-zero-ttl-token";
+constexpr const char* kTokenMinimal = "conformance-minimal-token";
+constexpr const char* kTokenPaddedProbe = "  conformance-padded-probe  ";
+constexpr const char* kTokenPaddedProbeName = "conformance-padded";
+
+constexpr const char* kGrantTokenPrefix = "conformance-grant-for:";
+constexpr const char* kScopeSeparator = "|";
+constexpr double kGrantExpiresAt = 1893456000.0;  // 2030-01-01T00:00:00Z
+constexpr const char* kGrantId = "conformance-grant-id";
+constexpr const char* kRefusedPurpose = "conformance-refused";
+constexpr const char* kMinimalPurpose = "conformance-minimal";
+
+/// Resolve a credential under the fixed conformance policy.
+///
+/// Receives the credential exactly as the caller sent it, untrimmed -- which
+/// is what `kTokenPaddedProbe` exists to observe.  A port that trims once, up
+/// front, and resolves the result passes every other case in the group,
+/// because the padded credential still resolves; it just falls through to the
+/// catch-all rule and reports the wrong `token_name`.
+std::optional<TokenIdentity> resolve_token(const std::string& token) {
+    if (token == kTokenUnavailable) {
+        // Transient, and distinct from a definitive rejection: a caller that
+        // negative-caches "unknown" must not cache an outage.
+        throw IdentityUnavailableError("conformance: mapping store unreachable");
+    }
+    if (token == kTokenUnknown) return std::nullopt;
+    if (token == kTokenZeroTtl) {
+        // A resolver naming zero is saying *do not cache this*.  The tempting
+        // normalisation of `<= 0` up to the 300 default silently converts that
+        // into five minutes of continued access after revocation.
+        return TokenIdentity{kSubjectPrincipal, kSubjectTokenName, 0};
+    }
+    if (token == kTokenMinimal) {
+        // Only the principal is supplied, so the other two land on their
+        // documented defaults.  Writing `{principal, "", 300}` here would test
+        // that this line says 300, not that the default is 300.
+        TokenIdentity identity;
+        identity.principal = kSubjectPrincipal;
+        return identity;
+    }
+    if (token == kTokenPaddedProbe) {
+        return TokenIdentity{kSubjectPrincipal, kTokenPaddedProbeName, kSubjectTtl};
+    }
+    return TokenIdentity{kSubjectPrincipal, kSubjectTokenName, kSubjectTtl};
+}
+
+/// Mint a grant under the fixed conformance policy.
+///
+/// The token embeds the *caller's* principal, which is how "the subject is the
+/// caller, never a parameter" becomes observable: two callers making identical
+/// requests get two different tokens.  It echoes the scopes so the list's
+/// round trip is visible in the response, an empty list included.
+IssuedGrant mint_grant(const std::string& principal, const std::string& purpose,
+                       const std::vector<std::string>& scopes, int64_t ttl_seconds) {
+    (void)ttl_seconds;  // A request, not an instruction; `expires_at` is authoritative.
+    if (purpose == kRefusedPurpose) {
+        throw GrantRefusedError("conformance: this purpose is refused");
+    }
+    std::string token = std::string(kGrantTokenPrefix) + principal + kScopeSeparator;
+    for (size_t i = 0; i < scopes.size(); ++i) {
+        if (i != 0) token += ",";
+        token += scopes[i];
+    }
+    if (purpose == kMinimalPurpose) {
+        // `grant_id` omitted, so its documented default ("") is observable.
+        IssuedGrant grant;
+        grant.token = std::move(token);
+        grant.expires_at = kGrantExpiresAt;
+        return grant;
+    }
+    return IssuedGrant{std::move(token), kGrantExpiresAt, kGrantId};
+}
+
+}  // namespace identity_fixture
+
 int main(int argc, char** argv) {
     // Parse the conformance CLI surface.  --access-log and the HTTP flags are
     // acted on; other access-log tuning flags are accepted (and ignored) so the
@@ -1476,6 +1602,11 @@ int main(int argc, char** argv) {
     bool transport_kind_probe = false;
     bool polymorphic_stream_probe = false;
     bool http_concurrency_probe = false;
+    // `vgi_rpc.Identity.v1` fixture mode: "off", "both" or "introspect-only".
+    // Two conformance workers are the same binary with this flag different;
+    // the narrowed one configures no mint hook, which is what makes the
+    // method-level narrowing (and the shrunken protocol_hash) observable.
+    std::string identity_mode = "off";
     std::string server_id;
     vgi_rpc::HttpConfig http_cfg;
     // Sticky is on by default here, matching the reference conformance worker,
@@ -1586,6 +1717,20 @@ int main(int argc, char** argv) {
             http_cfg.cors_origin = take_value(i);
         } else if (arg == "--introspect") {
             http_cfg.token_introspection = true;
+        } else if (arg == "--identity") {
+            identity_mode = take_value(i);
+            if (identity_mode != "off" && identity_mode != "both" &&
+                identity_mode != "introspect-only") {
+                std::cerr << "vgi_rpc: --identity must be one of off, both, introspect-only\n";
+                return 2;
+            }
+            if (identity_mode != "off") {
+                // Implies principal-header auth: every one of Identity's guards
+                // reads an authenticated caller, so without it the allowlist
+                // and the freshness check have nothing to read and the worker
+                // would refuse every call for the same reason.
+                http_cfg.sticky_header_auth = true;
+            }
         } else if (arg == "--sticky") {
             http_cfg.sticky = true;
         } else if (arg == "--no-sticky") {
@@ -2018,6 +2163,23 @@ int main(int argc, char** argv) {
     // We implement SHM, so we must answer the handshake: a worker that stays
     // silent is treated as "no SHM" and clients never negotiate it.
     builder.enable_transport_options();
+    if (identity_mode != "off") {
+        vgi_rpc::IdentityOptions identity_options;
+        identity_options.resolve_token = identity_fixture::resolve_token;
+        // Absent for "introspect-only", which is what narrows the binding to
+        // one method.  A method whose hook the deployment did not configure is
+        // not hosted at all -- absent beats routed-and-refusing, and the
+        // protocol_hash narrows with it.
+        if (identity_mode == "both") identity_options.mint_grant = identity_fixture::mint_grant;
+        identity_options.introspect_principals = {identity_fixture::kIntrospectorPrincipal};
+        // Far above the default 20, deliberately.  Nearly every case in the
+        // shared group is an introspection, so a production-tuned limiter would
+        // fire mid-group and every resulting failure would read as the wrong
+        // guard.  The limiter is asserted port-locally instead.
+        identity_options.introspect_rate_limit = identity_fixture::kIntrospectRateLimit;
+        identity_options.max_auth_age = identity_fixture::kMaxAuthAge;
+        builder.identity(std::make_shared<vgi_rpc::IdentityImpl>(std::move(identity_options)));
+    }
     if (!server_id.empty()) builder.server_id(server_id);
     if (!access_log_path.empty()) {
         builder.access_log(access_log_path, access_log_max_record_bytes);

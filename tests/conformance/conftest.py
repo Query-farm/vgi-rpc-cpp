@@ -850,3 +850,36 @@ def conformance_http_sticky_auth_port() -> Iterator[int]:
     """
     with spawn_http("--sticky-auth") as port:
         yield port
+
+
+@pytest.fixture(scope="session")
+def conformance_http_identity_port() -> Iterator[int]:
+    """A worker hosting ``vgi_rpc.Identity.v1`` with both hooks configured.
+
+    The fixed deployment policy of ``IDENTITY_CONFORMANCE_FIXTURE.md``:
+    the resolver of §3.3, the minter of §3.4, an introspector allowlist of
+    exactly ``["conformance-introspector"]``, ``max_auth_age`` 900 and a rate
+    limit of 100000. Identity is nearly all guards and every guard reads
+    deployment policy, so a cross-port assertion exists only because every
+    port configures these same values.
+
+    ``--identity`` implies principal-header auth, which is how the group gets
+    an authenticated caller — and an ``auth_time`` claim — without an identity
+    provider. It is trivially spoofable and exists only here.
+    """
+    with spawn_http("--identity", "both") as port:
+        yield port
+
+
+@pytest.fixture(scope="session")
+def conformance_http_identity_introspect_only_port() -> Iterator[int]:
+    """The same binary with the mint hook left out.
+
+    Method-level narrowing — that an unconfigured hook makes its method
+    *absent* rather than hosted-and-refusing, and shrinks the ``protocol_hash``
+    with it — is only observable against a second worker. Absent beats
+    routed-and-refusing: it is what keeps a dependency upgrade from growing a
+    credential-to-identity oracle on every existing worker.
+    """
+    with spawn_http("--identity", "introspect-only") as port:
+        yield port
