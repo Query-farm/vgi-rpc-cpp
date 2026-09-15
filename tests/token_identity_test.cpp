@@ -346,6 +346,43 @@ TEST_CASE("padding does not smuggle a JWS past the guard") {
     }
 }
 
+TEST_CASE("every codepoint in the spec's trim floor is trimmed") {
+    // `IDENTITY_V1_SPEC.md` enumerates the floor every port must trim:
+    //
+    //     U+0009 U+000A U+000B U+000C U+000D U+0020 U+0085 U+00A0
+    //
+    // Measured across the ports, this one trimmed only the first six -- which
+    // moves the divergence one layer down rather than closing it.  A port
+    // trimming a narrower set routes a padded JWS that another port refuses,
+    // which is the same hole the guard exists to close.  U+0085 and U+00A0 are
+    // two UTF-8 bytes each (`C2 85`, `C2 A0`), so a byte-wise trim has to
+    // handle them rather than compare `char`s.
+    const std::vector<std::string> floor = {"\x09", "\x0a", "\x0b",     "\x0c",
+                                            "\x0d", " ",    "\xc2\x85", "\xc2\xa0"};
+    for (const std::string& space : floor) {
+        CAPTURE(space);
+        // Padding a JWS with it must not smuggle the JWS past the guard,
+        // leading, trailing, or both.
+        CHECK_THROWS_AS(reject_jws_shaped(space + "aaa.bbb.ccc"), TokenUnresolvedError);
+        CHECK_THROWS_AS(reject_jws_shaped("aaa.bbb.ccc" + space), TokenUnresolvedError);
+        CHECK_THROWS_AS(reject_jws_shaped(space + "aaa.bbb.ccc" + space), TokenUnresolvedError);
+        // And a credential made only of it is not a credential.
+        CHECK_THROWS_AS(reject_jws_shaped(space), TokenUnresolvedError);
+        CHECK_THROWS_AS(reject_jws_shaped(space + space), TokenUnresolvedError);
+    }
+
+    // The whole floor at once, in both orders, is still not a way through.
+    std::string all;
+    for (const std::string& space : floor) all += space;
+    CHECK_THROWS_AS(reject_jws_shaped(all + "aaa.bbb.ccc" + all), TokenUnresolvedError);
+    CHECK_THROWS_AS(reject_jws_shaped(all), TokenUnresolvedError);
+
+    // A lone 0x85 or 0xA0 byte is a UTF-8 continuation of some other codepoint,
+    // not whitespace: trimming it would corrupt the credential the shape test
+    // runs against, so an opaque token carrying one still reaches the resolver.
+    CHECK_NOTHROW(reject_jws_shaped(std::string("\xc3\xa0opaque\xc3\xa0")));
+}
+
 TEST_CASE("a blank credential is not a credential") {
     // Whitespace-only never reaches a resolver either.
     for (const std::string& token :

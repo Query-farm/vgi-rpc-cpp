@@ -246,6 +246,16 @@ private:
 using ClientLogHandler = std::function<void(const Message&)>;
 
 struct RpcClientOptions {
+    /// Routing key of the protocol this client addresses.
+    ///
+    /// Stamped as `vgi_rpc.protocol` on every application call, which a server
+    /// hosting more than one protocol needs in order to resolve
+    /// `(protocol, method)`. Reserved `__name__` methods are server-level
+    /// surface owned by no protocol and carry no key.
+    ///
+    /// Empty sends no key at all -- the pre-multi-service shape, which is
+    /// still what a peer that has not been migrated expects.
+    std::string protocol;
     std::string protocol_version;
     ClientLogHandler on_log;
     // Zero disables SHM. A positive value performs __transport_options__ at
@@ -340,7 +350,21 @@ public:
                                bool has_header = false,
                                std::shared_ptr<arrow::KeyValueMetadata> metadata = nullptr);
 
-    ServiceDescription describe();
+    /// Every protocol this server hosts, with versions and hashes.
+    ///
+    /// The cheap half of discovery, and the only one a warm client needs: the
+    /// hash answers "has it changed" without transferring a single schema.
+    ProtocolListing list_protocols();
+
+    /// One protocol's full description.
+    ///
+    /// Costs up to two round trips, because a server may host several
+    /// protocols and there is no longer a single "the" protocol to describe
+    /// without asking. Name *protocol* to skip the first hop; the returned
+    /// `server_id` and `request_version` are then empty, since those are
+    /// properties of the server that only `list_protocols` reports.
+    ServiceDescription describe(const std::string& protocol = "");
+
     ClientTransportOptions transport_options();
     bool enable_shared_memory(size_t bytes);
     bool shared_memory_enabled() const noexcept;
@@ -355,6 +379,10 @@ private:
                              const std::shared_ptr<arrow::RecordBatch>& params, bool has_header,
                              std::shared_ptr<arrow::KeyValueMetadata> metadata,
                              ClientStreamKind kind);
+
+    /// One unary call routed to the co-hosted reflection protocol.
+    AnnotatedBatch call_reflection(const std::string& method,
+                                   const std::shared_ptr<arrow::RecordBatch>& params);
 
     std::shared_ptr<Impl> impl_;
 

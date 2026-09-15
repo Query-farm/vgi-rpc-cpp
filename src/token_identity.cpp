@@ -73,17 +73,58 @@ std::shared_ptr<arrow::Array> OneFloat64(double value) {
     return out;
 }
 
+/// The byte width of the whitespace codepoint beginning at `pos`, or 0.
+///
+/// The floor `IDENTITY_V1_SPEC.md` requires every port to trim:
+///
+///     U+0009 U+000A U+000B U+000C U+000D U+0020 U+0085 U+00A0
+///
+/// It is a *floor* and not a set because trimming wider can only add refusals,
+/// never remove one -- but trimming narrower is the hole this guard exists to
+/// close, one level down: a port that stops at ASCII routes a NBSP-padded JWS
+/// onward that a port trimming the full set refuses.  Divergence between ports
+/// is the bug, so the set is enumerated rather than delegated to `isspace`,
+/// whose answer depends on the active locale.
+///
+/// The credential is a UTF-8 `std::string`, so two of the eight are two bytes
+/// each -- U+0085 is `C2 85` and U+00A0 is `C2 A0`.  Comparing `char`s would
+/// silently trim neither.  A lone `85` or `A0` byte is a continuation of some
+/// other codepoint and is left alone.
+size_t WhitespaceWidth(const std::string& token, size_t pos) {
+    const auto byte = static_cast<unsigned char>(token[pos]);
+    if (byte == 0x20 || (byte >= 0x09 && byte <= 0x0D)) return 1;
+    if (byte == 0xC2 && pos + 1 < token.size()) {
+        const auto next = static_cast<unsigned char>(token[pos + 1]);
+        if (next == 0x85 || next == 0xA0) return 2;
+    }
+    return 0;
+}
+
+/// The byte width of the whitespace codepoint *ending* at `end`, or 0.
+size_t TrailingWhitespaceWidth(const std::string& token, size_t begin, size_t end) {
+    if (end - begin >= 2 && WhitespaceWidth(token, end - 2) == 2) return 2;
+    const auto byte = static_cast<unsigned char>(token[end - 1]);
+    return (byte == 0x20 || (byte >= 0x09 && byte <= 0x0D)) ? 1 : 0;
+}
+
 /// Strip leading and trailing whitespace, without copying.
 ///
-/// ASCII whitespace only, which is exactly `str.strip()`'s set for the bytes a
-/// bearer credential can contain.  A credential is not text to be normalised --
-/// this view exists only so the shape test below can be run against it.
+/// A credential is not text to be normalised -- this view exists only so the
+/// shape test below can be run against it.
 std::string_view Trimmed(const std::string& token) {
-    constexpr std::string_view kSpace = " \t\n\v\f\r";
-    const size_t first = token.find_first_not_of(kSpace);
-    if (first == std::string::npos) return std::string_view();
-    const size_t last = token.find_last_not_of(kSpace);
-    return std::string_view(token).substr(first, last - first + 1);
+    size_t begin = 0;
+    while (begin < token.size()) {
+        const size_t width = WhitespaceWidth(token, begin);
+        if (width == 0) break;
+        begin += width;
+    }
+    size_t end = token.size();
+    while (end > begin) {
+        const size_t width = TrailingWhitespaceWidth(token, begin, end);
+        if (width == 0) break;
+        end -= width;
+    }
+    return std::string_view(token).substr(begin, end - begin);
 }
 
 /// Whether `candidate` looks like a JWS: three dot-separated base64url

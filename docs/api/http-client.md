@@ -32,10 +32,20 @@ identity-key, and timeout settings. See [Native Iroh client](../native-iroh-clie
 HTTP-over-Iroh changes only the carrier; all behavior documented below remains
 the same.
 
-`describe()` invokes `__describe__` and returns a validated
-`ServiceDescription`. Malformed schemas, duplicate method names, and
-unsupported describe/request versions fail closed rather than producing a
-partial model.
+`describe()` goes through `vgi_rpc.Reflection.v1` -- `list_protocols()` to
+find the application protocol, then `describe(protocol)` -- and returns a
+validated `ServiceDescription`. Pass the protocol name to skip the first hop;
+`server_id` and `request_version` are then empty, being properties only
+`list_protocols()` reports. Malformed schemas and duplicate method names fail
+closed rather than producing a partial model, but unknown columns are ignored
+and defaulted ones default: a version-mismatched client calls reflection to
+learn *what* mismatched, so the decoder must survive minor skew.
+
+`protocol` on `HttpClientConfig` (or `HttpClientBuilder::protocol()`) is the
+routing key. When set, application methods are posted to
+`{prefix}/{protocol}/{method}` and carry `vgi_rpc.protocol`; reserved
+`__name__` methods stay flat. Leave it empty for a peer that predates
+multi-service routing.
 
 ## HTTPS and authentication
 

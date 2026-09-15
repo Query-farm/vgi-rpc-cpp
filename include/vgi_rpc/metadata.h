@@ -85,6 +85,14 @@ inline constexpr const char* ERROR_KIND_SESSION_LOST = "session_lost";
 inline constexpr const char* ERROR_KIND_SERVER_DRAINING = "server_draining";
 inline constexpr const char* ERROR_KIND_METHOD_NOT_IMPLEMENTED = "method_not_implemented";
 
+/// The wire name of the reflection protocol.
+///
+/// Fixed, and the one protocol name either side may know a priori: it is the
+/// bootstrap, so there is nothing to discover it with.  It lives here rather
+/// than beside the server-side builders because the client needs it too --
+/// discovery is the one call a client makes before it knows anything else.
+inline constexpr const char* kReflectionProtocolName = "vgi_rpc.Reflection.v1";
+
 // Protocol constants
 inline constexpr const char* REQUEST_VERSION_VALUE = "1";
 inline constexpr const char* DESCRIBE_VERSION_VALUE = "4";

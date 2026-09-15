@@ -8,6 +8,8 @@
 #include "vgi_rpc/shm.h"
 #include "vgi_rpc/wire.h"
 
+#include <arrow/builder.h>
+#include <arrow/record_batch.h>
 #include <arrow/ipc/reader.h>
 #include <arrow/ipc/writer.h>
 #include <arrow/util/key_value_metadata.h>
@@ -57,8 +59,18 @@ void strip_transport_controls(const std::shared_ptr<arrow::KeyValueMetadata>& me
     }
 }
 
+/// Whether `method` is a server-level reserved name rather than a protocol's.
+///
+/// Reserved names are owned by no protocol, so they carry no routing key --
+/// and must not, since resolving them against a protocol's method table is a
+/// different lookup than resolving them against the server's.
+bool is_reserved_method(const std::string& method) {
+    return method.size() > 4 && method.rfind("__", 0) == 0 &&
+           method.compare(method.size() - 2, 2, "__") == 0;
+}
+
 std::shared_ptr<arrow::KeyValueMetadata> request_metadata(
-    const std::string& method, const std::string& protocol_version,
+    const std::string& method, const std::string& protocol, const std::string& protocol_version,
     const std::shared_ptr<arrow::KeyValueMetadata>& extras,
     const std::shared_ptr<ShmSegment>& shm) {
     if (method.empty()) throw std::invalid_argument("RPC method must not be empty");
@@ -67,6 +79,9 @@ std::shared_ptr<arrow::KeyValueMetadata> request_metadata(
     // Framework-owned keys win over caller extras so a caller cannot make the
     // request id logged locally disagree with the one sent on the wire.
     replace_metadata(metadata, keys::METHOD, method);
+    if (!protocol.empty() && !is_reserved_method(method)) {
+        replace_metadata(metadata, keys::PROTOCOL, protocol);
+    }
     replace_metadata(metadata, keys::REQUEST_VERSION, REQUEST_VERSION_VALUE);
     replace_metadata(metadata, keys::REQUEST_ID, random_hex(32));
     if (protocol_version.empty()) {
@@ -573,8 +588,8 @@ AnnotatedBatch RpcClient::call_unary(const std::string& method,
                                      const std::shared_ptr<arrow::RecordBatch>& params,
                                      std::shared_ptr<arrow::KeyValueMetadata> metadata) {
     if (!params) throw std::invalid_argument("RPC params batch must not be null");
-    auto request_md =
-        request_metadata(method, impl_->options.protocol_version, metadata, impl_->shm);
+    auto request_md = request_metadata(method, impl_->options.protocol,
+                                       impl_->options.protocol_version, metadata, impl_->shm);
     CallReservation reservation(impl_);
     try {
         write_ipc_stream(impl_->output, params->schema(),
@@ -597,8 +612,8 @@ ClientStream RpcClient::open_stream(const std::string& method,
                                     std::shared_ptr<arrow::KeyValueMetadata> metadata,
                                     ClientStreamKind kind) {
     if (!params) throw std::invalid_argument("RPC params batch must not be null");
-    auto request_md =
-        request_metadata(method, impl_->options.protocol_version, metadata, impl_->shm);
+    auto request_md = request_metadata(method, impl_->options.protocol,
+                                       impl_->options.protocol_version, metadata, impl_->shm);
     CallReservation reservation(impl_);
     try {
         write_ipc_stream(impl_->output, params->schema(),
@@ -651,9 +666,61 @@ ClientStream RpcClient::open_exchange(const std::string& method,
     return open_stream(method, params, has_header, std::move(metadata), ClientStreamKind::EXCHANGE);
 }
 
-ServiceDescription RpcClient::describe() {
-    return parse_service_description(
-        call_unary(DESCRIBE_METHOD_NAME, make_empty_batch(empty_schema())));
+namespace {
+
+/// The one-row `{protocol}` batch that `describe` takes as its parameter.
+std::shared_ptr<arrow::RecordBatch> describe_params(const std::string& protocol) {
+    arrow::StringBuilder builder;
+    VGI_RPC_THROW_NOT_OK(builder.Append(protocol));
+    auto schema = arrow::schema({arrow::field("protocol", arrow::utf8(), /*nullable=*/false)});
+    return arrow::RecordBatch::Make(schema, 1, {unwrap(builder.Finish())});
+}
+
+}  // namespace
+
+AnnotatedBatch RpcClient::call_reflection(const std::string& method,
+                                          const std::shared_ptr<arrow::RecordBatch>& params) {
+    if (!params) throw std::invalid_argument("RPC params batch must not be null");
+    const std::shared_ptr<arrow::KeyValueMetadata> extras;
+    // No protocol_version, deliberately. Reflection is exempt from the version
+    // gate -- it is the protocol a mismatched client calls to learn *what*
+    // mismatched -- and stamping the application's version on a call to a
+    // framework protocol invites a port that gates less carefully to refuse
+    // the client exactly the diagnosis it came for.
+    auto request_md = request_metadata(method, kReflectionProtocolName,
+                                       /*protocol_version=*/"", extras, impl_->shm);
+    CallReservation reservation(impl_);
+    try {
+        write_ipc_stream(impl_->output, params->schema(),
+                         {AnnotatedBatch::with_metadata(params, std::move(request_md))});
+        VGI_RPC_THROW_NOT_OK(impl_->output->Flush());
+        auto response = read_substream(impl_);
+        if (!response) throw std::runtime_error("RPC response contains no data batch");
+        return std::move(*response);
+    } catch (const RpcException&) {
+        throw;
+    } catch (...) {
+        impl_->abort_transport();
+        throw;
+    }
+}
+
+ProtocolListing RpcClient::list_protocols() {
+    return decode_protocol_list(
+        call_reflection("list_protocols", make_empty_batch(empty_schema())));
+}
+
+ServiceDescription RpcClient::describe(const std::string& protocol) {
+    if (!protocol.empty()) {
+        return decode_service_description(call_reflection("describe", describe_params(protocol)));
+    }
+    const auto listing = list_protocols();
+    const auto* application = listing.application();
+    if (application == nullptr) {
+        throw std::runtime_error("server " + listing.server_id + " hosts no application protocol");
+    }
+    return decode_service_description(
+        call_reflection("describe", describe_params(application->protocol)), &listing);
 }
 
 ClientTransportOptions RpcClient::transport_options() {

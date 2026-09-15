@@ -234,6 +234,10 @@ const char* python_executable() {
 
 RpcClientOptions client_options() {
     RpcClientOptions options;
+    // The routing key the reference worker hosts its methods under.  A real
+    // client knows it from the Protocol it was generated for; this one is
+    // hand-written, so it says so.
+    options.protocol = "ClientConformanceService";
 #ifndef _WIN32
     options.shared_memory_bytes = 4 * 1024 * 1024;
 #endif

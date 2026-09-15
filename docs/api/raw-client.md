@@ -18,9 +18,12 @@ while (auto batch = producer.tick()) {
 ```
 
 The client is dynamic and schema-first: callers build exact Arrow record
-batches and receive owned `AnnotatedBatch` values. `describe()` validates the
-version-4 service description rather than returning a partial model when the
-peer supplies malformed schemas or duplicate methods.
+batches and receive owned `AnnotatedBatch` values. `list_protocols()` and
+`describe()` speak `vgi_rpc.Reflection.v1`; `describe()` validates the reply
+rather than returning a partial model when the peer supplies malformed schemas
+or duplicate methods. Set `RpcClientOptions::protocol` to the routing key the
+peer hosts its methods under -- a server hosting more than one protocol needs
+it to resolve `(protocol, method)`.
 
 ## Transports
 

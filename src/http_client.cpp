@@ -115,13 +115,29 @@ std::shared_ptr<arrow::KeyValueMetadata> sanitized_metadata(
     return metadata;
 }
 
+/// Whether `method` is a server-level reserved name rather than a protocol's.
+///
+/// Reserved names are owned by no protocol: they neither carry a routing key
+/// nor live under one in the URL.
+bool is_reserved_method(const std::string& method) {
+    return method.size() > 4 && method.rfind("__", 0) == 0 &&
+           method.compare(method.size() - 2, 2, "__") == 0;
+}
+
 std::shared_ptr<arrow::KeyValueMetadata> request_metadata(
     const std::shared_ptr<arrow::KeyValueMetadata>& original, const std::string& method,
-    const std::string& protocol_version, const std::string& request_id) {
+    const std::string& protocol, const std::string& protocol_version,
+    const std::string& request_id) {
     auto metadata = sanitized_metadata(original);
     replace_metadata(metadata, keys::METHOD, method);
     replace_metadata(metadata, keys::REQUEST_VERSION, REQUEST_VERSION_VALUE);
     replace_metadata(metadata, keys::REQUEST_ID, request_id);
+    // The routing key names the protocol the request addresses. Reserved names
+    // belong to no protocol and carry none; an unconfigured protocol sends none
+    // either, which is what a peer predating multi-service routing expects.
+    if (!protocol.empty() && !is_reserved_method(method)) {
+        replace_metadata(metadata, keys::PROTOCOL, protocol);
+    }
     if (!protocol_version.empty()) {
         replace_metadata(metadata, keys::PROTOCOL_VERSION, protocol_version);
     }
@@ -193,6 +209,14 @@ std::shared_ptr<arrow::Schema> upload_url_response_schema() {
         {arrow::field("upload_url", arrow::utf8(), true),
          arrow::field("download_url", arrow::utf8(), true),
          arrow::field("expires_at", arrow::timestamp(arrow::TimeUnit::MICRO, "UTC"), true)});
+}
+
+/// The one-row `{protocol}` batch that reflection's `describe` takes.
+std::shared_ptr<arrow::RecordBatch> describe_params(const std::string& protocol) {
+    arrow::StringBuilder builder;
+    VGI_RPC_THROW_NOT_OK(builder.Append(protocol));
+    auto schema = arrow::schema({arrow::field("protocol", arrow::utf8(), /*nullable=*/false)});
+    return arrow::RecordBatch::Make(schema, 1, {unwrap(builder.Finish())});
 }
 
 AnnotatedBatch upload_url_request(int64_t count) {
@@ -1606,8 +1630,8 @@ public:
         }
         const std::string control_method = "__upload_url__";
         const std::string control_id = logical_request_id(options);
-        const auto metadata =
-            request_metadata(nullptr, control_method, config.protocol_version, control_id);
+        const auto metadata = request_metadata(nullptr, control_method, config.protocol,
+                                               config.protocol_version, control_id);
         const std::string control_body =
             encode_ipc(upload_url_request(count), metadata, config.max_request_bytes);
         const auto response = post_inline(control_method, path(control_method, "/init"),
@@ -1913,6 +1937,27 @@ public:
         return (config.prefix == "/" ? std::string() : config.prefix) + "/" + method + suffix;
     }
 
+    /// The route for a co-hosted protocol's method: `{prefix}/{protocol}/{method}`.
+    ///
+    /// A protocol is addressed by its routing key, which is what lets one
+    /// server host several of them without their method names colliding.
+    std::string protocol_path(const std::string& protocol, const std::string& method,
+                              const char* suffix = "") const {
+        return (config.prefix == "/" ? std::string() : config.prefix) + "/" + protocol + "/" +
+               method + suffix;
+    }
+
+    /// The route for an application method.
+    ///
+    /// Falls back to the flat `{prefix}/{method}` when no protocol is
+    /// configured -- the pre-multi-service shape, which is still what a peer
+    /// that has not been migrated serves.  Reserved `__name__` methods are
+    /// server-level surface owned by no protocol and stay flat either way.
+    std::string method_path(const std::string& method, const char* suffix = "") const {
+        if (config.protocol.empty() || is_reserved_method(method)) return path(method, suffix);
+        return protocol_path(config.protocol, method, suffix);
+    }
+
     HttpClientConfig config;
 
     ClientExternalHttp* external() const noexcept { return external_http.get(); }
@@ -2156,6 +2201,12 @@ HttpClientBuilder& HttpClientBuilder::prefix(std::string prefix) {
     return *this;
 }
 
+HttpClientBuilder& HttpClientBuilder::protocol(std::string protocol) {
+    if (!impl_) throw std::logic_error("HttpClientBuilder is moved from");
+    impl_->config.protocol = std::move(protocol);
+    return *this;
+}
+
 HttpClientBuilder& HttpClientBuilder::protocol_version(std::string version) {
     if (!impl_) throw std::logic_error("HttpClientBuilder is moved from");
     impl_->config.protocol_version = std::move(version);
@@ -2296,10 +2347,10 @@ AnnotatedBatch HttpClient::call(const std::string& method, const AnnotatedBatch&
     validate_method(method);
     if (!state_) throw HttpClientError("HttpClient is moved from");
     const std::string request_id = logical_request_id(options);
-    const auto metadata = request_metadata(request.custom_metadata, method,
+    const auto metadata = request_metadata(request.custom_metadata, method, state_->config.protocol,
                                            state_->config.protocol_version, request_id);
     const auto response =
-        state_->post(method, state_->path(method),
+        state_->post(method, state_->method_path(method),
                      encode_ipc(request, metadata, state_->request_serialization_cap()), request_id,
                      options, true, sticky_session_);
     auto decoded =
@@ -2320,9 +2371,53 @@ HttpServerCapabilities HttpClient::capabilities(const CallOptions& options) cons
     return state_->capabilities(logical_request_id(options), options, sticky_session_);
 }
 
-ServiceDescription HttpClient::describe(const CallOptions& options) const {
+AnnotatedBatch HttpClient::call_reflection(const std::string& method, const AnnotatedBatch& request,
+                                           const CallOptions& options) const {
+    validate_method(method);
+    if (!state_) throw HttpClientError("HttpClient is moved from");
+    const std::string request_id = logical_request_id(options);
+    // No protocol_version, deliberately: reflection is exempt from the version
+    // gate, being the protocol a mismatched client calls to learn *what*
+    // mismatched.
+    const auto metadata = request_metadata(request.custom_metadata, method, kReflectionProtocolName,
+                                           /*protocol_version=*/std::string(), request_id);
+    const auto response =
+        state_->post(method, state_->protocol_path(kReflectionProtocolName, method),
+                     encode_ipc(request, metadata, state_->request_serialization_cap()), request_id,
+                     options, true, sticky_session_);
+    // Decoded like any other unary reply, externalization included: the old
+    // `__describe__` fast path was exempt from the transport's payload
+    // handling only by accident of answering before dispatch.
+    auto decoded =
+        state_->decode(response, ResponseShape::UNARY, false, state_->external(), sticky_session_);
+    if (decoded.data.size() != 1) {
+        throw HttpClientError("reflection response must contain exactly one data batch");
+    }
+    decoded.data[0].custom_metadata = strip_transport_metadata(decoded.data[0].custom_metadata);
+    return std::move(decoded.data[0]);
+}
+
+ProtocolListing HttpClient::list_protocols(const CallOptions& options) const {
     const AnnotatedBatch request = AnnotatedBatch::data(make_empty_batch(empty_schema()));
-    return parse_service_description(call("__describe__", request, nullptr, options));
+    return decode_protocol_list(call_reflection("list_protocols", request, options));
+}
+
+ServiceDescription HttpClient::describe(const std::string& protocol,
+                                        const CallOptions& options) const {
+    return decode_service_description(
+        call_reflection("describe", AnnotatedBatch::data(describe_params(protocol)), options));
+}
+
+ServiceDescription HttpClient::describe(const CallOptions& options) const {
+    const auto listing = list_protocols(options);
+    const auto* application = listing.application();
+    if (application == nullptr) {
+        throw HttpClientError("server " + listing.server_id + " hosts no application protocol");
+    }
+    return decode_service_description(
+        call_reflection("describe", AnnotatedBatch::data(describe_params(application->protocol)),
+                        options),
+        &listing);
 }
 
 std::vector<HttpUploadUrl> HttpClient::request_upload_urls(int64_t count,
@@ -2391,9 +2486,20 @@ HttpServerCapabilities HttpSessionView::capabilities(const CallOptions& options)
     return impl_->client.capabilities(options);
 }
 
+ProtocolListing HttpSessionView::list_protocols(const CallOptions& options) const {
+    if (!impl_) throw HttpClientError("HTTP sticky-session view is moved from");
+    return impl_->client.list_protocols(options);
+}
+
 ServiceDescription HttpSessionView::describe(const CallOptions& options) const {
     if (!impl_) throw HttpClientError("HTTP sticky-session view is moved from");
     return impl_->client.describe(options);
+}
+
+ServiceDescription HttpSessionView::describe(const std::string& protocol,
+                                             const CallOptions& options) const {
+    if (!impl_) throw HttpClientError("HTTP sticky-session view is moved from");
+    return impl_->client.describe(protocol, options);
 }
 
 std::vector<HttpUploadUrl> HttpSessionView::request_upload_urls(int64_t count,
@@ -2506,10 +2612,10 @@ HttpExchangeSession HttpClient::open_exchange(const std::string& method,
         throw std::invalid_argument("exchange input and output schemas must not be null");
     }
     const std::string request_id = logical_request_id(options);
-    const auto metadata = request_metadata(request.custom_metadata, method,
+    const auto metadata = request_metadata(request.custom_metadata, method, state_->config.protocol,
                                            state_->config.protocol_version, request_id);
     const auto response =
-        state_->post(method, state_->path(method, "/init"),
+        state_->post(method, state_->method_path(method, "/init"),
                      encode_ipc(request, metadata, state_->request_serialization_cap()), request_id,
                      options, true, sticky_session_);
     auto decoded = state_->decode(response, ResponseShape::EXCHANGE_INIT, false, state_->external(),
@@ -2582,8 +2688,8 @@ AnnotatedBatch HttpExchangeSession::exchange(const AnnotatedBatch& input,
     // a new one, preventing accidental duplicate execution.
     impl_->is_active = false;
     const auto response =
-        impl_->state->post(impl_->method, impl_->state->path(impl_->method, "/exchange"), body,
-                           request_id, options, false, impl_->sticky_session);
+        impl_->state->post(impl_->method, impl_->state->method_path(impl_->method, "/exchange"),
+                           body, request_id, options, false, impl_->sticky_session);
     auto decoded = impl_->state->decode(response, ResponseShape::EXCHANGE_TURN, false,
                                         impl_->state->external(), impl_->sticky_session);
     if (!schema_equals(decoded.schema, impl_->output_schema)) {
@@ -2627,7 +2733,7 @@ void HttpExchangeSession::cancel() noexcept {
         replace_metadata(metadata, keys::CANCEL, "1");
         const AnnotatedBatch cancel = AnnotatedBatch::data(make_empty_batch(empty_schema()));
         (void)impl_->state->post(
-            impl_->method, impl_->state->path(impl_->method, "/exchange"),
+            impl_->method, impl_->state->method_path(impl_->method, "/exchange"),
             encode_ipc(cancel, metadata, impl_->state->request_serialization_cap()), request_id,
             CallOptions{}, false, impl_->sticky_session);
     } catch (const std::exception&) {
@@ -2742,10 +2848,10 @@ HttpStreamSession HttpClient::open_producer(const std::string& method,
     if (!state_) throw HttpClientError("HttpClient is moved from");
     if (!output_schema) throw std::invalid_argument("producer output schema must not be null");
     const std::string request_id = logical_request_id(options);
-    const auto metadata = request_metadata(request.custom_metadata, method,
+    const auto metadata = request_metadata(request.custom_metadata, method, state_->config.protocol,
                                            state_->config.protocol_version, request_id);
     const auto response =
-        state_->post(method, state_->path(method, "/init"),
+        state_->post(method, state_->method_path(method, "/init"),
                      encode_ipc(request, metadata, state_->request_serialization_cap()), request_id,
                      options, true, sticky_session_);
     auto decoded = state_->decode(response, ResponseShape::STREAM_INIT, has_header,
@@ -2767,10 +2873,10 @@ HttpStreamSession HttpClient::open_stream_exchange(const std::string& method,
         throw std::invalid_argument("exchange input and output schemas must not be null");
     }
     const std::string request_id = logical_request_id(options);
-    const auto metadata = request_metadata(request.custom_metadata, method,
+    const auto metadata = request_metadata(request.custom_metadata, method, state_->config.protocol,
                                            state_->config.protocol_version, request_id);
     const auto response =
-        state_->post(method, state_->path(method, "/init"),
+        state_->post(method, state_->method_path(method, "/init"),
                      encode_ipc(request, metadata, state_->request_serialization_cap()), request_id,
                      options, true, sticky_session_);
     auto decoded = state_->decode(response, ResponseShape::STREAM_INIT, has_header,
@@ -2856,7 +2962,7 @@ std::optional<AnnotatedBatch> HttpStreamSession::tick(const CallOptions& options
         // though the continuation cursor itself is immutable. Replay only
         // when the caller has explicitly declared this turn idempotent.
         const auto response = impl_->state->post(
-            impl_->method, impl_->state->path(impl_->method, "/exchange"),
+            impl_->method, impl_->state->method_path(impl_->method, "/exchange"),
             encode_ipc(request, metadata, impl_->state->request_serialization_cap()), request_id,
             options, true, impl_->sticky_session);
         auto decoded = impl_->state->decode(response, ResponseShape::PRODUCER_TURN, false,
@@ -2919,7 +3025,7 @@ std::optional<AnnotatedBatch> HttpStreamSession::exchange(const AnnotatedBatch& 
     }
     impl_->is_closed = true;
     const auto response =
-        impl_->state->post(impl_->method, impl_->state->path(impl_->method, "/exchange"),
+        impl_->state->post(impl_->method, impl_->state->method_path(impl_->method, "/exchange"),
                            encode_ipc(input, metadata, impl_->state->request_serialization_cap()),
                            request_id, options, false, impl_->sticky_session);
     auto decoded = impl_->state->decode(response, ResponseShape::EXCHANGE_TURN, false,
@@ -2972,7 +3078,7 @@ void HttpStreamSession::cancel() noexcept {
         auto metadata = impl_->continuation_metadata(request_id, true);
         const AnnotatedBatch request = AnnotatedBatch::data(make_empty_batch(empty_schema()));
         (void)impl_->state->post(
-            impl_->method, impl_->state->path(impl_->method, "/exchange"),
+            impl_->method, impl_->state->method_path(impl_->method, "/exchange"),
             encode_ipc(request, metadata, impl_->state->request_serialization_cap()), request_id,
             CallOptions{}, false, impl_->sticky_session);
     } catch (const std::exception&) {

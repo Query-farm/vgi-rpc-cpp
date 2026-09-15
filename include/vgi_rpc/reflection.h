@@ -14,15 +14,10 @@
 #include <arrow/type.h>
 
 #include "vgi_rpc/export.h"
+#include "vgi_rpc/metadata.h"
 #include "vgi_rpc/server.h"
 
 namespace vgi_rpc {
-
-/// The wire name of the reflection protocol.
-///
-/// Fixed, and the one protocol name a client may know a priori: it is the
-/// bootstrap, so there is nothing to discover it with.
-inline constexpr const char* kReflectionProtocolName = "vgi_rpc.Reflection.v1";
 
 /// One hosted protocol, as it appears in `list_protocols`.
 struct VGI_RPC_EXPORT ProtocolSummary {

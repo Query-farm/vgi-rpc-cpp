@@ -147,6 +147,15 @@ struct HttpClientConfig {
     // Sent on every request. Native clients default to 256 MiB. Appended for
     // positional aggregate source compatibility.
     int64_t accepted_max_response_bytes = 256LL * 1024 * 1024;
+    // Routing key of the protocol this client addresses. When set, application
+    // methods are posted to {prefix}/{protocol}/{method} and carry
+    // vgi_rpc.protocol; reserved __name__ methods, being server-level surface
+    // owned by no protocol, stay flat and carry no key either way.
+    //
+    // Empty keeps the flat {prefix}/{method} shape a peer that predates
+    // multi-service routing serves. Appended, again, for positional aggregate
+    // source compatibility.
+    std::string protocol;
 };
 
 /// One HTTP/1.1 exchange carried over an authenticated `iroh-http/2` stream.
@@ -258,6 +267,8 @@ public:
 
     HttpClientBuilder& config(HttpClientConfig config);
     HttpClientBuilder& prefix(std::string prefix);
+    /// Routing key of the protocol to address; see HttpClientConfig::protocol.
+    HttpClientBuilder& protocol(std::string protocol);
     HttpClientBuilder& protocol_version(std::string version);
     HttpClientBuilder& header(std::string name, std::string value);
     HttpClientBuilder& compression_level(std::optional<int> level);
@@ -312,8 +323,19 @@ public:
     // capabilities.  Ordinary RPC responses refine the same cache.
     HttpServerCapabilities capabilities(const CallOptions& options = {}) const;
 
-    // Fetch and validate the protocol's version-4 introspection document.
+    // Every protocol this server hosts, with versions and hashes.  The cheap
+    // half of discovery: the hash answers "has it changed" without
+    // transferring a single schema.
+    ProtocolListing list_protocols(const CallOptions& options = {}) const;
+
+    // Fetch and validate one protocol's description via vgi_rpc.Reflection.v1.
+    // Costs up to two round trips, because a server may host several protocols
+    // and there is no longer a single "the" protocol to describe without
+    // asking.  Name the protocol to skip the first hop; server_id and
+    // request_version are then empty, being properties only list_protocols
+    // reports.
     ServiceDescription describe(const CallOptions& options = {}) const;
+    ServiceDescription describe(const std::string& protocol, const CallOptions& options = {}) const;
 
     // Request one or more method-bound external upload/download URL pairs.
     std::vector<HttpUploadUrl> request_upload_urls(int64_t count,
@@ -356,6 +378,11 @@ private:
     friend class HttpSessionView;
     explicit HttpClient(std::shared_ptr<HttpClientState> state,
                         std::shared_ptr<HttpStickySessionState> sticky_session = nullptr);
+
+    // One unary call routed to the co-hosted reflection protocol.
+    AnnotatedBatch call_reflection(const std::string& method, const AnnotatedBatch& request,
+                                   const CallOptions& options) const;
+
     std::shared_ptr<HttpClientState> state_;
     std::shared_ptr<HttpStickySessionState> sticky_session_;
 };
@@ -372,7 +399,9 @@ public:
                         std::shared_ptr<arrow::Schema> expected_output_schema = nullptr,
                         const CallOptions& options = {}) const;
     HttpServerCapabilities capabilities(const CallOptions& options = {}) const;
+    ProtocolListing list_protocols(const CallOptions& options = {}) const;
     ServiceDescription describe(const CallOptions& options = {}) const;
+    ServiceDescription describe(const std::string& protocol, const CallOptions& options = {}) const;
     std::vector<HttpUploadUrl> request_upload_urls(int64_t count,
                                                    const CallOptions& options = {}) const;
     HttpExchangeSession open_exchange(const std::string& method, const AnnotatedBatch& request,

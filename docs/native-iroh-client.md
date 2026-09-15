@@ -31,9 +31,10 @@ auto client = vgi_rpc::HttpClient::builder("httpi://<64-hex-endpoint-id>/vgi")
 auto description = client.describe();
 ```
 
-The URI base path is the RPC prefix: `/vgi` above produces `/vgi/health`, `/vgi/__describe__`, and
-`/vgi/<method>` requests. A URI without a path uses bare `/<method>` routes. A later builder
-`prefix()` or `config()` call is an explicit override.
+The URI base path is the RPC prefix: `/vgi` above produces `/vgi/health` and `/vgi/<method>`
+requests, or `/vgi/<protocol>/<method>` once `protocol()` names a routing key. A URI without a path
+uses bare `/<method>` routes. A later builder `prefix()` or `config()` call is an explicit
+override.
 
 Only the HTTP carrier changes. Capability discovery, request/response size negotiation, Arrow IPC,
 compression, authentication callbacks, sticky sessions, continuations, typed exchange/producer

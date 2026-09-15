@@ -290,6 +290,7 @@ int main() {
 
         HttpClientConfig config;
         config.prefix = "";
+        config.protocol = "ClientConformanceService";
         config.max_request_bytes = 8 * 1024 * 1024;
         config.max_response_bytes = 8 * 1024 * 1024;
         auto client = HttpClient::builder("http://127.0.0.1:" + std::to_string(worker.port()))

@@ -188,6 +188,7 @@ int main() {
         external_options.url_policy = ExternalUrlPolicy::LOOPBACK_HTTP_TEST;
         auto client = HttpClient::builder("http://127.0.0.1:" + std::to_string(worker.port()))
                           .prefix("/vgi")
+                          .protocol("ClientConformanceService")
                           .external_http_options(external_options)
                           .build();
         const auto capabilities = client.capabilities();
@@ -212,6 +213,7 @@ int main() {
         auto external_disabled =
             HttpClient::builder("http://127.0.0.1:" + std::to_string(worker.port()))
                 .prefix("/vgi")
+                .protocol("ClientConformanceService")
                 .disable_external_locations()
                 .build();
         bool disabled_urls_rejected = false;
