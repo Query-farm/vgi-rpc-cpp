@@ -78,6 +78,8 @@ add_library(vgi_rpc
     src/pipe_transport.cpp
     src/socket_transport.cpp
     src/describe.cpp
+    src/type_tokens.cpp
+    src/protocol_hash.cpp
     src/access_log.cpp
     src/http_transport.cpp
     src/http_client.cpp
