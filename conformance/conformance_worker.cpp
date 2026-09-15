@@ -102,8 +102,8 @@ static std::shared_ptr<arrow::Schema> accum_output_schema() {
 
 static std::shared_ptr<arrow::Schema> conformance_header_schema() {
     static auto s = arrow::schema({
-        arrow::field("total_expected", arrow::int64()),
-        arrow::field("description", arrow::utf8()),
+        arrow::field("total_expected", arrow::int64(), /*nullable=*/false),
+        arrow::field("description", arrow::utf8(), /*nullable=*/false),
     });
     return s;
 }
@@ -147,46 +147,46 @@ static std::shared_ptr<arrow::DataType> conformance_status_map_type() {
 // =========================================================================
 
 static std::shared_ptr<arrow::Schema> str_result_schema() {
-    static auto s = arrow::schema({arrow::field("result", arrow::utf8())});
+    static auto s = arrow::schema({arrow::field("result", arrow::utf8(), /*nullable=*/false)});
     return s;
 }
 static std::shared_ptr<arrow::Schema> bytes_result_schema() {
-    static auto s = arrow::schema({arrow::field("result", arrow::binary())});
+    static auto s = arrow::schema({arrow::field("result", arrow::binary(), /*nullable=*/false)});
     return s;
 }
 static std::shared_ptr<arrow::Schema> int_result_schema() {
-    static auto s = arrow::schema({arrow::field("result", arrow::int64())});
+    static auto s = arrow::schema({arrow::field("result", arrow::int64(), /*nullable=*/false)});
     return s;
 }
 static std::shared_ptr<arrow::Schema> float_result_schema() {
-    static auto s = arrow::schema({arrow::field("result", arrow::float64())});
+    static auto s = arrow::schema({arrow::field("result", arrow::float64(), /*nullable=*/false)});
     return s;
 }
 static std::shared_ptr<arrow::Schema> bool_result_schema() {
-    static auto s = arrow::schema({arrow::field("result", arrow::boolean())});
+    static auto s = arrow::schema({arrow::field("result", arrow::boolean(), /*nullable=*/false)});
     return s;
 }
 static std::shared_ptr<arrow::Schema> binary_result_schema() {
-    static auto s = arrow::schema({arrow::field("result", arrow::binary())});
+    static auto s = arrow::schema({arrow::field("result", arrow::binary(), /*nullable=*/false)});
     return s;
 }
 static std::shared_ptr<arrow::Schema> enum_result_schema() {
     static auto s =
-        arrow::schema({arrow::field("result", arrow::dictionary(arrow::int16(), arrow::utf8()))});
+        arrow::schema({arrow::field("result", arrow::dictionary(arrow::int16(), arrow::utf8()), /*nullable=*/false)});
     return s;
 }
 static std::shared_ptr<arrow::Schema> list_str_result_schema() {
-    static auto s = arrow::schema({arrow::field("result", arrow::list(arrow::utf8()))});
+    static auto s = arrow::schema({arrow::field("result", arrow::list(arrow::utf8()), /*nullable=*/false)});
     return s;
 }
 static std::shared_ptr<arrow::Schema> dict_str_int_result_schema() {
     static auto s =
-        arrow::schema({arrow::field("result", arrow::map(arrow::utf8(), arrow::int64()))});
+        arrow::schema({arrow::field("result", arrow::map(arrow::utf8(), arrow::int64()), /*nullable=*/false)});
     return s;
 }
 static std::shared_ptr<arrow::Schema> nested_list_result_schema() {
     static auto s =
-        arrow::schema({arrow::field("result", arrow::list(arrow::list(arrow::int64())))});
+        arrow::schema({arrow::field("result", arrow::list(arrow::list(arrow::int64())), /*nullable=*/false)});
     return s;
 }
 static std::shared_ptr<arrow::Schema> optional_str_result_schema() {
@@ -210,16 +210,16 @@ static std::shared_ptr<arrow::Schema> required_int32_result_schema() {
     return s;
 }
 static std::shared_ptr<arrow::Schema> int32_result_schema() {
-    static auto s = arrow::schema({arrow::field("result", arrow::int32())});
+    static auto s = arrow::schema({arrow::field("result", arrow::int32(), /*nullable=*/false)});
     return s;
 }
 static std::shared_ptr<arrow::Schema> float32_result_schema() {
-    static auto s = arrow::schema({arrow::field("result", arrow::float32())});
+    static auto s = arrow::schema({arrow::field("result", arrow::float32(), /*nullable=*/false)});
     return s;
 }
 // list[int] return (cancel_probe_counters)
 static std::shared_ptr<arrow::Schema> list_int_result_schema() {
-    static auto s = arrow::schema({arrow::field("result", arrow::list(arrow::int64()))});
+    static auto s = arrow::schema({arrow::field("result", arrow::list(arrow::int64()), /*nullable=*/false)});
     return s;
 }
 

@@ -171,6 +171,12 @@ public:
 
     const std::string& server_id() const noexcept { return server_id_; }
     const std::string& protocol_name() const noexcept { return protocol_name_; }
+
+    /// Serve one call to the co-hosted reflection protocol.
+    bool serve_reflection(const std::shared_ptr<arrow::io::OutputStream>& output,
+                          const std::string& method_name,
+                          const std::shared_ptr<arrow::RecordBatch>& request_batch,
+                          const std::string& request_id);
     const std::unordered_map<std::string, MethodInfo>& methods() const noexcept { return methods_; }
     // The reason a request's declared application protocol version is
     // incompatible with this server's, or empty when it is fine.

@@ -5,6 +5,8 @@
 #include "vgi_rpc/access_log.h"
 #include "vgi_rpc/arrow_utils.h"
 #include "vgi_rpc/metadata.h"
+#include "vgi_rpc/reflection.h"
+#include <arrow/array/builder_binary.h>
 #include "vgi_rpc/wire.h"
 #include "vgi_rpc/log_sink.h"
 #include "vgi_rpc/output_collector.h"
@@ -153,6 +155,86 @@ void Server::run() {
     }
 }
 
+/// Serve one call to `vgi_rpc.Reflection.v1`.
+///
+/// Two methods, deliberately. `list_protocols` is the cheap question -- what is
+/// here, and has it changed -- and the only one a client needs on a warm path,
+/// because the hash answers "has it changed" without transferring any schema.
+/// `describe` is the expensive one, asked once.
+///
+/// Self-description is not special-cased: reflection appears in its own output,
+/// so a client discovers it the same way it discovers everything else.
+bool Server::serve_reflection(const std::shared_ptr<arrow::io::OutputStream>& output,
+                              const std::string& method_name,
+                              const std::shared_ptr<arrow::RecordBatch>& request_batch,
+                              const std::string& request_id) {
+    auto fail = [&](const std::string& type, const std::string& message) {
+        auto err = Result::error(empty_schema(), type, message, server_id_, request_id);
+        write_ipc_stream(output, empty_schema(), {err.annotated_batch()});
+        VGI_RPC_THROW_NOT_OK(output->Flush());
+        return true;
+    };
+
+    auto app_hash = BindingHash(protocol_name_, methods_);
+    if (!app_hash.ok()) return fail("RuntimeError", app_hash.status().ToString());
+    // Reflection describes itself with no methods of its own in the table: they
+    // are framework-owned rather than registered, so the honest hash is over an
+    // empty method set.
+    const std::unordered_map<std::string, MethodInfo> reflection_methods;
+    auto refl_hash = BindingHash(kReflectionProtocolName, reflection_methods);
+    if (!refl_hash.ok()) return fail("RuntimeError", refl_hash.status().ToString());
+
+    arrow::Result<std::string> payload = arrow::Status::Invalid("unreachable");
+    if (method_name == "list_protocols") {
+        payload = BuildProtocolList(
+            server_id_, "", REQUEST_VERSION_VALUE,
+            {ProtocolSummary{protocol_name_, protocol_version_, *app_hash},
+             ProtocolSummary{kReflectionProtocolName, "", *refl_hash}});
+    } else if (method_name == "describe") {
+        std::string requested;
+        if (request_batch != nullptr) {
+            auto col = request_batch->GetColumnByName("protocol");
+            if (col != nullptr && col->length() > 0 && col->IsValid(0)) {
+                if (auto* sa = dynamic_cast<arrow::StringArray*>(col.get())) {
+                    requested = sa->GetString(0);
+                }
+            }
+        }
+        if (requested == protocol_name_) {
+            payload = BuildServiceDescription(protocol_name_, protocol_version_, *app_hash,
+                                              methods_);
+        } else if (requested == kReflectionProtocolName) {
+            payload = BuildServiceDescription(kReflectionProtocolName, "", *refl_hash,
+                                              reflection_methods);
+        } else {
+            // Named, not silently empty: an empty description reads as "this
+            // protocol has no methods".
+            return fail("RuntimeError", "This server does not host protocol '" + requested +
+                                            "'. Hosted: [" + protocol_name_ + ", " +
+                                            kReflectionProtocolName + "]");
+        }
+    } else {
+        return fail("AttributeError",
+                    std::string("Protocol '") + kReflectionProtocolName + "' has no method '" +
+                        method_name + "'. Available: ['describe', 'list_protocols']");
+    }
+    if (!payload.ok()) return fail("RuntimeError", payload.status().ToString());
+
+    // The framework's ordinary convention for a structured return: the payload
+    // rides as serialized bytes in a single `result` binary column. Reflection
+    // is an ordinary protocol, so it is subject to it like everything else.
+    auto schema = arrow::schema({arrow::field("result", arrow::binary(), /*nullable=*/false)});
+    arrow::BinaryBuilder b;
+    VGI_RPC_THROW_NOT_OK(b.Append(*payload));
+    std::shared_ptr<arrow::Array> arr;
+    VGI_RPC_THROW_NOT_OK(b.Finish(&arr));
+    auto out_batch = arrow::RecordBatch::Make(schema, 1, {arr});
+    auto result = Result::value(out_batch);
+    write_ipc_stream(output, schema, {result.annotated_batch()});
+    VGI_RPC_THROW_NOT_OK(output->Flush());
+    return true;
+}
+
 bool Server::serve_one(const std::shared_ptr<arrow::io::InputStream>& input,
                        const std::shared_ptr<arrow::io::OutputStream>& output) {
     return serve_one(input, output, TransportKind::PIPE);
@@ -222,6 +304,15 @@ bool Server::serve_one_with_state(const std::shared_ptr<arrow::io::InputStream>&
         write_ipc_stream(output, empty_schema(), {error_result.annotated_batch()});
         VGI_RPC_THROW_NOT_OK(output->Flush());
         return true;
+    }
+
+    // 3a. Reflection is a co-hosted protocol, routed by the same key as
+    // everything else and appearing in its own output. Handled before the
+    // version gate because it is exempt from it: this is what a
+    // version-mismatched client calls to learn what mismatched, and gating it
+    // would deny the client the diagnosis it came for.
+    if (get_metadata_value(custom_metadata, keys::PROTOCOL) == kReflectionProtocolName) {
+        return serve_reflection(output, method_name, batch, request_id);
     }
 
     // 4. Application protocol version gate.
