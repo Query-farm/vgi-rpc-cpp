@@ -226,9 +226,15 @@ jobs:
           # server. identity_consistency greps this port's sources for the
           # Identity.v1 invariants. Both exit non-zero on disagreement, and
           # `set -e` carries that out of the step.
+          #
+          # --verbose on the second one is not noise. It is a source-level
+          # grep: with the layout above even slightly wrong it would have
+          # nothing to read, and a passing exit code and a real audit are
+          # different claims. --verbose makes the log name this port and the
+          # files it actually opened, so the difference is visible.
           cd "$reference"
           python tools/cross-port/describe_diff.py --only cpp
-          python tools/cross-port/identity_consistency.py --only cpp
+          python tools/cross-port/identity_consistency.py --only cpp --verbose
 
       - name: Test native HTTP-over-Iroh end to end (direct, no relay)
         if: runner.os == 'Linux' && runner.arch == 'X64'
