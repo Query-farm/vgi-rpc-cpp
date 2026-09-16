@@ -1817,7 +1817,7 @@ int main(int argc, char** argv) {
 
     // --- Scalar Echo ---
     builder
-        .add_unary("echo_string", params({arrow::field("value", arrow::utf8())}),
+        .add_unary("echo_string", params({arrow::field("text", arrow::utf8())}),
                    str_result_schema(), echo_string_handler, "Echo a string value.")
         .add_unary("echo_bytes", params({arrow::field("data", arrow::binary())}),
                    bytes_result_schema(), echo_bytes_handler, "Echo a bytes value.")
