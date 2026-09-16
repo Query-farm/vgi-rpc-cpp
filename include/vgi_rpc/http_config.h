@@ -163,6 +163,15 @@ struct HttpConfig {
     int64_t hosting_max_response_bytes = -1;
     int64_t preferred_response_bytes = -1;
 
+    // Largest body a *client* may PUT to a vended upload URL, advertised as
+    // `VGI-Max-Upload-Bytes`.  Advertisement only, and deliberately its own
+    // number: it bounds a request the client uploads, while
+    // `max_externalized_response_bytes` bounds a response this server uploads.
+    // Deriving one from the other made a tight response cap silently forbid
+    // large *requests* to any client that honours the advertisement. Appended,
+    // like the fields above it, for positional aggregate source compatibility.
+    int64_t max_upload_bytes = int64_t{1} << 31;
+
     // Called once with the bound port, before the accept loop starts.
     //
     // `port = 0` picks a free one, and printing `PORT:<n>` to stdout is a CLI

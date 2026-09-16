@@ -852,10 +852,7 @@ void HttpServer::stamp_capabilities(httplib::Response& res) const {
         if (!configured_request_limit) {
             res.set_header("VGI-Max-Request-Bytes", std::to_string(cfg_.externalize_threshold));
         }
-        res.set_header("VGI-Max-Upload-Bytes",
-                       std::to_string(cfg_.max_externalized_response_bytes >= 0
-                                          ? cfg_.max_externalized_response_bytes
-                                          : int64_t{1} << 31));
+        res.set_header("VGI-Max-Upload-Bytes", std::to_string(cfg_.max_upload_bytes));
     }
     // Present-but-empty is a server positively stating it speaks no
     // compression; absent would mean a server predating the header, for which
