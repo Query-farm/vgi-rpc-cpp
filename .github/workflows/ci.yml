@@ -186,6 +186,50 @@ jobs:
       - name: Test (unit)
         run: ctest --test-dir build --output-on-failure -E conformance
 
+      # Cross-port drift. Everything above establishes that this port agrees
+      # with itself and with the spec as this repository reads it; nothing
+      # above compares it to another implementation. These two tools do, and
+      # between them they have caught ports describing a protocol as having
+      # zero methods, six ports logging six different wrong protocol hashes,
+      # and a client sending bare paths — none of it visible from inside any
+      # single port.
+      #
+      # The reference is cloned from `main`, unpinned, by the install step
+      # above. That is deliberate: a pinned reference is how a lane rots for
+      # weeks while reporting green. A reference change that breaks this port
+      # is meant to turn this port red the day it lands.
+      #
+      # One leg only. The comparison is over protocol *shape* and over source
+      # text, neither of which varies by OS or architecture, so running it on
+      # all three legs would buy nothing and pay three times.
+      - name: Cross-port drift vs the Python reference
+        if: matrix.conformance && runner.os == 'Linux' && runner.arch == 'X64'
+        env:
+          VGI_RPC_REPOS: ${{ runner.temp }}/cross-port
+        run: |
+          set -euo pipefail
+          # Both tools resolve a port as <repos>/vgi-rpc-<dirname>, and both
+          # spell this port `vgi-rpc-c++` (describe_diff.SUBPROCESS_WORKERS,
+          # identity_consistency.PORTS). The GitHub checkout is `vgi-rpc-cpp`
+          # and the reference clone landed at `../vgi-rpc`, so assemble the
+          # layout the tools expect out of symlinks instead of re-cloning
+          # either repository — re-cloning the reference here would also
+          # reintroduce the risk of the two copies drifting apart mid-run.
+          mkdir -p "$VGI_RPC_REPOS"
+          reference="$(cd "$GITHUB_WORKSPACE/../vgi-rpc" && pwd)"
+          ln -sfn "$GITHUB_WORKSPACE" "$VGI_RPC_REPOS/vgi-rpc-c++"
+          ln -sfn "$reference" "$VGI_RPC_REPOS/vgi-rpc-python"
+
+          # describe_diff spawns build/conformance/conformance_worker (already
+          # built above; its `build` step is a no-op rebuild) and compares
+          # every protocol it hosts, by hash, against the in-process Python
+          # server. identity_consistency greps this port's sources for the
+          # Identity.v1 invariants. Both exit non-zero on disagreement, and
+          # `set -e` carries that out of the step.
+          cd "$reference"
+          python tools/cross-port/describe_diff.py --only cpp
+          python tools/cross-port/identity_consistency.py --only cpp
+
       - name: Test native HTTP-over-Iroh end to end (direct, no relay)
         if: runner.os == 'Linux' && runner.arch == 'X64'
         run: |
