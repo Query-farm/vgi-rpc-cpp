@@ -11,6 +11,27 @@ matching test group needs.
 
 Point ``VGI_RPC_CPP_WORKER`` at the built binary, or let it default to
 ``build/conformance/conformance_worker`` relative to the repo root.
+
+Two axes, both environment-selected:
+
+``VGI_CONFORMANCE_ROLE``
+    ``server`` (default) drives the C++ *server* with the reference Python
+    client.  ``client`` reverses it: every connection is opened by the C++
+    *client*, reached through the JSONL driver in
+    ``conformance/conformance_client_driver.cpp``.
+
+``VGI_CONFORMANCE_SERVER``
+    Which server the run talks to: ``cpp`` (default) or ``python``, the
+    reference.
+
+The pairing that matters is ``role=client`` with ``server=python``.  A run
+against one's own server proves the two halves of one port agree with each
+other; it cannot prove either agrees with the protocol, because every
+accommodation a server makes for the client it ships with is invisible to that
+pair and only that pair.  This port has already been bitten three times over —
+a client still calling the retired ``__describe__``, a missing
+``vgi_rpc.protocol`` routing key, and flat rather than namespaced HTTP paths —
+each of which a C++-only run reported as green.
 """
 
 from __future__ import annotations
@@ -42,8 +63,101 @@ _DEFAULT_WORKER = _REPO_ROOT / "build" / "conformance" / "conformance_worker"
 CONFORMANCE_CORS_ORIGIN = "https://conformance.example"
 
 
-def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
-    """Apply bounded timeouts to the C++ suite's deliberately heavier topologies.
+# ---------------------------------------------------------------------------
+# Role and server selection
+# ---------------------------------------------------------------------------
+
+#: ``server`` (default) or ``client``; see the module docstring.
+CONFORMANCE_ROLE = os.environ.get("VGI_CONFORMANCE_ROLE", "server")
+
+#: ``cpp`` (default) or ``python``.
+CONFORMANCE_SERVER = os.environ.get("VGI_CONFORMANCE_SERVER", "cpp")
+
+if CONFORMANCE_ROLE not in ("server", "client"):
+    raise RuntimeError(f"VGI_CONFORMANCE_ROLE must be 'server' or 'client', got {CONFORMANCE_ROLE!r}")
+if CONFORMANCE_SERVER not in ("cpp", "python"):
+    raise RuntimeError(f"VGI_CONFORMANCE_SERVER must be 'cpp' or 'python', got {CONFORMANCE_SERVER!r}")
+
+_DEFAULT_DRIVER = _REPO_ROOT / "build" / "conformance" / "conformance_client_driver"
+
+#: Interpreter that has the Python reference importable.  Only consulted when
+#: ``VGI_CONFORMANCE_SERVER=python``.
+_REFERENCE_PYTHON = os.environ.get("VGI_RPC_PYTHON") or sys.executable
+
+#: Checkout holding the reference's ``tests/serve_conformance_*.py`` entry
+#: points.  They live in the repository rather than the wheel, so a run against
+#: the Python server needs a checkout and not merely an install.
+_REFERENCE_REPO = Path(
+    os.environ.get("VGI_RPC_PYTHON_REPO") or Path.home() / "Development" / "vgi-rpc-python"
+)
+
+
+def _reference_script(name: str) -> str:
+    """Absolute path to one of the reference's conformance server scripts."""
+    path = _REFERENCE_REPO / "tests" / name
+    if not path.is_file():
+        pytest.skip(
+            f"Python reference server script not found: {path}. "
+            f"Set VGI_RPC_PYTHON_REPO to a vgi-rpc-python checkout."
+        )
+    return str(path)
+
+
+#: C++ worker flags the reference's HTTP entry point spells differently, or
+#: serves from a different script.  Kept as an explicit table rather than a
+#: shared flag vocabulary because the two workers are independent programs that
+#: happen to offer the same *configurations*, not the same command line.
+_PYTHON_HTTP_FLAG_RENAMES = {"--externalize-compression": "--compression"}
+
+#: Flags only the reference's "strict caps" entry point accepts.  Their
+#: presence selects that script.
+_PYTHON_STRICT_FLAGS = frozenset({"--max-response-bytes", "--max-externalized-response-bytes"})
+
+
+def _python_http_argv(extra_args: tuple[str, ...]) -> list[str]:
+    """Translate C++-worker HTTP flags onto the reference's entry points.
+
+    Raises:
+        Exception: ``pytest.skip`` when the configuration has no counterpart in
+            the reference's scripts.  Skipping is deliberate: silently serving
+            a *different* configuration would make the group pass while proving
+            nothing.
+
+    """
+    unsupported = {
+        "--auth-reject-all": "serve_conformance_http_auth.py (server-probe group only)",
+        "--introspect": "reference introspection worker",
+        "--transport-kind-probe": "reference transport-kind probe",
+        "--http-concurrency-probe": "reference concurrency probe",
+        "--polymorphic-stream-probe": "reference polymorphic-stream probe",
+        "--proof-mode": "serve_conformance_http_proof.py (server-probe group only)",
+    }
+    for flag in extra_args:
+        if flag in unsupported:
+            pytest.skip(f"the Python reference serves {flag} from {unsupported[flag]}")
+
+    script = (
+        "serve_conformance_http_strict.py"
+        if any(flag in _PYTHON_STRICT_FLAGS for flag in extra_args)
+        else "serve_conformance_http.py"
+    )
+    argv = [_REFERENCE_PYTHON, _reference_script(script)]
+    if script == "serve_conformance_http.py":
+        argv.append("--http")
+    for arg in extra_args:
+        argv.append(_PYTHON_HTTP_FLAG_RENAMES.get(arg, arg))
+    return argv
+
+
+def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
+    """Scope the run to its role, then bound the heavier topologies' timeouts.
+
+    In client role the run is narrowed to the tests that actually put the
+    client under test on the wire.  The rest of the shared suite pokes a server
+    with raw HTTP — CORS preflights, 401 shapes, proxy-proof envelopes,
+    request-id echo — and would report the *server's* health under a heading
+    that claims to be about the client.  Deselecting is visible in the summary;
+    passing them would not be.
 
     The portable suite's 50-second default is appropriate for most workers,
     but the C++ unary soak performs thousands of HTTP round trips and reaches
@@ -54,9 +168,25 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
     an object-store upload and fetch.
 
     """
+    if CONFORMANCE_ROLE == "client":
+        keep = [item for item in items if _exercises_the_client(item)]
+        deselected = [item for item in items if item not in keep]
+        if deselected:
+            config.hook.pytest_deselected(items=deselected)
+        items[:] = keep
+
     for item in items:
         if item.cls is not None and item.cls.__name__ == "TestResourceSoak":
             item.add_marker(pytest.mark.timeout(120), append=False)
+        elif CONFORMANCE_ROLE == "client" and item.cls is not None and item.cls.__name__ == "TestLargeData":
+            # Every multi-megabyte batch crosses the control channel twice more
+            # than it otherwise would, base64 inside JSON in both directions.
+            # That is harness cost, not client cost, and the portable
+            # five-second budget was sized for a client the suite calls
+            # in-process.  Typical is ~1s here; the allowance keeps a loaded
+            # runner from reporting throughput as a protocol failure, while
+            # still bounding completion.
+            item.add_marker(pytest.mark.timeout(30), append=False)
         elif (
             item.cls is not None
             and item.cls.__name__ == "TestLargeData"
@@ -70,6 +200,16 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
             item.add_marker(pytest.mark.timeout(30), append=False)
 
 
+if CONFORMANCE_ROLE == "client":
+    # `TestExternalLocation`, `TestSticky` and the response-cap groups import
+    # `http_connect` / `http_capabilities` / `request_upload_urls` *inside* the
+    # test body.  Without this they would quietly exercise the reference Python
+    # client and prove nothing about the port under test.
+    from vgi_rpc.conformance.client_driver import ClientDriver as _ClientDriver
+
+    _ClientDriver.from_env(default=[str(_DEFAULT_DRIVER)]).install_http_overrides()
+
+
 def worker_path() -> str:
     """Absolute path to the C++ conformance worker under test."""
     override = os.environ.get("VGI_RPC_CPP_WORKER")
@@ -79,12 +219,19 @@ def worker_path() -> str:
     return str(path)
 
 
+def stdio_server_argv() -> list[str]:
+    """Argv that serves the conformance protocol on stdin/stdout."""
+    if CONFORMANCE_SERVER == "python":
+        return [_REFERENCE_PYTHON, _reference_script("serve_conformance_pipe.py")]
+    return [worker_path()]
+
+
 @pytest.fixture(scope="session")
 def cpp_transport() -> Iterator[Any]:
     """One long-lived stdio worker for the shared-subprocess matrix leg."""
     from vgi_rpc.rpc import SubprocessTransport
 
-    transport = SubprocessTransport([worker_path()])
+    transport = SubprocessTransport(stdio_server_argv())
     try:
         yield transport
     finally:
@@ -135,9 +282,18 @@ def _wait_for_tcp(host: str, port: int, timeout: float = 30.0) -> None:
 
 @contextlib.contextmanager
 def spawn_http(*extra_args: str, tcp_readiness_only: bool = False) -> Iterator[int]:
-    """Spawn the C++ worker in HTTP mode with *extra_args*, yielding its port."""
+    """Spawn the server in HTTP mode with *extra_args*, yielding its port.
+
+    *extra_args* are the C++ worker's flags; ``_python_http_argv`` translates
+    them when the run is pointed at the Python reference.
+    """
+    argv = (
+        _python_http_argv(extra_args)
+        if CONFORMANCE_SERVER == "python"
+        else [worker_path(), "--http", *extra_args]
+    )
     proc = subprocess.Popen(
-        [worker_path(), "--http", *extra_args],
+        argv,
         stdout=subprocess.PIPE,
         stderr=sys.stderr,
     )
@@ -176,6 +332,8 @@ def conformance_http_port() -> Iterator[int]:
 @pytest.fixture
 def conformance_resource_soak_target() -> Iterator[Any]:
     """Expose one isolated C++ HTTP worker to the shared resource soak."""
+    if CONFORMANCE_ROLE != "server" or CONFORMANCE_SERVER != "cpp":
+        pytest.skip("the resource soak measures this port's own server process")
     from vgi_rpc.conformance import ConformanceService
     from vgi_rpc.conformance._resource_soak_pytest import (
         ResourceSoakLimits,
@@ -243,11 +401,23 @@ def conformance_http_externalize_always_port(
         yield port
 
 
+def _listener_argv(flag: str, value: str, extra_args: tuple[str, ...]) -> list[str]:
+    """Argv that binds the conformance protocol to a socket transport."""
+    if CONFORMANCE_SERVER != "python":
+        return [worker_path(), flag, value, *extra_args]
+    if extra_args:
+        pytest.skip(f"the Python reference socket servers take no flags: {extra_args}")
+    if flag == "--unix":
+        return [_REFERENCE_PYTHON, _reference_script("serve_conformance_unix.py"), value]
+    host, _, port = value.rpartition(":")
+    return [_REFERENCE_PYTHON, _reference_script("serve_conformance_tcp.py"), host or "127.0.0.1", port]
+
+
 @contextlib.contextmanager
 def _spawn_listener(flag: str, value: str, prefix: str, *extra_args: str) -> Iterator[str]:
-    """Spawn the worker on a socket transport, yielding its discovery line's payload."""
+    """Spawn the server on a socket transport, yielding its discovery line's payload."""
     proc = subprocess.Popen(
-        [worker_path(), flag, value, *extra_args], stdout=subprocess.PIPE, stderr=sys.stderr
+        _listener_argv(flag, value, extra_args), stdout=subprocess.PIPE, stderr=sys.stderr
     )
     try:
         assert proc.stdout is not None
@@ -307,6 +477,8 @@ def conformance_transport_kind_probes() -> Iterator[
     tuple[tuple[str, Callable[[], str]], ...]
 ]:
     """Expose real wire probes for every C++ server transport."""
+    if CONFORMANCE_SERVER != "cpp":
+        pytest.skip("the transport-kind probe is a C++ server build mode")
 
     class _KindProbe(Protocol):
         # The worker hosts every probe method under its one application protocol,
@@ -380,6 +552,118 @@ def conformance_transport_kind_probes() -> Iterator[
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+# ---------------------------------------------------------------------------
+# Client role
+#
+# The connection fixtures below are the seam: in server role they hand the
+# suite a reference Python client, and in client role they hand it a
+# `ClientDriverProxy` speaking to the C++ client through the JSONL driver.
+# Everything downstream of the fixture is the shared suite, unchanged.
+# ---------------------------------------------------------------------------
+
+
+def client_driver() -> Any:
+    """The `ClientDriver` this run drives, or a skip if it is not built."""
+    from vgi_rpc.conformance.client_driver import ClientDriver
+
+    driver = ClientDriver.from_env(default=[str(_DEFAULT_DRIVER)])
+    binary = Path(driver.command[0])
+    if not binary.is_absolute() or binary.is_file():
+        return driver
+    pytest.skip(f"conformance client driver not built: {binary}")
+
+
+def _driver_connection(
+    request: pytest.FixtureRequest,
+    param: str,
+    on_log: Callable[..., None] | None,
+) -> Any:
+    """Open one driver-backed connection for a `conformance_conn` parameter."""
+    from vgi_rpc.external import ExternalLocationConfig
+
+    external_config: Any = None
+    if param in ("pipe", "subprocess"):
+        # A driver process owns exactly one connection, so the shared-transport
+        # leg has no analogue here; it becomes a second independent stdio run
+        # rather than being dropped.
+        transport, target = "stdio", stdio_server_argv()
+    elif param == "shm":
+        transport, target = "shm", stdio_server_argv()
+    elif param == "http":
+        port = request.getfixturevalue("conformance_http_port")
+        transport, target = "http", f"http://127.0.0.1:{port}"
+    elif param == "http_externalize_always":
+        port = request.getfixturevalue("conformance_http_externalize_always_port")
+        transport, target = "http", f"http://127.0.0.1:{port}"
+        # Presence is all that crosses the control boundary: the *client under
+        # test* resolves the pointer batch, which is the whole point of the leg.
+        external_config = ExternalLocationConfig(url_validator=None)
+    elif param == "unix":
+        transport, target = "unix", request.getfixturevalue("conformance_unix_path")
+    elif param == "tcp":
+        host, port = request.getfixturevalue("conformance_tcp_addr")
+        transport, target = "tcp", f"{host}:{port}"
+    else:
+        raise AssertionError(f"unknown conformance transport {param!r}")
+
+    @contextlib.contextmanager
+    def _conn() -> Iterator[Any]:
+        proxy = client_driver().connect(
+            transport, target, on_log, external_config=external_config
+        )
+        try:
+            yield proxy
+        finally:
+            proxy.close()
+
+    return _conn()
+
+
+#: Test classes that reach the client through `http_connect`, `http_capabilities`
+#: or `request_upload_urls` *inside the test body* rather than through
+#: `conformance_conn`.  `ClientDriver.install_http_overrides` re-binds those
+#: three, so these do exercise the client under test and are kept in client
+#: role.  Every other class that takes none of the connection fixtures pokes a
+#: server with raw HTTP and says nothing about a client.
+_CLIENT_ROLE_HTTP_CLASSES = frozenset(
+    {
+        "TestExternalLocation",
+        "TestHttpResponseCap",
+        "TestHttpResponseCapProducer",
+        "TestExternalizedResponseCap",
+        "TestCallTokenSplit",
+        "TestColdCallStateCache",
+        "TestSticky",
+    }
+)
+
+#: Connection fixtures whose presence marks a test as client-exercising.
+_CLIENT_ROLE_FIXTURES = frozenset(
+    {"conformance_conn", "conformance_raw_conn", "conformance_describe"}
+)
+
+#: Classes that take a connection fixture only to borrow its *socket*.  The
+#: adversarial groups hand-craft malformed request bytes and write them onto
+#: `proxy._transport` directly, deliberately bypassing whatever client the
+#: fixture built — they test a server's handling of a hostile wire.  A
+#: driver-backed proxy has no such attribute by construction: the socket lives
+#: in the client process, which is the point.
+_CLIENT_ROLE_EXCLUDED_CLASSES = frozenset(
+    {"TestAdversarialRawRequestContract", "TestAdversarialHttpRequestContract"}
+)
+
+
+def _exercises_the_client(item: pytest.Item) -> bool:
+    """Whether *item* actually puts the client under test on the wire."""
+    name = item.cls.__name__ if item.cls is not None else None
+    if name in _CLIENT_ROLE_EXCLUDED_CLASSES:
+        return False
+    if name in _CLIENT_ROLE_HTTP_CLASSES:
+        return True
+    fixtures = getattr(item, "fixturenames", ())
+    return any(fixture in _CLIENT_ROLE_FIXTURES for fixture in fixtures)
+
+
 class _ShmAdapter:
     """Expose a Python-owned SHM segment beside a subprocess pipe."""
 
@@ -439,8 +723,10 @@ def conformance_conn(
     )
 
     def factory(on_log: Callable[[Message], None] | None = None) -> Any:
+        if CONFORMANCE_ROLE == "client":
+            return _driver_connection(request, request.param, on_log)
         if request.param == "pipe":
-            return connect(ConformanceService, [worker_path()], on_log=on_log)
+            return connect(ConformanceService, stdio_server_argv(), on_log=on_log)
         if request.param == "subprocess":
             @contextlib.contextmanager
             def _shared_conn() -> Iterator[Any]:
@@ -453,7 +739,7 @@ def conformance_conn(
             @contextlib.contextmanager
             def _shm_conn() -> Iterator[Any]:
                 segment = ShmSegment.create(64 * 1024 * 1024)
-                transport = SubprocessTransport([worker_path()])
+                transport = SubprocessTransport(stdio_server_argv())
                 try:
                     yield _RpcProxy(
                         ConformanceService,
@@ -511,8 +797,10 @@ def conformance_raw_conn(request: pytest.FixtureRequest, cpp_transport: Any) -> 
     )
 
     def factory(on_log: Callable[[Any], None] | None = None) -> Any:
+        if CONFORMANCE_ROLE == "client":
+            return _driver_connection(request, request.param, on_log)
         if request.param == "pipe":
-            return connect(ConformanceService, [worker_path()], on_log=on_log)
+            return connect(ConformanceService, stdio_server_argv(), on_log=on_log)
         if request.param == "subprocess":
             @contextlib.contextmanager
             def _shared_conn() -> Iterator[Any]:
@@ -525,7 +813,7 @@ def conformance_raw_conn(request: pytest.FixtureRequest, cpp_transport: Any) -> 
             @contextlib.contextmanager
             def _shm_conn() -> Iterator[Any]:
                 segment = ShmSegment.create(64 * 1024 * 1024)
-                transport = SubprocessTransport([worker_path()])
+                transport = SubprocessTransport(stdio_server_argv())
                 try:
                     yield _RpcProxy(
                         ConformanceService,
@@ -572,6 +860,14 @@ def conformance_describe(
     from vgi_rpc.introspect import introspect
     from vgi_rpc.rpc import SubprocessTransport, TcpTransport, UnixTransport
 
+    if CONFORMANCE_ROLE == "client":
+        # The client's own two-hop reflection walk, relayed already decoded:
+        # `describe` is the single deliberate exception to "the driver decodes
+        # nothing", because the reply is two nested payloads and relaying raw
+        # Arrow would make the Python shim re-implement the reflection schema.
+        with _driver_connection(request, request.param, None) as proxy:
+            return proxy.describe()
+
     if request.param == "http":
         return http_introspect(f"http://127.0.0.1:{conformance_http_port}")
     if request.param == "subprocess":
@@ -592,7 +888,7 @@ def conformance_describe(
             return introspect(transport)
         finally:
             transport.close()
-    transport = SubprocessTransport([worker_path()])
+    transport = SubprocessTransport(stdio_server_argv())
     try:
         return introspect(transport)
     finally:

@@ -29,6 +29,32 @@ Two conformance suites, both driven by `scripts/run_conformance.sh`:
 1. `vgi-rpc-test` — the CLI runner, over pipe, Unix socket, TCP, and HTTP, plus access-log validation.
 2. `pytest tests/conformance/test_suite.py tests/conformance/test_polymorphic_stream.py` — the mandatory, zero-skip shared suite re-exported from `vgi_rpc.conformance._pytest_suite`, which reaches the capability-gated HTTP groups the CLI runner cannot: sticky sessions, proxy proof, CORS, 401s, token introspection, zstd/gzip compression negotiation, external locations, response caps. `tests/conformance/conftest.py` supplies the fixtures by spawning the worker with the matching flags. `test_cloud_storage.py` runs separately because S3/GCS are opt-in build profiles.
 
+Both of those drive this port's **server**. The **client** is tested by the same
+shared suite run in the other direction — `scripts/run_client_conformance.sh` —
+which opens every connection through `conformance/conformance_client_driver.cpp`,
+a JSONL bridge specified by the reference's
+`tools/cross-port/specs/CLIENT_DRIVER_PROTOCOL.md`.
+
+> A conforming client passes the conformance suite **against the reference
+> server**.
+
+The second half is load bearing, and `VGI_CONFORMANCE_SERVER=python` is the leg
+that establishes it. A green run against our own server proves only that the two
+halves of this port agree with each other: every accommodation a server makes
+for the client it ships with is invisible to that pair and only that pair. This
+port had shipped a client calling the retired `__describe__`, sending no
+`vgi_rpc.protocol` routing key, and posting flat rather than namespaced HTTP
+paths, with every C++-only suite green throughout. Run the `cpp` leg too — the
+gap between the two localises a defect to one side immediately — but never
+instead.
+
+The driver is a **relay**. It must not decode or re-encode values, resolve an
+external pointer, default a method name or routing key, infer a stream kind from
+a method name, retry, or normalise an error type: each of those converts a
+client defect into a passing run. Its stdout is the control channel and nothing
+else, which is why it moves the real descriptor aside at startup and points fd 1
+at stderr — one stray `printf` from any library desynchronises the whole run.
+
 Prefer:
 - Conformance tests (Python) for protocol correctness and end-to-end validation
 - Minimal C++ unit tests only for internal utilities and type conversion logic — the exception is `tests/crypto_test.cpp`, which pins the hand-written primitives against published vectors (FIPS 180-4, RFC 4231, RFC 4648) and an envelope sealed by an independent implementation. A crypto implementation that only agrees with itself is worth nothing.

@@ -312,3 +312,43 @@ jobs:
         env:
           CONFORMANCE_WORKER: ${{ github.workspace }}/build/conformance/conformance_worker
         run: ./scripts/run_conformance.sh
+
+      # Everything above drives this port's *server* with the reference
+      # client. The two steps below reverse that and drive this port's
+      # *client*, through the JSONL driver in
+      # conformance/conformance_client_driver.cpp.
+      #
+      # This is the half nothing else covers. The client had shipped calling
+      # the retired `__describe__`, sending no `vgi_rpc.protocol` routing key,
+      # and posting flat rather than namespaced HTTP paths; three C++-only
+      # suites reported green throughout, because a server accommodates the
+      # client it ships with and neither half can see the accommodation. The
+      # Rust port's client sent bare paths for weeks on exactly that basis and
+      # produced 730 failures the first time it met the reference.
+      #
+      # Both legs on every OS, unlike the protocol-shape drift check above:
+      # what is under test here is transport code — subprocess spawn, AF_UNIX,
+      # TCP, HTTP keep-alive — and that is precisely what varies by platform.
+      - name: Test (client role — this port's client vs the Python reference server)
+        if: matrix.conformance
+        # The gate. A conforming client passes the conformance suite against
+        # the reference server; a run against our own server cannot establish
+        # that, however green.
+        env:
+          VGI_CONFORMANCE_ROLE: client
+          VGI_CONFORMANCE_SERVER: python
+          VGI_CLIENT_DRIVER: ${{ github.workspace }}/build/conformance/conformance_client_driver
+          VGI_RPC_PYTHON_REPO: ${{ github.workspace }}/../vgi-rpc
+        run: python -m pytest tests/conformance/test_suite.py -q -p no:randomly
+
+      - name: Test (client role — this port's client vs this port's server)
+        if: matrix.conformance
+        # Not the gate: a regression check, and a triage aid. When the step
+        # above goes red, the gap between the two runs localises the defect to
+        # one side in a single comparison.
+        env:
+          VGI_CONFORMANCE_ROLE: client
+          VGI_CONFORMANCE_SERVER: cpp
+          VGI_CLIENT_DRIVER: ${{ github.workspace }}/build/conformance/conformance_client_driver
+          VGI_RPC_CPP_WORKER: ${{ github.workspace }}/build/conformance/conformance_worker
+        run: python -m pytest tests/conformance/test_suite.py -q -p no:randomly
