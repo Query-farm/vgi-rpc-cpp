@@ -21,9 +21,9 @@ namespace vgi_rpc {
 
 /// One hosted protocol, as it appears in `list_protocols`.
 struct VGI_RPC_EXPORT ProtocolSummary {
-  std::string protocol;
-  std::string version;
-  std::string hash;
+    std::string protocol;
+    std::string version;
+    std::string hash;
 };
 
 /// Whether a method belongs to the application protocol rather than the framework.

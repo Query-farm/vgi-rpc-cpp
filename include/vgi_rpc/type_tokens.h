@@ -45,9 +45,9 @@ namespace vgi_rpc {
 ///
 /// Strings and booleans only, so the preimage carries no JSON numbers.
 struct VGI_RPC_EXPORT FieldToken {
-  std::string name;
-  bool nullable;
-  std::string type;
+    std::string name;
+    bool nullable;
+    std::string type;
 };
 
 /// Return the canonical token for `field`'s type.
@@ -59,7 +59,6 @@ struct VGI_RPC_EXPORT FieldToken {
 VGI_RPC_EXPORT arrow::Result<std::string> TypeToken(const arrow::Field& field);
 
 /// Describe a schema's fields in declaration order, which is significant.
-VGI_RPC_EXPORT arrow::Result<std::vector<FieldToken>> SchemaTokens(
-    const arrow::Schema* schema);
+VGI_RPC_EXPORT arrow::Result<std::vector<FieldToken>> SchemaTokens(const arrow::Schema* schema);
 
 }  // namespace vgi_rpc

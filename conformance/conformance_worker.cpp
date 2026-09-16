@@ -172,22 +172,23 @@ static std::shared_ptr<arrow::Schema> binary_result_schema() {
     return s;
 }
 static std::shared_ptr<arrow::Schema> enum_result_schema() {
-    static auto s =
-        arrow::schema({arrow::field("result", arrow::dictionary(arrow::int16(), arrow::utf8()), /*nullable=*/false)});
+    static auto s = arrow::schema({arrow::field(
+        "result", arrow::dictionary(arrow::int16(), arrow::utf8()), /*nullable=*/false)});
     return s;
 }
 static std::shared_ptr<arrow::Schema> list_str_result_schema() {
-    static auto s = arrow::schema({arrow::field("result", arrow::list(arrow::utf8()), /*nullable=*/false)});
+    static auto s =
+        arrow::schema({arrow::field("result", arrow::list(arrow::utf8()), /*nullable=*/false)});
     return s;
 }
 static std::shared_ptr<arrow::Schema> dict_str_int_result_schema() {
-    static auto s =
-        arrow::schema({arrow::field("result", arrow::map(arrow::utf8(), arrow::int64()), /*nullable=*/false)});
+    static auto s = arrow::schema(
+        {arrow::field("result", arrow::map(arrow::utf8(), arrow::int64()), /*nullable=*/false)});
     return s;
 }
 static std::shared_ptr<arrow::Schema> nested_list_result_schema() {
-    static auto s =
-        arrow::schema({arrow::field("result", arrow::list(arrow::list(arrow::int64())), /*nullable=*/false)});
+    static auto s = arrow::schema(
+        {arrow::field("result", arrow::list(arrow::list(arrow::int64())), /*nullable=*/false)});
     return s;
 }
 static std::shared_ptr<arrow::Schema> optional_str_result_schema() {
@@ -220,7 +221,8 @@ static std::shared_ptr<arrow::Schema> float32_result_schema() {
 }
 // list[int] return (cancel_probe_counters)
 static std::shared_ptr<arrow::Schema> list_int_result_schema() {
-    static auto s = arrow::schema({arrow::field("result", arrow::list(arrow::int64()), /*nullable=*/false)});
+    static auto s =
+        arrow::schema({arrow::field("result", arrow::list(arrow::int64()), /*nullable=*/false)});
     return s;
 }
 

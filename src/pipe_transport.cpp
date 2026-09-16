@@ -257,9 +257,9 @@ bool Server::serve_reflection(const std::shared_ptr<arrow::io::OutputStream>& ou
                                             "'. Hosted: [" + hosted + "]");
         }
     } else {
-        return fail("AttributeError",
-                    std::string("Protocol '") + kReflectionProtocolName + "' has no method '" +
-                        method_name + "'. Available: ['describe', 'list_protocols']");
+        return fail("AttributeError", std::string("Protocol '") + kReflectionProtocolName +
+                                          "' has no method '" + method_name +
+                                          "'. Available: ['describe', 'list_protocols']");
     }
     if (!payload.ok()) return fail("RuntimeError", payload.status().ToString());
 
@@ -408,11 +408,10 @@ bool Server::serve_one_with_state(const std::shared_ptr<arrow::io::InputStream>&
         if (wire_protocol != protocol_name_) {
             // The request-supplied name is deliberately not echoed: a routing
             // failure must not be a way to get a chosen string into a log.
-            auto error_result =
-                Result::error(empty_schema(), "ProtocolNotSupportedError",
-                              "This server does not host the named protocol. It hosts: '" +
-                                  protocol_name_ + "'.",
-                              server_id_, request_id, ERROR_KIND_PROTOCOL_NOT_SUPPORTED);
+            auto error_result = Result::error(
+                empty_schema(), "ProtocolNotSupportedError",
+                "This server does not host the named protocol. It hosts: '" + protocol_name_ + "'.",
+                server_id_, request_id, ERROR_KIND_PROTOCOL_NOT_SUPPORTED);
             write_ipc_stream(output, empty_schema(), {error_result.annotated_batch()});
             VGI_RPC_THROW_NOT_OK(output->Flush());
             return true;

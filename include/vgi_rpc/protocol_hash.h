@@ -60,16 +60,16 @@ inline constexpr const char* kProtocolHashDomain = "vgi_rpc.protocol_hash.v1|";
 /// and accepting bytes would invite a caller to pass whatever its encoder
 /// produced.
 struct VGI_RPC_EXPORT HashMethod {
-  std::string name;
-  /// "unary" or "stream".
-  std::string method_type;
-  bool has_return = false;
-  bool has_header = false;
-  std::shared_ptr<arrow::Schema> params_schema;
-  /// Ignored when `has_return` is false.
-  std::shared_ptr<arrow::Schema> result_schema;
-  /// Ignored when `has_header` is false.
-  std::shared_ptr<arrow::Schema> header_schema;
+    std::string name;
+    /// "unary" or "stream".
+    std::string method_type;
+    bool has_return = false;
+    bool has_header = false;
+    std::shared_ptr<arrow::Schema> params_schema;
+    /// Ignored when `has_return` is false.
+    std::shared_ptr<arrow::Schema> result_schema;
+    /// Ignored when `has_header` is false.
+    std::shared_ptr<arrow::Schema> header_schema;
 };
 
 /// Build the canonical preimage for one protocol.
@@ -77,14 +77,14 @@ struct VGI_RPC_EXPORT HashMethod {
 /// Exposed because a hash mismatch between ports is otherwise one bit of
 /// information. With the preimage in hand a failing port diffs two JSON
 /// documents and sees which method, field or type token it spells differently.
-VGI_RPC_EXPORT arrow::Result<std::string> CanonicalDescription(
-    const std::string& protocol_name, std::vector<HashMethod> methods);
+VGI_RPC_EXPORT arrow::Result<std::string> CanonicalDescription(const std::string& protocol_name,
+                                                               std::vector<HashMethod> methods);
 
 /// Return the SHA-256 hex digest of a protocol's canonical description.
 ///
 /// Identical in every port for the same protocol -- which is a property
 /// conformance can assert, and could not before.
-VGI_RPC_EXPORT arrow::Result<std::string> ComputeProtocolHash(
-    const std::string& protocol_name, std::vector<HashMethod> methods);
+VGI_RPC_EXPORT arrow::Result<std::string> ComputeProtocolHash(const std::string& protocol_name,
+                                                              std::vector<HashMethod> methods);
 
 }  // namespace vgi_rpc
