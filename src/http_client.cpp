@@ -128,7 +128,18 @@ std::shared_ptr<arrow::KeyValueMetadata> request_metadata(
     const std::shared_ptr<arrow::KeyValueMetadata>& original, const std::string& method,
     const std::string& protocol, const std::string& protocol_version,
     const std::string& request_id) {
+    // `sanitized_metadata` strips every transport key, protocol_version among
+    // them.  A configured version replaces it below; an unconfigured client
+    // restores whatever the caller supplied, because the peer's version gate
+    // reads this key and deleting it makes the gate unsatisfiable for a caller
+    // with no static version to configure.  Same rule as the raw client's.
+    const std::string caller_version = protocol_version.empty()
+                                           ? get_metadata_value(original, keys::PROTOCOL_VERSION)
+                                           : std::string{};
     auto metadata = sanitized_metadata(original);
+    if (!caller_version.empty()) {
+        replace_metadata(metadata, keys::PROTOCOL_VERSION, caller_version);
+    }
     replace_metadata(metadata, keys::METHOD, method);
     replace_metadata(metadata, keys::REQUEST_VERSION, REQUEST_VERSION_VALUE);
     replace_metadata(metadata, keys::REQUEST_ID, request_id);
@@ -419,6 +430,15 @@ DecodedResponse decode_response(const BoundedHttpResponse& response, const HttpC
         }
 
         decoded.schema = contents.schema;
+        // An exchange turn's cursor normally rides on the application batch,
+        // so the *first* non-log batch is always the application output even
+        // when it has zero rows and carries the cursor.  A server whose output
+        // schema has no fields instead emits the cursor on a batch of its own
+        // after that one -- indistinguishable from data by shape alone, and
+        // distinguishable by position, which is how the reference client reads
+        // it.  Without this an empty-schema exchange turn decodes as two data
+        // batches and the call fails.
+        bool saw_data = false;
         for (auto& batch : contents.batches) {
             if (batch.custom_metadata && batch.custom_metadata->FindKey(keys::LOCATION) >= 0) {
                 if (!external) {
@@ -466,10 +486,11 @@ DecodedResponse decode_response(const BoundedHttpResponse& response, const HttpC
             }
 
             const bool has_cursor = has(keys::STATE_B64);
+            const bool zero_rows = batch.batch && batch.batch->num_rows() == 0;
             if (has_cursor && (stream_shape == ResponseShape::EXCHANGE_INIT ||
                                stream_shape == ResponseShape::STREAM_INIT ||
                                stream_shape == ResponseShape::PRODUCER_TURN)) {
-                if (!batch.batch || batch.batch->num_rows() != 0) {
+                if (!zero_rows) {
                     throw HttpClientError("exchange init returned a non-empty state control batch",
                                           response.status);
                 }
@@ -480,10 +501,17 @@ DecodedResponse decode_response(const BoundedHttpResponse& response, const HttpC
                 throw HttpClientError("unexpected stream control metadata in unary response",
                                       response.status);
             }
+            if (has_cursor && zero_rows && saw_data &&
+                stream_shape == ResponseShape::EXCHANGE_TURN) {
+                decoded.control.push_back(std::move(batch));
+                continue;
+            }
 
-            // During an exchange turn the cursor is attached to the application
-            // batch.  It remains data even when it contains zero rows; zero rows
-            // are not an end-of-stream marker in the HTTP exchange protocol.
+            // During an exchange turn the cursor is normally attached to the
+            // application batch.  It remains data even when it contains zero
+            // rows; zero rows are not an end-of-stream marker in the HTTP
+            // exchange protocol.
+            saw_data = true;
             decoded.data.push_back(std::move(batch));
         }
     };
@@ -506,6 +534,16 @@ DecodedResponse decode_response(const BoundedHttpResponse& response, const HttpC
             response.status);
     }
     return decoded;
+}
+
+/// The last cursor carried by a turn's control batches, or empty.
+std::string control_cursor(const std::vector<AnnotatedBatch>& control) {
+    std::string cursor;
+    for (const auto& batch : control) {
+        const std::string value = get_metadata_value(batch.custom_metadata, keys::STATE_B64);
+        if (!value.empty()) cursor = value;
+    }
+    return cursor;
 }
 
 void validate_method(const std::string& method) {
@@ -1578,13 +1616,22 @@ public:
             return server_capabilities;
         };
 
-        // A body larger than the local inline ceiling cannot be sent merely to
+        // A body larger than the inline ceiling cannot be sent merely to
         // discover a server's 413 behavior. Discover capabilities first, then
         // either externalize within the separately bounded upload ceiling or
         // fail before transport.
-        if (request_body.size() > static_cast<uint64_t>(config.max_request_bytes)) {
-            (void)capabilities(random_hex(16), options, sticky_session);
-        }
+        //
+        // Unconditionally, and not just when the body clears the *local*
+        // ceiling: the ceiling that actually bites is the smaller of the local
+        // one and the server's advertised `max_request_bytes`, and that is
+        // exactly what an unfetched cache does not know.  `post_inline` fetches
+        // capabilities itself before its own cap check, so deciding from a cold
+        // cache here meant the very first oversized request on a connection
+        // reported the server's cap as a hard local failure instead of
+        // externalizing -- while the second, against the now-warm cache,
+        // succeeded.  The call is cached after the first, so hoisting it costs
+        // nothing.
+        (void)capabilities(request_id, options, sticky_session);
         auto caps = cached_caps();
         const int64_t inline_cap = caps.max_request_bytes
                                        ? std::min(config.max_request_bytes, *caps.max_request_bytes)
@@ -2011,7 +2058,15 @@ private:
         constexpr std::string_view echo_prefix = "vgi-echo-";
         for (const auto& [name, value] : response.headers) {
             if (ascii_lower(name).rfind(echo_prefix, 0) != 0) continue;
-            std::string replay_name = name.substr(echo_prefix.size());
+            // Lower-cased, not as the wire spelled it.  Header names are
+            // case-insensitive and intermediaries re-case them freely (the
+            // reference server's WSGI host title-cases every one), while the
+            // name a caller matches against comes from the server's own
+            // lower-case `VGI-Sticky-Echo-Headers` advertisement.  Exposing the
+            // wire casing makes the captured map uncomparable to that list
+            // against every peer whose stack re-cases, and identical-looking
+            // against the one whose stack does not.
+            std::string replay_name = ascii_lower(name.substr(echo_prefix.size()));
             if (replay_name.size() > 1024 || value.size() > 8192) {
                 throw HttpClientError(HttpClientErrorKind::PROTOCOL,
                                       "server returned an oversized sticky echo header",
@@ -2139,8 +2194,12 @@ private:
 RpcRemoteError::RpcRemoteError(std::string exception_type, std::string message,
                                std::string error_kind, std::string server_id,
                                std::string request_id, int http_status)
-    : HttpClientError(HttpClientErrorKind::REMOTE, exception_type + ": " + message, http_status, {},
-                      request_id),
+    // The peer's message verbatim, not `type + ": " + message`.  The class is
+    // already on `exception_type()`, the raw transports' `RpcException` carries
+    // the message unadorned, and the peer's own message routinely begins with
+    // its class name -- so composing here produced `ValueError: ValueError: ...`
+    // over HTTP and `ValueError: ...` over a pipe for one and the same error.
+    : HttpClientError(HttpClientErrorKind::REMOTE, message, http_status, {}, request_id),
       exception_type_(std::move(exception_type)),
       error_kind_(std::move(error_kind)),
       server_id_(std::move(server_id)),
@@ -2704,11 +2763,12 @@ AnnotatedBatch HttpExchangeSession::exchange(const AnnotatedBatch& input,
         throw HttpClientError(
             schema_mismatch("exchange output", impl_->output_schema, output.batch->schema()));
     }
-    const std::string cursor = get_metadata_value(output.custom_metadata, keys::STATE_B64);
+    std::string cursor = get_metadata_value(output.custom_metadata, keys::STATE_B64);
+    if (cursor.empty()) cursor = control_cursor(decoded.control);
     if (cursor.empty()) {
         throw HttpClientError("exchange response did not contain a continuation token");
     }
-    impl_->cursor = cursor;
+    impl_->cursor = std::move(cursor);
     impl_->is_active = true;
     output.custom_metadata = strip_transport_metadata(output.custom_metadata);
     return output;
@@ -2846,7 +2906,6 @@ HttpStreamSession HttpClient::open_producer(const std::string& method,
                                             bool has_header, const CallOptions& options) const {
     validate_method(method);
     if (!state_) throw HttpClientError("HttpClient is moved from");
-    if (!output_schema) throw std::invalid_argument("producer output schema must not be null");
     const std::string request_id = logical_request_id(options);
     const auto metadata = request_metadata(request.custom_metadata, method, state_->config.protocol,
                                            state_->config.protocol_version, request_id);
@@ -2869,9 +2928,6 @@ HttpStreamSession HttpClient::open_stream_exchange(const std::string& method,
                                                    const CallOptions& options) const {
     validate_method(method);
     if (!state_) throw HttpClientError("HttpClient is moved from");
-    if (!input_schema || !output_schema) {
-        throw std::invalid_argument("exchange input and output schemas must not be null");
-    }
     const std::string request_id = logical_request_id(options);
     const auto metadata = request_metadata(request.custom_metadata, method, state_->config.protocol,
                                            state_->config.protocol_version, request_id);
@@ -2881,9 +2937,12 @@ HttpStreamSession HttpClient::open_stream_exchange(const std::string& method,
                      options, true, sticky_session_);
     auto decoded = state_->decode(response, ResponseShape::STREAM_INIT, has_header,
                                   state_->external(), sticky_session_);
-    if (!decoded.data.empty()) {
-        throw HttpClientError("exchange init unexpectedly returned application data");
-    }
+    // An exchange's first output comes from its first turn, so anything the
+    // init response carries beside the tokens is not this stream's data. The
+    // reference server nevertheless emits a batch here when the output schema
+    // has no fields; refusing it makes every empty-schema exchange against the
+    // reference unopenable, so park it exactly where the reference client
+    // parks it -- in `pending`, which an exchange session never reads.
     auto impl =
         make_http_stream_impl(state_, method, HttpStreamKind::EXCHANGE, std::move(input_schema),
                               std::move(output_schema), std::move(decoded), sticky_session_);
@@ -2941,6 +3000,11 @@ bool HttpStreamSession::finished() const noexcept {
 }
 
 std::optional<AnnotatedBatch> HttpStreamSession::tick(const CallOptions& options) {
+    return tick(nullptr, options);
+}
+
+std::optional<AnnotatedBatch> HttpStreamSession::tick(
+    std::shared_ptr<arrow::KeyValueMetadata> turn_metadata, const CallOptions& options) {
     if (!impl_ || impl_->is_closed) throw HttpClientError("stream session is closed");
     if (impl_->stream_kind != HttpStreamKind::PRODUCER) {
         throw std::logic_error("tick is only valid for producer streams");
@@ -2957,6 +3021,15 @@ std::optional<AnnotatedBatch> HttpStreamSession::tick(const CallOptions& options
         }
         const std::string request_id = logical_request_id(options);
         auto metadata = impl_->continuation_metadata(request_id);
+        // The caller's per-turn metadata rides beneath the framework's own
+        // continuation controls: `sanitized_metadata` drops every transport
+        // key, so what is merged in can only be application keys.
+        if (turn_metadata) {
+            const auto application = sanitized_metadata(turn_metadata);
+            for (int64_t i = 0; i < application->size(); ++i) {
+                replace_metadata(metadata, application->key(i), application->value(i));
+            }
+        }
         const AnnotatedBatch request = AnnotatedBatch::data(make_empty_batch(empty_schema()));
         // Producing the next batch may have application side effects even
         // though the continuation cursor itself is immutable. Replay only
@@ -2967,7 +3040,9 @@ std::optional<AnnotatedBatch> HttpStreamSession::tick(const CallOptions& options
             options, true, impl_->sticky_session);
         auto decoded = impl_->state->decode(response, ResponseShape::PRODUCER_TURN, false,
                                             impl_->state->external(), impl_->sticky_session);
-        if (!schema_equals(decoded.schema, impl_->output_schema)) {
+        if (!impl_->output_schema) {
+            impl_->output_schema = decoded.schema;
+        } else if (!schema_equals(decoded.schema, impl_->output_schema)) {
             throw HttpClientError(
                 schema_mismatch("producer response", impl_->output_schema, decoded.schema));
         }
@@ -3012,7 +3087,9 @@ std::optional<AnnotatedBatch> HttpStreamSession::exchange(const AnnotatedBatch& 
         throw std::logic_error("exchange is only valid for exchange streams");
     }
     if (!input.batch) throw std::invalid_argument("exchange input batch must not be null");
-    if (!schema_equals(input.batch->schema(), impl_->input_schema)) {
+    if (!impl_->input_schema) {
+        impl_->input_schema = input.batch->schema();
+    } else if (!schema_equals(input.batch->schema(), impl_->input_schema)) {
         throw std::invalid_argument(
             schema_mismatch("exchange input", impl_->input_schema, input.batch->schema()));
     }
@@ -3030,7 +3107,9 @@ std::optional<AnnotatedBatch> HttpStreamSession::exchange(const AnnotatedBatch& 
                            request_id, options, false, impl_->sticky_session);
     auto decoded = impl_->state->decode(response, ResponseShape::EXCHANGE_TURN, false,
                                         impl_->state->external(), impl_->sticky_session);
-    if (!schema_equals(decoded.schema, impl_->output_schema)) {
+    if (!impl_->output_schema) {
+        impl_->output_schema = decoded.schema;
+    } else if (!schema_equals(decoded.schema, impl_->output_schema)) {
         throw HttpClientError(
             schema_mismatch("exchange response", impl_->output_schema, decoded.schema));
     }
@@ -3043,6 +3122,7 @@ std::optional<AnnotatedBatch> HttpStreamSession::exchange(const AnnotatedBatch& 
     }
     auto output = std::move(decoded.data.front());
     impl_->cursor = get_metadata_value(output.custom_metadata, keys::STATE_B64);
+    if (impl_->cursor.empty()) impl_->cursor = control_cursor(decoded.control);
     impl_->is_finished = impl_->cursor.empty();
     impl_->is_closed = false;
     output.custom_metadata = strip_transport_metadata(output.custom_metadata);

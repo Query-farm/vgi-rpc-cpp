@@ -350,12 +350,20 @@ public:
 
     // Initialize a producer stream. Application batches emitted during init
     // are queued and returned before the first continuation request.
+    //
+    // A null `output_schema` opens the stream *dynamically*: the first
+    // response's own schema is adopted and every later turn is checked against
+    // that, which is what the raw transports have always done. A schema-first
+    // caller should still name what it expects -- but a caller that genuinely
+    // cannot (a relay, or a caller driving a method whose per-turn shape the
+    // protocol description does not carry) is not thereby locked out of HTTP.
     HttpStreamSession open_producer(const std::string& method, const AnnotatedBatch& request,
                                     std::shared_ptr<arrow::Schema> output_schema,
                                     bool has_header = false, const CallOptions& options = {}) const;
 
     // General stream API for exchanges that may terminate without a final
     // data batch. Existing open_exchange remains the strict compatibility API.
+    // Null schemas mean the same dynamic mode as open_producer's.
     HttpStreamSession open_stream_exchange(const std::string& method, const AnnotatedBatch& request,
                                            std::shared_ptr<arrow::Schema> input_schema,
                                            std::shared_ptr<arrow::Schema> output_schema,
@@ -484,6 +492,12 @@ public:
     bool finished() const noexcept;
 
     std::optional<AnnotatedBatch> tick(const CallOptions& options = {});
+    // `metadata` is application metadata for this turn only. A producer tick
+    // carries an empty batch, so the metadata map is the only thing a caller
+    // can vary per turn -- and a worker whose `process()` reads it needs the
+    // client to be able to send one. Matches ClientStream::tick.
+    std::optional<AnnotatedBatch> tick(std::shared_ptr<arrow::KeyValueMetadata> metadata,
+                                       const CallOptions& options = {});
     std::optional<HttpStreamBatch> next_with_token(const CallOptions& options = {});
     std::optional<AnnotatedBatch> exchange(const AnnotatedBatch& input,
                                            const CallOptions& options = {});

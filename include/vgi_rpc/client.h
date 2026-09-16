@@ -288,7 +288,11 @@ public:
     const std::optional<AnnotatedBatch>& header() const noexcept;
     bool finished() const noexcept;
 
-    std::optional<AnnotatedBatch> tick();
+    // `metadata` is application metadata for this turn only. A producer tick
+    // carries an empty batch, so the metadata map is the only thing a caller
+    // can vary per turn -- and a worker whose `process()` reads it needs the
+    // client to be able to send one.
+    std::optional<AnnotatedBatch> tick(std::shared_ptr<arrow::KeyValueMetadata> metadata = nullptr);
     std::optional<AnnotatedBatch> exchange(
         const std::shared_ptr<arrow::RecordBatch>& input,
         std::shared_ptr<arrow::KeyValueMetadata> metadata = nullptr);

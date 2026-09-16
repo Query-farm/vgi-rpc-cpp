@@ -173,7 +173,13 @@ void exercise_client(RpcClient& client, const std::string& transport, bool expec
     const auto description = client.describe();
     require(description.protocol_name == "ClientConformanceService",
             transport + ": describe returned the wrong protocol");
-    require(description.describe_version == "4", transport + ": describe was not version 4");
+    // A literal, deliberately: comparing against `DESCRIBE_VERSION_VALUE` would
+    // only assert that the constant equals itself, and the constant is the
+    // thing that drifted. The authority is the Python reference's
+    // `DESCRIBE_VERSION`; the client-role conformance run compares this port's
+    // reported value against it, because the number never crosses the wire and
+    // a server-role run therefore cannot see it.
+    require(description.describe_version == "5", transport + ": describe was not version 5");
     require(description.protocol_hash.size() == 64,
             transport + ": describe returned an invalid protocol hash");
     require(description.method("__transport_options__") == nullptr,

@@ -84,13 +84,13 @@ std::shared_ptr<arrow::KeyValueMetadata> request_metadata(
     }
     replace_metadata(metadata, keys::REQUEST_VERSION, REQUEST_VERSION_VALUE);
     replace_metadata(metadata, keys::REQUEST_ID, random_hex(32));
-    if (protocol_version.empty()) {
-        int64_t index = metadata->FindKey(keys::PROTOCOL_VERSION);
-        while (index >= 0) {
-            (void)metadata->Delete(index);
-            index = metadata->FindKey(keys::PROTOCOL_VERSION);
-        }
-    } else {
+    // A configured protocol_version wins, as every other framework-owned key
+    // does.  An *unconfigured* one leaves whatever the caller supplied per
+    // call: the peer's version gate reads this key, and a client that deletes
+    // it makes the gate unsatisfiable for any caller -- a dynamic one above
+    // all -- that has no static version to configure.  Absent on both sides
+    // still sends nothing, which is what an unversioned protocol expects.
+    if (!protocol_version.empty()) {
         replace_metadata(metadata, keys::PROTOCOL_VERSION, protocol_version);
     }
     if (shm) {
@@ -484,13 +484,26 @@ bool ClientStream::finished() const noexcept {
     return impl_->finished;
 }
 
-std::optional<AnnotatedBatch> ClientStream::tick() {
+std::optional<AnnotatedBatch> ClientStream::tick(
+    std::shared_ptr<arrow::KeyValueMetadata> metadata) {
     impl_->require_step_allowed(ClientStreamKind::PRODUCER, "tick");
     if (impl_->finished) return std::nullopt;
     try {
         impl_->ensure_input_writer(empty_schema());
-        VGI_RPC_THROW_NOT_OK(
-            impl_->input_writer->WriteRecordBatch(*make_empty_batch(empty_schema())));
+        // Transport controls are framework-owned on the way out, exactly as
+        // they are for an exchange input; what is left is the caller's own
+        // per-turn metadata, which the worker sees on this tick alone.
+        if (metadata) {
+            metadata = copy_metadata(metadata);
+            strip_transport_controls(metadata);
+        }
+        if (metadata && metadata->size() > 0) {
+            VGI_RPC_THROW_NOT_OK(impl_->input_writer->WriteRecordBatch(
+                *make_empty_batch(empty_schema()), std::move(metadata)));
+        } else {
+            VGI_RPC_THROW_NOT_OK(
+                impl_->input_writer->WriteRecordBatch(*make_empty_batch(empty_schema())));
+        }
         VGI_RPC_THROW_NOT_OK(impl_->client->output->Flush());
     } catch (...) {
         impl_->closed = true;

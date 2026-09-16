@@ -106,7 +106,13 @@ inline constexpr const char* REQUEST_VERSION_VALUE = "1";
 /// version rides its protocol name.  Kept because `ServiceDescription` is a
 /// client-side *view*, and a caller that branches on the shape it was handed
 /// still needs a number for it.
-inline constexpr const char* DESCRIBE_VERSION_VALUE = "4";
+///
+/// It never crosses the wire, which is exactly why it drifted: a Python client
+/// describing this server stamps its own constant, so no server-role test can
+/// see the number this client reports.  It is cross-port shared state and must
+/// equal the reference's `DESCRIBE_VERSION`; retiring `__describe__` moved that
+/// to 5 and this was left at 4.
+inline constexpr const char* DESCRIBE_VERSION_VALUE = "5";
 
 /// Retired in the multi-service revamp, and kept only so the refusal can say
 /// where introspection went.
