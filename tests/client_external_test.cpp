@@ -232,10 +232,14 @@ TEST_CASE("external pointer resolution parses one IPC level and frees signed URL
     REQUIRE(get_metadata_value(resolved.custom_metadata, "application.tag") == "kept");
     REQUIRE(get_metadata_value(resolved.custom_metadata, keys::STREAM_STATE) ==
             "outer-continuation");
-    REQUIRE(get_metadata_value(resolved.custom_metadata, keys::LOCATION_SOURCE) ==
-            server.url("/pointer"));
-    REQUIRE(get_metadata_value(resolved.custom_metadata, keys::LOCATION_SOURCE).find("secret") ==
-            std::string::npos);
+    // §12: `location.source` is the URL that was fetched, in full. The query
+    // string is deliberately retained even when it carries a signature -- this
+    // assertion previously required the opposite, which made this port the only
+    // one of seven whose value for the key differed. Callers must treat the key
+    // as credential-bearing; see the note at the stamping site.
+    REQUIRE(get_metadata_value(resolved.custom_metadata, keys::LOCATION_SOURCE) == signed_url);
+    REQUIRE(get_metadata_value(resolved.custom_metadata, keys::LOCATION_SOURCE).find(
+                "X-Amz-Signature=top-secret") != std::string::npos);
 
     auto nested_outer_metadata = std::make_shared<arrow::KeyValueMetadata>();
     nested_outer_metadata->Append(keys::LOCATION, server.url("/nested"));

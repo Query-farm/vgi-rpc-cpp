@@ -725,8 +725,20 @@ AnnotatedBatch ClientExternalHttp::resolve_pointer(const AnnotatedBatch& pointer
     const double elapsed =
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started)
             .count();
+    // `vgi_rpc.location.source` records the URL **in full**, query string
+    // included, per WIRE_PROTOCOL.md §12. This port previously redacted it,
+    // which was the only such divergence across the seven ports and made the
+    // key's value implementation-defined.
+    //
+    // The redaction rule in §12 governs *diagnostics* -- errors, logs, traces,
+    // exception chains -- not application metadata. A signed URL is already on
+    // the wire in `vgi_rpc.location` on the pointer batch, so carrying it here
+    // exposes it to the consuming application rather than to a new observer.
+    // It does outlive the pointer, which is stripped from the resolved batch:
+    // callers must therefore treat this key as credential-bearing and keep it
+    // out of logs, exactly as they would the pointer URL itself.
     data[0].custom_metadata = merge_resolution_metadata(
-        pointer.custom_metadata, data[0].custom_metadata, redact_external_url(url), elapsed);
+        pointer.custom_metadata, data[0].custom_metadata, url, elapsed);
     return std::move(data[0]);
 }
 
