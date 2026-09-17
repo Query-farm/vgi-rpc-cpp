@@ -230,8 +230,16 @@ public:
             case BatchType::STATE_TOKEN:
                 throw std::runtime_error(
                     "state-token batch is invalid on a live raw stream transport");
-            default: return response;
+            // Enumerated rather than defaulted, deliberately. A `default:` here
+            // is what made the external arm easy to miss in the first place:
+            // under -Wall a switch that names every BatchType makes the
+            // compiler list the readers that have not handled a new one, and a
+            // catch-all silently classifies it as plain data instead.
+            case BatchType::DATA:
+            case BatchType::LOG:
+            case BatchType::EXCEPTION: return response;
         }
+        return response;
     }
 
     ClientTransport transport;
