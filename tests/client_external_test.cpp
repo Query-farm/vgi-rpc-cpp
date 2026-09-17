@@ -238,8 +238,8 @@ TEST_CASE("external pointer resolution parses one IPC level and frees signed URL
     // one of seven whose value for the key differed. Callers must treat the key
     // as credential-bearing; see the note at the stamping site.
     REQUIRE(get_metadata_value(resolved.custom_metadata, keys::LOCATION_SOURCE) == signed_url);
-    REQUIRE(get_metadata_value(resolved.custom_metadata, keys::LOCATION_SOURCE).find(
-                "X-Amz-Signature=top-secret") != std::string::npos);
+    REQUIRE(get_metadata_value(resolved.custom_metadata, keys::LOCATION_SOURCE)
+                .find("X-Amz-Signature=top-secret") != std::string::npos);
 
     auto nested_outer_metadata = std::make_shared<arrow::KeyValueMetadata>();
     nested_outer_metadata->Append(keys::LOCATION, server.url("/nested"));

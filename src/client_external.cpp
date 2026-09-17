@@ -737,8 +737,8 @@ AnnotatedBatch ClientExternalHttp::resolve_pointer(const AnnotatedBatch& pointer
     // It does outlive the pointer, which is stripped from the resolved batch:
     // callers must therefore treat this key as credential-bearing and keep it
     // out of logs, exactly as they would the pointer URL itself.
-    data[0].custom_metadata = merge_resolution_metadata(
-        pointer.custom_metadata, data[0].custom_metadata, url, elapsed);
+    data[0].custom_metadata =
+        merge_resolution_metadata(pointer.custom_metadata, data[0].custom_metadata, url, elapsed);
     return std::move(data[0]);
 }
 
