@@ -62,10 +62,27 @@ Negotiation is capability-gated. Large exchange inputs and returned pointer
 batches are resolved transparently, and `shared_memory_live_allocations()` is
 available for lifecycle diagnostics. Shared memory is disabled by default.
 
+## External storage pointers
+
+Externalization is not an HTTP feature. Any transport that carries record
+batches carries pointer batches, so a peer serving a byte stream may replace an
+output cycle -- or a *stream header* -- with a zero-row batch bearing
+`vgi_rpc.location`. `RpcClient` resolves those on the header substream and the
+data stream alike, dispatching every log batch bundled into the fetched object
+and returning the inner data batch's metadata plus the reader-stamped
+`vgi_rpc.location.source` / `vgi_rpc.location.fetch_ms` provenance.
+
+`RpcClientOptions::external_http` carries the policy, and defaults to the same
+one `HttpClient` uses: HTTPS only, every resolved address globally routable,
+bounded redirects, and independent encoded/decoded byte caps. Set it to
+`std::nullopt` for a deployment whose byte-stream client must make no outbound
+HTTP request of its own; a pointer batch is then refused rather than fetched.
+
 ## Deliberate scope
 
-The raw client rejects external-location and stateless-resume envelopes; those
-belong to the HTTP client. Raw streams currently have no response-byte cap,
+The raw client rejects stateless-resume envelopes; those belong to the HTTP
+client, because a raw stream is its own continuation handle. Raw streams
+currently have no response-byte cap,
 and subprocess pipes do not provide a per-read deadline, although subprocess
 abandonment uses bounded shutdown. Windows subprocess support is native;
 Windows Unix/TCP raw sockets remain unavailable with the current server.

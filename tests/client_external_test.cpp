@@ -4,6 +4,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "vgi_rpc/arrow_utils.h"
+#include "vgi_rpc/client.h"
 #include "vgi_rpc/client_external.h"
 #include "vgi_rpc/crypto.h"
 #include "vgi_rpc/log.h"
@@ -22,10 +23,12 @@
 #include <chrono>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
 #include <utility>
+#include <vector>
 
 using namespace vgi_rpc;
 
@@ -287,4 +290,103 @@ TEST_CASE("external PUT is credential-free capped and never follows redirects",
     REQUIRE_THROWS_AS(client.put(server.url("/redirect-upload"), "payload"), ExternalHttpError);
     REQUIRE(uploads.load() == 1);
     REQUIRE(redirected_uploads.load() == 0);
+}
+
+// The raw byte-stream transports resolve pointer batches through the same
+// resolver HTTP uses (WIRE_PROTOCOL.md §12, "Transport independence"), and the
+// *header* substream carries them too: an externalized header is a zero-row
+// pointer, so a reader that classifies zero rows as log-or-control before
+// testing for `vgi_rpc.location` reports the header absent rather than
+// malformed (§1.5). Both halves are asserted here because both were dead code.
+TEST_CASE("the raw client resolves external pointers on its header and data streams",
+          "[client][client_external]") {
+    auto log_metadata = std::make_shared<arrow::KeyValueMetadata>();
+    log_metadata->Append(keys::LOG_LEVEL, "INFO");
+    log_metadata->Append(keys::LOG_MESSAGE, "inside the payload");
+
+    auto header_inner_metadata = std::make_shared<arrow::KeyValueMetadata>();
+    header_inner_metadata->Append("application.tag", "header");
+    const std::string header_payload = encode_ipc(
+        value_schema(), {AnnotatedBatch::with_metadata(value_batch(3), header_inner_metadata)});
+
+    auto data_inner_metadata = std::make_shared<arrow::KeyValueMetadata>();
+    data_inner_metadata->Append("application.tag", "data");
+    const std::string data_payload =
+        encode_ipc(value_schema(),
+                   {AnnotatedBatch::with_metadata(make_empty_batch(value_schema()), log_metadata),
+                    AnnotatedBatch::with_metadata(value_batch(4), data_inner_metadata)});
+
+    LoopbackServer server([&](httplib::Server& http) {
+        http.Get("/header", [&](const httplib::Request&, httplib::Response& response) {
+            response.set_content(header_payload, "application/vnd.apache.arrow.stream");
+        });
+        http.Get("/data", [&](const httplib::Request&, httplib::Response& response) {
+            response.set_content(data_payload, "application/vnd.apache.arrow.stream");
+        });
+    });
+
+    const auto pointer = [&](const std::string& path, const std::string& payload) {
+        auto metadata = std::make_shared<arrow::KeyValueMetadata>();
+        metadata->Append(keys::LOCATION, server.url(path));
+        metadata->Append(keys::LOCATION_SHA256, sha256_hex(payload));
+        return AnnotatedBatch::with_metadata(make_empty_batch(value_schema()), metadata);
+    };
+
+    std::string wire = encode_ipc(value_schema(), {pointer("/header", header_payload)});
+    wire.append(encode_ipc(value_schema(), {pointer("/data", data_payload)}));
+
+    std::vector<Message> logs;
+    RpcClientOptions options;
+    options.external_http = loopback_options();
+    options.on_log = [&](const Message& message) { logs.push_back(message); };
+
+    auto output = unwrap(arrow::io::BufferOutputStream::Create());
+    RpcClient client(ClientTransport::from_streams(std::make_shared<arrow::io::BufferReader>(
+                                                       arrow::Buffer::FromString(std::move(wire))),
+                                                   output),
+                     options);
+
+    auto stream = client.open_producer("externalized", make_empty_batch(empty_schema()),
+                                       /*has_header=*/true);
+    REQUIRE(stream.header());
+    REQUIRE(stream.header()->batch->num_rows() == 1);
+    REQUIRE(
+        std::static_pointer_cast<arrow::Int64Array>(stream.header()->batch->column(0))->Value(0) ==
+        3);
+    REQUIRE(get_metadata_value(stream.header()->custom_metadata, "application.tag") == "header");
+
+    const auto response = stream.tick();
+    REQUIRE(response);
+    REQUIRE(response->batch->num_rows() == 1);
+    REQUIRE(std::static_pointer_cast<arrow::Int64Array>(response->batch->column(0))->Value(0) == 4);
+    // The resolved metadata is the *inner* data batch's, plus reader-stamped
+    // provenance -- never the pointer's.
+    REQUIRE(get_metadata_value(response->custom_metadata, "application.tag") == "data");
+    REQUIRE(response->custom_metadata->FindKey(keys::LOCATION) < 0);
+    REQUIRE(response->custom_metadata->FindKey(keys::LOCATION_SHA256) < 0);
+    REQUIRE(!get_metadata_value(response->custom_metadata, keys::LOCATION_SOURCE).empty());
+    REQUIRE(!get_metadata_value(response->custom_metadata, keys::LOCATION_FETCH_MS).empty());
+    // A log batch bundled into the externalized cycle still reaches on_log.
+    REQUIRE(logs.size() == 1);
+    REQUIRE(logs[0].message == "inside the payload");
+}
+
+TEST_CASE("a raw client with no external policy refuses pointer batches",
+          "[client][client_external]") {
+    auto metadata = std::make_shared<arrow::KeyValueMetadata>();
+    metadata->Append(keys::LOCATION, "https://example.invalid/object");
+    const std::string wire =
+        encode_ipc(value_schema(),
+                   {AnnotatedBatch::with_metadata(make_empty_batch(value_schema()), metadata)});
+
+    RpcClientOptions options;
+    options.external_http = std::nullopt;
+
+    auto output = unwrap(arrow::io::BufferOutputStream::Create());
+    RpcClient client(
+        ClientTransport::from_streams(
+            std::make_shared<arrow::io::BufferReader>(arrow::Buffer::FromString(wire)), output),
+        options);
+    REQUIRE_THROWS_AS(client.call_unary("externalized", make_empty_batch(empty_schema())),
+                      std::runtime_error);
 }

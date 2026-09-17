@@ -4,6 +4,7 @@
 #include "vgi_rpc/client.h"
 
 #include "vgi_rpc/arrow_utils.h"
+#include "vgi_rpc/client_external.h"
 #include "vgi_rpc/metadata.h"
 #include "vgi_rpc/shm.h"
 #include "vgi_rpc/wire.h"
@@ -161,7 +162,11 @@ public:
         : transport(std::move(value)),
           input(transport.input()),
           output(transport.output()),
-          options(std::move(value_options)) {}
+          options(std::move(value_options)) {
+        if (options.external_http) {
+            external = std::make_unique<ClientExternalHttp>(*options.external_http);
+        }
+    }
 
     void reserve_call() {
         std::lock_guard<std::mutex> lock(mutex);
@@ -207,9 +212,21 @@ public:
                 if (free_offset >= 0) shm->free_alloc(free_offset);
                 return response;
             }
-            case BatchType::EXTERNAL_POINTER:
-                throw std::runtime_error(
-                    "external-location batches are not supported by the raw native client");
+            case BatchType::EXTERNAL_POINTER: {
+                if (!external) {
+                    throw std::runtime_error(
+                        "server returned an external-location batch but this client has no "
+                        "external transfer policy configured");
+                }
+                // The fetched object is a whole IPC stream -- this turn's log
+                // batches followed by its single data batch -- so the log sink
+                // goes *into* the resolver. A reader that stopped at the first
+                // data batch would drop logs that were delivered inline before
+                // externalization was switched on, which no data assertion can
+                // see (WIRE_PROTOCOL.md §12, "Resolution (reading)").
+                return external->resolve_pointer(
+                    response, [this](const AnnotatedBatch& log) { dispatch_log(log); });
+            }
             case BatchType::STATE_TOKEN:
                 throw std::runtime_error(
                     "state-token batch is invalid on a live raw stream transport");
@@ -221,6 +238,7 @@ public:
     std::shared_ptr<arrow::io::InputStream> input;
     std::shared_ptr<arrow::io::OutputStream> output;
     RpcClientOptions options;
+    std::unique_ptr<ClientExternalHttp> external;
     std::shared_ptr<ShmSegment> shm;
     mutable std::mutex mutex;
     bool active = false;
@@ -259,10 +277,15 @@ std::optional<AnnotatedBatch> read_substream(const std::shared_ptr<ClientImpl>& 
             case BatchType::EXCEPTION: throw remote_exception(response);
             case BatchType::DATA:
             case BatchType::SHM_POINTER:
+            // A pointer batch *is* the data batch, on this substream as on the
+            // header substream that shares this reader: an externalized cycle
+            // is replaced on the wire by one zero-row pointer, so a reader that
+            // classifies it as anything but data reports the payload absent
+            // rather than malformed (WIRE_PROTOCOL.md §1.5).
+            case BatchType::EXTERNAL_POINTER:
                 if (data) throw std::runtime_error("RPC response contains multiple data batches");
                 data = client->resolve_data(std::move(response));
                 break;
-            case BatchType::EXTERNAL_POINTER:
             case BatchType::STATE_TOKEN: (void)client->resolve_data(std::move(response));
         }
     }
@@ -325,8 +348,9 @@ public:
                         drain_reader(output_reader);
                         throw remote_exception(response);
                     case BatchType::DATA:
-                    case BatchType::SHM_POINTER: return client->resolve_data(std::move(response));
+                    case BatchType::SHM_POINTER:
                     case BatchType::EXTERNAL_POINTER:
+                        return client->resolve_data(std::move(response));
                     case BatchType::STATE_TOKEN: (void)client->resolve_data(std::move(response));
                 }
             }

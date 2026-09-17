@@ -103,6 +103,30 @@ def _reference_script(name: str) -> str:
     return str(path)
 
 
+def _reference_pipe_argv(*extra_args: str) -> list[str]:
+    """Argv for the reference conformance CLI serving one byte-stream peer.
+
+    ``stdio_server_argv`` reaches the same server through
+    ``tests/serve_conformance_pipe.py``, but only when the run was pointed at
+    the Python reference — which needs a *checkout*, and two of this repo's
+    three conformance CI legs have only the installed wheel.  That script is
+    now a three-line delegation to this CLI (reference ``97fb123``), so calling
+    the CLI directly is the same peer with one fewer prerequisite, and
+    ``docs/cross-language-conformance.md`` names it as the thing to spawn.
+
+    ``--describe`` matches what the script pre-selects, so the peer is
+    identical either way.
+    """
+    return [
+        _REFERENCE_PYTHON,
+        "-m",
+        "vgi_rpc.conformance._cli",
+        "--pipe",
+        "--describe",
+        *extra_args,
+    ]
+
+
 #: C++ worker flags the reference's HTTP entry point spells differently, or
 #: serves from a different script.  Kept as an explicit table rather than a
 #: shared flag vocabulary because the two workers are independent programs that
@@ -619,14 +643,17 @@ def _driver_connection(
     return _conn()
 
 
-#: Test classes that reach the client through `http_connect`, `http_capabilities`
-#: or `request_upload_urls` *inside the test body* rather than through
-#: `conformance_conn`.  `ClientDriver.install_http_overrides` re-binds those
-#: three, so these do exercise the client under test and are kept in client
+#: Test classes that build their own connection *inside the test body* rather
+#: than taking `conformance_conn`, and still put the client under test on the
+#: wire.  Most reach it through `http_connect`, `http_capabilities` or
+#: `request_upload_urls`, which `ClientDriver.install_http_overrides` re-binds;
+#: `TestExternalByteStream` reaches it through this module's own
+#: `conformance_bytestream_external_target`, which is driver-backed in every
 #: role.  Every other class that takes none of the connection fixtures pokes a
 #: server with raw HTTP and says nothing about a client.
-_CLIENT_ROLE_HTTP_CLASSES = frozenset(
+_CLIENT_ROLE_BODY_CLASSES = frozenset(
     {
+        "TestExternalByteStream",
         "TestExternalLocation",
         "TestHttpResponseCap",
         "TestHttpResponseCapProducer",
@@ -658,7 +685,7 @@ def _exercises_the_client(item: pytest.Item) -> bool:
     name = item.cls.__name__ if item.cls is not None else None
     if name in _CLIENT_ROLE_EXCLUDED_CLASSES:
         return False
-    if name in _CLIENT_ROLE_HTTP_CLASSES:
+    if name in _CLIENT_ROLE_BODY_CLASSES:
         return True
     fixtures = getattr(item, "fixturenames", ())
     return any(fixture in _CLIENT_ROLE_FIXTURES for fixture in fixtures)
@@ -1009,6 +1036,74 @@ def conformance_fake_storage() -> Iterator[str]:
         yield base_url
     finally:
         shutdown()
+
+
+@pytest.fixture(scope="session")
+def conformance_bytestream_external_target(
+    conformance_fake_storage: str,
+) -> Iterator[Any]:
+    """Drive this port's client against an externalising reference peer.
+
+    Backs the shared ``TestExternalByteStream`` group.  Externalization is not
+    an HTTP feature (``docs/WIRE_PROTOCOL.md`` §12, "Transport independence"):
+    the same resolver serves the pipe, subprocess, Unix-socket and TCP
+    clients, and until this fixture existed nothing in the suite ever handed
+    that resolver a pointer batch off the HTTP path.  This port's raw client
+    did not merely have the half untested — it refused pointer batches
+    outright, with an honest error, which is why the group is worth its wiring
+    rather than being a formality.
+
+    **Driver-backed in every role, deliberately.**  Elsewhere the connection
+    fixtures follow ``VGI_CONFORMANCE_ROLE``: server role hands the suite a
+    reference Python client so the C++ *server* is what answers.  That would
+    make this group vacuous, because the C++ server externalizes on the HTTP
+    transport only — a server-role leg would put the reference on both ends of
+    the pointer and assert nothing about this port at all.  What this group
+    exists to exercise is the *resolver*, which lives in the C++ client, so the
+    client under test is on the wire here regardless of role.
+
+    The peer is the reference CLI with a one-byte threshold, so every
+    data-bearing batch in the group goes through storage — including the
+    *stream header*, which is the path a port cannot reach against its own
+    server (§1.5) and which this port's header reader had never seen.
+    """
+    import httpx2
+
+    from vgi_rpc.conformance._external_bytestream_pytest import ByteStreamExternalTarget
+    from vgi_rpc.external import ExternalLocationConfig
+
+    # Skip early, not once per test, when the driver binary is not built.
+    client_driver()
+    argv = _reference_pipe_argv(
+        "--fake-storage", conformance_fake_storage, "--externalize-threshold", "1"
+    )
+
+    @contextlib.contextmanager
+    def _conn(on_log: Callable[..., None] | None) -> Iterator[Any]:
+        # Presence is all that crosses the control boundary: the *client under
+        # test* fetches the payload.  Resolving it here would make the group
+        # pass without the client ever doing the work.
+        proxy = client_driver().connect(
+            "stdio", argv, on_log, external_config=ExternalLocationConfig(url_validator=None)
+        )
+        try:
+            yield proxy
+        finally:
+            proxy.close()
+
+    def connect(on_log: Callable[..., None] | None = None) -> Any:
+        return _conn(on_log)
+
+    def uploaded_objects() -> int:
+        response = httpx2.get(f"{conformance_fake_storage}/_stats", timeout=5.0)
+        response.raise_for_status()
+        return int(response.json()["object_count"])
+
+    yield ByteStreamExternalTarget(
+        name="cpp-client-vs-reference-pipe",
+        connect=connect,
+        uploaded_objects=uploaded_objects,
+    )
 
 
 @pytest.fixture(scope="session")

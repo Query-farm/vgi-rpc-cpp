@@ -27,6 +27,7 @@
 
 #include "vgi_rpc/annotated_batch.h"
 #include "vgi_rpc/client_description.h"
+#include "vgi_rpc/client_external.h"
 #include "vgi_rpc/export.h"
 #include "vgi_rpc/log.h"
 
@@ -261,6 +262,19 @@ struct RpcClientOptions {
     // Zero disables SHM. A positive value performs __transport_options__ at
     // construction and creates a POSIX segment only when both peers support it.
     size_t shared_memory_bytes = 0;
+    // Policy for resolving external-location pointer batches.
+    //
+    // Externalization is not an HTTP feature (WIRE_PROTOCOL.md §12,
+    // "Transport independence"): any transport that carries record batches
+    // carries pointer batches, and a peer serving a byte stream may externalize
+    // a data cycle *or* a stream header (§1.5). So this defaults to the same
+    // policy HttpClient uses -- HTTPS only, every resolved address globally
+    // routable -- rather than to "off", which is what left this client unable
+    // to read an externalized stream at all.
+    //
+    // `nullopt` refuses pointer batches instead, for a deployment that wants
+    // its byte-stream client to make no outbound HTTP request of its own.
+    std::optional<ClientExternalHttpOptions> external_http{ClientExternalHttpOptions{}};
 };
 
 struct ClientTransportOptions {
@@ -313,9 +327,11 @@ private:
 /// Dynamic, schema-first client for raw Arrow IPC transports.
 ///
 /// RpcClient is intentionally single-call-at-a-time. A live ClientStream
-/// reserves the connection until it is closed, cancelled, or destroyed. Raw
-/// clients reject external-location and stateless-resume envelopes; those are
-/// HTTP transport features.
+/// reserves the connection until it is closed, cancelled, or destroyed.
+/// External-location pointer batches are resolved on the data stream and on
+/// the header stream alike, under RpcClientOptions::external_http. Raw clients
+/// still reject stateless-resume envelopes; that one really is an HTTP
+/// transport feature, because a raw stream is its own continuation handle.
 class VGI_RPC_EXPORT RpcClient {
 public:
     explicit RpcClient(ClientTransport transport, const RpcClientOptions& options = {});

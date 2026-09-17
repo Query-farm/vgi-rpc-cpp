@@ -78,6 +78,16 @@ static std::shared_ptr<arrow::Schema> counter_schema() {
     return s;
 }
 
+static std::shared_ptr<arrow::Schema> annotated_schema() {
+    static auto s = arrow::schema({arrow::field("value", arrow::int64())});
+    return s;
+}
+
+// Deliberately non-ASCII, and a constant: a port that round-trips per-batch
+// metadata through a latin-1 or C-string path fails here rather than in
+// someone's production data.
+static constexpr const char* kAnnotatedEmitLabel = "\u00fcn\u00efcode-\u03bb";
+
 static std::shared_ptr<arrow::Schema> scale_input_schema() {
     static auto s = arrow::schema({arrow::field("value", arrow::float64())});
     return s;
@@ -1022,6 +1032,50 @@ private:
     int64_t rows_per_batch_, batch_count_, current_ = 0;
 };
 
+// `count` batches of `rows_per_batch` rows, each carrying distinct per-emit
+// custom metadata.
+//
+// This pins the one place per-batch metadata and externalization meet. Two
+// ports shipped opposite defects there: one refused to externalize any batch
+// carrying metadata, using "has metadata" as a proxy for "is a control batch";
+// the other externalized and *then* replaced the resulting batch's metadata,
+// erasing `vgi_rpc.location` and leaving a zero-row batch no resolver
+// recognises. This port is structurally immune to both, because OutputCollector
+// records which entry is the data batch (`data_batch_idx_`) rather than
+// inferring it from whether metadata is present -- but nothing proved that
+// until a conformance method emitted per-emit metadata at all.
+//
+// `batch_index` varies and the tests check *which* batch carried *which*
+// value: a constant label alone would pass against a port that caches the
+// first turn's metadata and reuses it.
+class AnnotatedProducerState : public ProducerState {
+public:
+    AnnotatedProducerState(int64_t count, int64_t rows_per_batch)
+        : count_(count), rows_per_batch_(rows_per_batch) {}
+    void produce(OutputCollector& out, CallContext&) override {
+        if (current_ >= count_) {
+            out.finish();
+            return;
+        }
+        const int64_t base = current_ * 1000000;
+        arrow::Int64Builder val;
+        for (int64_t i = 0; i < rows_per_batch_; ++i) {
+            VGI_RPC_THROW_NOT_OK(val.Append(base + i));
+        }
+        auto batch =
+            arrow::RecordBatch::Make(out.output_schema(), rows_per_batch_, {unwrap(val.Finish())});
+        auto metadata = std::make_shared<arrow::KeyValueMetadata>();
+        metadata->Append("conformance.batch_index", std::to_string(current_));
+        metadata->Append("conformance.batch_total", std::to_string(count_));
+        metadata->Append("conformance.emit_label", kAnnotatedEmitLabel);
+        out.emit_batch(std::move(batch), std::move(metadata));
+        ++current_;
+    }
+
+private:
+    int64_t count_, rows_per_batch_, current_ = 0;
+};
+
 // One oversized batch of rows_per_batch {index, value} rows, then finish.
 class OversizedBatchState : public ProducerState {
 public:
@@ -1328,6 +1382,12 @@ static Stream make_produce_large(const Request& req, CallContext&) {
     return {counter_schema(), empty_schema(),
             std::make_shared<LargeProducerState>(req.get<int64_t>("rows_per_batch"),
                                                  req.get<int64_t>("batch_count")),
+            nullptr};
+}
+static Stream make_produce_annotated_batches(const Request& req, CallContext&) {
+    return {annotated_schema(), empty_schema(),
+            std::make_shared<AnnotatedProducerState>(req.get<int64_t>("count"),
+                                                     req.get<int64_t>("rows_per_batch")),
             nullptr};
 }
 static Stream make_produce_with_logs(const Request& req, CallContext&) {
@@ -2055,6 +2115,11 @@ int main(int argc, char** argv) {
                               arrow::field("batch_count", arrow::int64())}),
                       counter_schema(), make_produce_large,
                       "Produce batch_count batches of rows_per_batch rows each.")
+        .add_producer("produce_annotated_batches",
+                      params({arrow::field("count", arrow::int64()),
+                              arrow::field("rows_per_batch", arrow::int64())}),
+                      annotated_schema(), make_produce_annotated_batches,
+                      "Produce count batches, each carrying distinct per-emit metadata.")
         .add_producer("produce_with_logs", params({arrow::field("count", arrow::int64())}),
                       counter_schema(), make_produce_with_logs,
                       "Produce batches with an INFO log before each.")

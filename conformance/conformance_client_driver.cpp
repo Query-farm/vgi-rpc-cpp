@@ -373,6 +373,17 @@ json Driver::op_connect(const json& request) {
         RpcClientOptions options;
         options.protocol = protocol;
         options.on_log = make_log_sink();
+        // The byte-stream transports resolve pointer batches through the same
+        // resolver HTTP uses, and the reference peer externalizes its *stream
+        // header* as well as its data cycles -- the one path a port cannot
+        // reach against its own server. Same policy choice as the HTTP branch
+        // below, for the same reason: the control protocol carries no URL
+        // policy field, and the fake object store vends `http://127.0.0.1/...`.
+        // LOOPBACK_HTTP_TEST is not a loosening -- it additionally requires
+        // every resolved address to be loopback.
+        ClientExternalHttpOptions raw_external;
+        raw_external.url_policy = ExternalUrlPolicy::LOOPBACK_HTTP_TEST;
+        options.external_http = raw_external;
 
         if (transport == "stdio") {
             raw_.emplace(RpcClient::spawn(argv_target(), options));
