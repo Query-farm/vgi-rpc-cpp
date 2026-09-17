@@ -4,7 +4,9 @@
 
 vgi-rpc-cpp is a C++20 RPC framework built on Apache Arrow IPC. It provides unary and streaming (producer/exchange) method patterns over four transports: pipe (stdin/stdout), Unix domain socket, TCP, and HTTP, plus a shared-memory side channel that rides alongside the raw-framing ones. Dispatch is single-threaded by design — the HTTP transport serializes requests under one mutex to preserve that.
 
-The HTTP transport additionally carries the optional features of the wire spec: capability discovery, response and externalization caps, external-location pointer batches, bounded zstd/gzip request decoding and response negotiation, CORS, sticky sessions, standardized 401s, proxy proof, and token introspection. All are off by default except codec support, which is part of the HTTP wire baseline; `HttpConfig::compression = false` disables response compression without disabling request decoding.
+The HTTP transport additionally carries most of the optional features of the wire spec: capability discovery, response and externalization caps, bounded zstd/gzip request decoding and response negotiation, CORS, sticky sessions, standardized 401s, proxy proof, and token introspection. All are off by default except codec support, which is part of the HTTP wire baseline; `HttpConfig::compression = false` disables response compression without disabling request decoding.
+
+*Resolving* external-location pointer batches is not among them: any transport that carries record batches carries pointer batches, so `RpcClient` resolves them on its data and header streams too, under `RpcClientOptions::external_http`. *Producing* them is still HTTP-only on the server side.
 
 External storage picks its backend by URL scheme: `http(s)://` always works, while `s3://` and `gs://` need the opt-in vcpkg manifest features (`VCPKG_MANIFEST_FEATURES="s3;gcs"` plus `-DVGI_RPC_WITH_S3=ON -DVGI_RPC_WITH_GCS=ON`). Keep them opt-in — aws-sdk-cpp and google-cloud-cpp roughly triple the dependency build time.
 
