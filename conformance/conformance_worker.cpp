@@ -1301,6 +1301,36 @@ public:
     }
 };
 
+// Reports, per input, the metadata `exchange` was handed: `seen` is the value
+// of `vgi.conformance.input` (empty when absent) and `keys` every key present,
+// sorted and comma-joined.  The pair lets the suite check both halves of the
+// rule -- the input's own metadata arrives, the HTTP cursor and call token
+// do not.
+class InputMetadataExchangeState : public ExchangeState {
+public:
+    void exchange(const AnnotatedBatch& input, OutputCollector& out, CallContext&) override {
+        std::string seen;
+        std::vector<std::string> keys;
+        if (const auto& md = input.custom_metadata) {
+            if (const auto index = md->FindKey("vgi.conformance.input"); index >= 0) {
+                seen = md->value(index);
+            }
+            keys = md->keys();
+            std::sort(keys.begin(), keys.end());
+        }
+        std::string joined;
+        for (const auto& key : keys) {
+            if (!joined.empty()) joined += ",";
+            joined += key;
+        }
+        arrow::StringBuilder seen_builder;
+        arrow::StringBuilder keys_builder;
+        VGI_RPC_THROW_NOT_OK(seen_builder.Append(seen));
+        VGI_RPC_THROW_NOT_OK(keys_builder.Append(joined));
+        out.emit_arrays({unwrap(seen_builder.Finish()), unwrap(keys_builder.Finish())});
+    }
+};
+
 class FailOnExchangeNState : public ExchangeState {
 public:
     FailOnExchangeNState(int64_t fail_on) : fail_on_(fail_on) {}
@@ -1477,6 +1507,11 @@ static Stream make_exchange_with_logs(const Request&, CallContext&) {
 }
 static Stream make_exchange_zero_columns(const Request&, CallContext&) {
     return {empty_schema(), empty_schema(), std::make_shared<ZeroColumnExchangeState>(), nullptr};
+}
+static Stream make_exchange_input_metadata(const Request&, CallContext&) {
+    auto output =
+        arrow::schema({arrow::field("seen", arrow::utf8()), arrow::field("keys", arrow::utf8())});
+    return {output, scale_input_schema(), std::make_shared<InputMetadataExchangeState>(), nullptr};
 }
 static Stream make_exchange_error_on_nth(const Request& req, CallContext&) {
     return {scale_output_schema(), scale_input_schema(),
@@ -2177,6 +2212,11 @@ int main(int argc, char** argv) {
         .add_exchange("exchange_zero_columns", empty_schema(), empty_schema(), empty_schema(),
                       make_exchange_zero_columns,
                       "Exchange stream with zero-column input and output.")
+        .add_exchange("exchange_input_metadata", empty_schema(), scale_input_schema(),
+                      arrow::schema({arrow::field("seen", arrow::utf8()),
+                                     arrow::field("keys", arrow::utf8())}),
+                      make_exchange_input_metadata,
+                      "Report the custom metadata each exchange input batch was handed with.")
         .add_exchange("exchange_error_on_nth", params({arrow::field("fail_on", arrow::int64())}),
                       scale_input_schema(), scale_output_schema(), make_exchange_error_on_nth,
                       "Raise on the Nth exchange (1-indexed).")
