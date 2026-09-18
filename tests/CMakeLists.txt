@@ -44,6 +44,7 @@ vgi_rpc_add_test(token_identity_test)
 vgi_rpc_add_test(client_external_test)
 vgi_rpc_add_test(client_test)
 vgi_rpc_add_test(http_routing_test)
+vgi_rpc_add_test(http_stream_metadata_test)
 
 add_executable(client_integration client_integration.cpp)
 target_link_libraries(client_integration PRIVATE vgi_rpc)

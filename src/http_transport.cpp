@@ -50,6 +50,7 @@
 #include <array>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <ctime>
 #include <exception>
 #include <functional>
@@ -453,6 +454,54 @@ std::shared_ptr<arrow::KeyValueMetadata> cursor_metadata(const std::string& curs
     auto md = std::make_shared<arrow::KeyValueMetadata>();
     md->Append(keys::STATE_B64, cursor);
     return md;
+}
+
+// What one HTTP stream turn hands `process()` as its input's metadata: the
+// request batch's own, less the transport's bookkeeping.
+//
+// That metadata is application data.  VGI hangs per-input state on it --
+// `vgi.cache.if_none_match` / `if_modified_since` on every exchange input,
+// `vgi_pushdown_filters` deltas on every tick -- and the pipe transport
+// delivers it with the batch it rode in on.  Over HTTP each turn is its own
+// request, so dropping it here strands exactly those updates, silently: the
+// stream still completes and nothing errors.
+//
+// The cursor, the call token and the cancel marker are stripped, as the
+// reference does (WIRE_PROTOCOL.md, "Stream exchange (HTTP)").  The pipe
+// transport keeps that state in the connection and never puts it on a batch,
+// so forwarding it would be a transport-parity break -- and the cursor is a
+// sealed token application code has no business reading.  Every other key,
+// `vgi_rpc.*` included, passes through, again as the reference does.
+//
+// `provenance` is the `vgi_rpc.location.source` / `fetch_ms` pair when the
+// input arrived through an external pointer: resolved metadata is the fetched
+// batch's plus the reader's provenance stamp, never the pointer's (§12).
+std::shared_ptr<arrow::KeyValueMetadata> turn_input_metadata(
+    const std::shared_ptr<arrow::KeyValueMetadata>& request,
+    const std::shared_ptr<arrow::KeyValueMetadata>& provenance) {
+    auto md = std::make_shared<arrow::KeyValueMetadata>();
+    if (request) {
+        for (int64_t i = 0; i < request->size(); ++i) {
+            const std::string& key = request->key(i);
+            if (key == keys::STATE_B64 || key == keys::CALL_STATE_B64 || key == keys::CANCEL) {
+                continue;
+            }
+            md->Append(key, request->value(i));
+        }
+    }
+    if (provenance) {
+        // The reader's stamp wins: a payload cannot choose its own provenance.
+        for (int64_t i = 0; i < provenance->size(); ++i) {
+            for (auto index = md->FindKey(provenance->key(i)); index >= 0;
+                 index = md->FindKey(provenance->key(i))) {
+                (void)md->Delete(index);
+            }
+            md->Append(provenance->key(i), provenance->value(i));
+        }
+    }
+    // Absent rather than empty, matching the pipe transport for a batch that
+    // carried nothing.
+    return md->size() > 0 ? md : nullptr;
 }
 
 // The sentinel an /init response carries: both tokens on the one zero-row
@@ -1364,9 +1413,24 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
         return;
     }
     // Stage 1: a pointer batch is replaced by what it points at, so dispatch
-    // sees the parameters the caller meant to send.
+    // sees the parameters the caller meant to send.  The reader's provenance
+    // stamp is kept aside for the one place resolved metadata reaches user
+    // code, a stream turn's input (see turn_input_metadata).
+    std::shared_ptr<arrow::KeyValueMetadata> input_provenance;
     try {
+        const std::string pointer_url =
+            get_metadata_value(contents->batches[0].custom_metadata, keys::LOCATION);
+        const auto fetch_started = std::chrono::steady_clock::now();
         if (auto resolved = resolve_request_pointer(contents->batches[0])) {
+            const std::chrono::duration<double, std::milli> fetch_ms =
+                std::chrono::steady_clock::now() - fetch_started;
+            char fetch_ms_text[32];
+            std::snprintf(fetch_ms_text, sizeof fetch_ms_text, "%.1f", fetch_ms.count());
+            input_provenance = std::make_shared<arrow::KeyValueMetadata>();
+            // In full, query string included: §12 makes this application
+            // metadata, not a diagnostic.
+            input_provenance->Append(keys::LOCATION_SOURCE, pointer_url);
+            input_provenance->Append(keys::LOCATION_FETCH_MS, fetch_ms_text);
             contents = std::move(resolved);
         }
     } catch (const std::exception& e) {
@@ -2075,7 +2139,13 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
             auto coerced = coerce_input(batch, sess->input_schema);
             OutputCollector oc(output_schema, /*producer=*/false, rpc_.server_id(), request_id,
                                response_limit, preferred_response);
-            sess->state->process(AnnotatedBatch::data(coerced), oc, ctx);
+            // The input's own metadata rides along with it, as on the pipe
+            // transport: an exchange is asked once per input and each one may
+            // carry its own validators or filter deltas.
+            sess->state->process(
+                AnnotatedBatch::with_metadata(
+                    coerced, turn_input_metadata(custom_metadata, input_provenance)),
+                oc, ctx);
             std::string body = build_body([&](const std::shared_ptr<arrow::io::OutputStream>& out) {
                 std::vector<AnnotatedBatch> batches = oc.batches();
                 // Only the cursor is re-minted; re-issuing the call token
