@@ -1776,8 +1776,6 @@ int main(int argc, char** argv) {
             http_cfg.compression = false;
         } else if (arg == "--cors-origin") {
             http_cfg.cors_origin = take_value(i);
-        } else if (arg == "--introspect") {
-            http_cfg.token_introspection = true;
         } else if (arg == "--identity") {
             identity_mode = take_value(i);
             if (identity_mode != "off" && identity_mode != "both" &&

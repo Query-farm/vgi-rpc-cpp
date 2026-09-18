@@ -283,3 +283,32 @@ TEST_CASE("__describe__ is refused with the name of its replacement", "[http-rou
         CHECK(res.body.find("list_protocols") != std::string::npos);
     }
 }
+
+TEST_CASE("the retired __introspect_token__ route is not served", "[http-routing]") {
+    // Introspection is the `vgi_rpc.Identity.v1` protocol.  The pre-0.46 HTTP
+    // JSON route it replaced is retired (IDENTITY_V1_SPEC §8): a second surface
+    // is a second set of guards to keep identical, and it had already drifted.
+    // So the name gets no bespoke handler -- it is an unknown reserved method,
+    // answered in Arrow like any other, and never the route's JSON.
+    RoutingServer server;
+    auto res = post(server.port(), "/vgi/__introspect_token__",
+                    request_body("__introspect_token__", std::nullopt, /*empty_params=*/true));
+    CHECK(res.status == 404);
+    CHECK(has_error_kind(res.body, ERROR_KIND_METHOD_NOT_IMPLEMENTED));
+
+    // The JSON body the route used to accept is refused before any dispatch.
+    httplib::Client client("127.0.0.1", server.port());
+    client.set_read_timeout(10, 0);
+    for (const std::string& path :
+         {std::string("/vgi/__introspect_token__"), std::string("/__introspect_token__")}) {
+        auto json = client.Post(path, R"({"token":"anything"})", "application/json");
+        REQUIRE(json);
+        CHECK(json->status != 200);
+        CHECK(json->body.find("principal") == std::string::npos);
+    }
+
+    // Nor does capability discovery advertise it.
+    auto health = client.Get("/vgi/health");
+    REQUIRE(health);
+    CHECK_FALSE(health->has_header("VGI-Token-Introspection"));
+}

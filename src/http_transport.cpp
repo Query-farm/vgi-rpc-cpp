@@ -4,8 +4,10 @@
 // HTTP transport for the vgi-rpc server (cpp-httplib).  Maps the pipe-based
 // wire protocol onto stateless HTTP request/response pairs per
 // docs/WIRE_PROTOCOL.md §10, and carries the optional HTTP-only features:
-// capability discovery, CORS, standardized 401s, proxy proof, token
-// introspection, and sticky sessions.
+// capability discovery, CORS, standardized 401s, proxy proof, and sticky
+// sessions.  Token introspection is not among them: it is the
+// `vgi_rpc.Identity.v1` protocol, served on every transport, and the HTTP-only
+// `__introspect_token__` route it replaced is retired.
 //
 // Stream state is held server-side in a token-keyed registry, which is what
 // keeps the C++ stream-state objects — live handles, not serializable values —
@@ -89,13 +91,6 @@ constexpr const char* PRINCIPAL_HEADER = "X-Conformance-Principal";
 // went untested.  The guard is what parses; the fixture only transports.
 constexpr const char* AUTH_TIME_HEADER = "X-Conformance-Auth-Time";
 constexpr const char* AUTH_REASON_REQUEST_HEADER = "X-Conformance-Auth-Reason";
-
-// Fixture constants for the token-introspection group.  The shared suite posts
-// these exact values, so they are part of the endpoint's test contract.
-constexpr const char* INTROSPECTOR_PRINCIPAL = "conformance-introspector";
-constexpr const char* SUBJECT_TOKEN = "conformance-opaque-subject-token";
-constexpr const char* SUBJECT_PRINCIPAL = "subject@conformance.example";
-constexpr const char* UNAVAILABLE_TOKEN = "conformance-unavailable-token";
 
 // Live stream held across the separate HTTP requests of one stream call.
 struct HttpStreamSession {
@@ -784,8 +779,6 @@ private:
                             AuthReason reason) const;
 
     void handle_health(const httplib::Request& req, httplib::Response& res) const;
-    void handle_introspect(const httplib::Request& req, httplib::Response& res,
-                           const std::string& request_body);
     void handle_session_delete(const httplib::Request& req, httplib::Response& res);
     void handle_rpc(const httplib::Request& req, httplib::Response& res,
                     const std::string& request_body);
@@ -869,9 +862,6 @@ void HttpServer::stamp_capabilities(httplib::Response& res) const {
             }
             res.set_header("VGI-Sticky-Echo-Headers", names);
         }
-    }
-    if (cfg_.token_introspection) {
-        res.set_header("VGI-Token-Introspection", "true");
     }
     // Only in require mode — never as "false" in off or allow, which readers
     // would have to special-case.
@@ -1250,78 +1240,6 @@ void HttpServer::handle_health(const httplib::Request& req, httplib::Response& r
         body["protocol"] = rpc_.protocol_name();
         res.set_content(body.dump(), "application/json");
     }
-}
-
-void HttpServer::handle_introspect(const httplib::Request& req, httplib::Response& res,
-                                   const std::string& request_body) {
-    stamp_common(req, res, random_hex(16));
-
-    if (!cfg_.token_introspection) {
-        // Definitive, not transient: a 415 from a generic route would read as
-        // "retry later", so a proxy pointed at a worker without the feature
-        // would retry forever instead of failing at preflight.
-        res.status = 404;
-        res.set_content(nlohmann::json{{"error", "not_enabled"}}.dump(), "application/json");
-        return;
-    }
-
-    // An introspector allowlist with no permissive default: authentication is
-    // not the same capability as introspection.  A deployment where any valid
-    // credential may introspect lets any user resolve a stolen one to its owner.
-    const std::string caller = req.get_header_value(PRINCIPAL_HEADER);
-    if (caller != INTROSPECTOR_PRINCIPAL) {
-        res.status = 403;
-        res.set_content(nlohmann::json{{"error", "forbidden"}}.dump(), "application/json");
-        return;
-    }
-
-    std::string token;
-    try {
-        auto body = nlohmann::json::parse(request_body);
-        token = body.value("token", "");
-    } catch (const std::exception&) {
-        res.status = 404;
-        res.set_content(nlohmann::json{{"error", "not_found"}}.dump(), "application/json");
-        return;
-    }
-
-    // A JWS the asker can validate locally must never be vouched for here:
-    // routing one through hands a third party a bearer token the asker may
-    // itself have rejected.  Shape-checked before any resolution is attempted.
-    if (std::count(token.begin(), token.end(), '.') == 2) {
-        res.status = 404;
-        res.set_content(nlohmann::json{{"error", "not_found"}}.dump(), "application/json");
-        return;
-    }
-
-    if (token == UNAVAILABLE_TOKEN) {
-        // The resolver could not answer.  404 is the one status a caller may
-        // negative-cache, so a store blip reported as 404 is remembered as
-        // "this credential is bad" for the cache's lifetime.
-        res.status = 503;
-        res.set_header("Retry-After", "5");
-        res.set_content(nlohmann::json{{"error", "unavailable"}}.dump(), "application/json");
-        return;
-    }
-
-    if (token != SUBJECT_TOKEN) {
-        // Unknown, expired and malformed are byte-identical answers; reporting
-        // which would confirm that a guessed credential exists.  The credential
-        // itself appears nowhere in the response.
-        res.status = 404;
-        res.set_content(nlohmann::json{{"error", "not_found"}}.dump(), "application/json");
-        return;
-    }
-
-    nlohmann::json body;
-    body["principal"] = SUBJECT_PRINCIPAL;
-    body["token_name"] = "conformance";
-    body["ttl_seconds"] = 300;
-    // Exactly three keys.  A claims field would let this worker choose its
-    // caller's tenant routing and policy branch; the asker derives everything
-    // it needs from the principal alone.
-    res.status = 200;
-    res.set_content(body.dump(), "application/json");
 }
 
 void HttpServer::handle_session_delete(const httplib::Request& req, httplib::Response& res) {
@@ -2321,54 +2239,15 @@ void HttpServer::run() {
         svr.Options(p, health);
     }
 
-    // Always routed, even when disabled: a caller must get a definitive answer
-    // rather than whatever a generic route happens to produce.
+    // `POST {prefix}/__introspect_token__` is deliberately not routed.  It was
+    // the HTTP-only JSON form of introspection, retired when introspection
+    // became the `vgi_rpc.Identity.v1` protocol; it now reaches the catch-all
+    // below like any other unknown reserved name.
+    //
     // cpp-httplib keeps ordinary POST handlers and ContentReader POST handlers
     // in separate tables, and consults the latter first.  Register framework
     // POST endpoints as ContentReader handlers too, otherwise the catch-all RPC
     // route below wins and rejects their JSON/empty bodies as non-Arrow media.
-    auto introspect = [this](const httplib::Request& req, httplib::Response& res,
-                             const httplib::ContentReader& reader) {
-        std::exception_ptr serve_start_error;
-        try {
-            rpc_.notify_serve_start(TransportKind::HTTP);
-        } catch (...) {
-            serve_start_error = std::current_exception();
-        }
-
-        const auto configured_request_limit =
-            configured_limit(cfg_.max_request_bytes, cfg_.hosting_max_request_bytes);
-        const int64_t cap = configured_request_limit.value_or(-1);
-        std::string body;
-        bool decoded_too_large = false;
-        const bool read = reader([&](const char* data, size_t size) {
-            if (cap >= 0 && (size > static_cast<size_t>(cap) ||
-                             body.size() > static_cast<size_t>(cap) - size)) {
-                decoded_too_large = true;
-                return false;
-            }
-            body.append(data, size);
-            return true;
-        });
-        if (serve_start_error) std::rethrow_exception(serve_start_error);
-        if (!read) {
-            stamp_common(req, res, random_hex(16));
-            if (decoded_too_large || res.status == 413) {
-                res.status = 413;
-                res.set_content("Request body exceeds VGI-Max-Request-Bytes", "text/plain");
-            } else if (res.status < 400) {
-                res.status = 400;
-                res.set_content("Invalid compressed request body", "text/plain");
-            }
-            return;
-        }
-        handle_introspect(req, res, body);
-    };
-    for (const std::string& p :
-         {std::string("/__introspect_token__"), cfg_.prefix + "/__introspect_token__"}) {
-        svr.Post(p, introspect);
-    }
-
     if (cfg_.test_drain_endpoint) {
         // Conformance affordance: flip the drain flag over the wire, because
         // the alternative — SIGTERM — kills the worker the test is driving.

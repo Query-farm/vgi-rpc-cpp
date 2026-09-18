@@ -13,7 +13,7 @@
 #   2. `pytest tests/conformance/test_suite.py` — the shared pytest suite from
 #      `vgi_rpc.conformance._pytest_suite`, which covers the capability-gated
 #      HTTP groups the CLI runner has no way to reach: sticky sessions, proxy
-#      proof, CORS, standardized 401s, token introspection, compression
+#      proof, CORS, standardized 401s, vgi_rpc.Identity.v1, compression
 #      negotiation, external locations, and the response caps. Optional cloud
 #      backend tests run in their own explicitly skippable group.
 #

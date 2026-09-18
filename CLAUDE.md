@@ -4,7 +4,9 @@
 
 vgi-rpc-cpp is a C++20 RPC framework built on Apache Arrow IPC. It provides unary and streaming (producer/exchange) method patterns over four transports: pipe (stdin/stdout), Unix domain socket, TCP, and HTTP, plus a shared-memory side channel that rides alongside the raw-framing ones. Dispatch is single-threaded by design — the HTTP transport serializes requests under one mutex to preserve that.
 
-The HTTP transport additionally carries most of the optional features of the wire spec: capability discovery, response and externalization caps, bounded zstd/gzip request decoding and response negotiation, CORS, sticky sessions, standardized 401s, proxy proof, and token introspection. All are off by default except codec support, which is part of the HTTP wire baseline; `HttpConfig::compression = false` disables response compression without disabling request decoding.
+The HTTP transport additionally carries most of the optional features of the wire spec: capability discovery, response and externalization caps, bounded zstd/gzip request decoding and response negotiation, CORS, sticky sessions, standardized 401s, and proxy proof. All are off by default except codec support, which is part of the HTTP wire baseline; `HttpConfig::compression = false` disables response compression without disabling request decoding.
+
+Token introspection is not one of them. It is the `vgi_rpc.Identity.v1` protocol (`include/vgi_rpc/token_identity.h`), served on every transport, guarded by the introspector allowlist and **not rate limited** — a per-caller limit is one budget for every user behind the asker, drainable by junk credentials, and the cross-port audit forbids one. The HTTP-only `POST {prefix}/__introspect_token__` JSON route and its `VGI-Token-Introspection` header are retired (IDENTITY_V1_SPEC §8); do not bring them back.
 
 *Resolving* external-location pointer batches is not among them: any transport that carries record batches carries pointer batches, so `RpcClient` resolves them on its data and header streams too, under `RpcClientOptions::external_http`. *Producing* them is still HTTP-only on the server side.
 
@@ -29,7 +31,7 @@ Dependencies managed via vcpkg (Arrow, nlohmann-json, Catch2).
 Two conformance suites, both driven by `scripts/run_conformance.sh`:
 
 1. `vgi-rpc-test` — the CLI runner, over pipe, Unix socket, TCP, and HTTP, plus access-log validation.
-2. `pytest tests/conformance/test_suite.py tests/conformance/test_polymorphic_stream.py` — the mandatory, zero-skip shared suite re-exported from `vgi_rpc.conformance._pytest_suite`, which reaches the capability-gated HTTP groups the CLI runner cannot: sticky sessions, proxy proof, CORS, 401s, token introspection, zstd/gzip compression negotiation, external locations, response caps. `tests/conformance/conftest.py` supplies the fixtures by spawning the worker with the matching flags. `test_cloud_storage.py` runs separately because S3/GCS are opt-in build profiles.
+2. `pytest tests/conformance/test_suite.py tests/conformance/test_polymorphic_stream.py` — the mandatory, zero-skip shared suite re-exported from `vgi_rpc.conformance._pytest_suite`, which reaches the capability-gated HTTP groups the CLI runner cannot: sticky sessions, proxy proof, CORS, 401s, `vgi_rpc.Identity.v1`, zstd/gzip compression negotiation, external locations, response caps. `tests/conformance/conftest.py` supplies the fixtures by spawning the worker with the matching flags. `test_cloud_storage.py` runs separately because S3/GCS are opt-in build profiles.
 
 Both of those drive this port's **server**. The **client** is tested by the same
 shared suite run in the other direction — `scripts/run_client_conformance.sh` —

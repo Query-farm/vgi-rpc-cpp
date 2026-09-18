@@ -150,7 +150,6 @@ def _python_http_argv(extra_args: tuple[str, ...]) -> list[str]:
     """
     unsupported = {
         "--auth-reject-all": "serve_conformance_http_auth.py (server-probe group only)",
-        "--introspect": "reference introspection worker",
         "--transport-kind-probe": "reference transport-kind probe",
         "--http-concurrency-probe": "reference concurrency probe",
         "--polymorphic-stream-probe": "reference polymorphic-stream probe",
@@ -946,18 +945,6 @@ def conformance_http_auth_port() -> Iterator[int]:
 def conformance_http_auth_reason_port(conformance_http_auth_port: int) -> int:
     """The reject-all worker already reads the header, so this is an alias."""
     return conformance_http_auth_port
-
-
-@pytest.fixture(scope="session")
-def conformance_http_introspect_port() -> Iterator[int]:
-    """A worker with the token-introspection route enabled.
-
-    Needs its own process because the route is absent unless explicitly
-    enabled — which ``TestTokenIntrospectionOffMode`` asserts against the
-    default worker.
-    """
-    with spawn_http("--introspect") as port:
-        yield port
 
 
 @pytest.fixture(scope="session")

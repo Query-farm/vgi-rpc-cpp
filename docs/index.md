@@ -80,7 +80,6 @@ response without guessing whether an older worker ignored the request header.
 | Sticky sessions (AEAD-sealed tokens, TTL, drain) | `sticky`, `sticky_default_ttl`, `sticky_echo_headers` |
 | Standardized 401s with `VGI-Auth-Reason` | `reject_all` |
 | Proxy proof (HMAC-SHA256 proof-of-hop) | `proof_mode`, `proof_origin_id`, `proof_secrets` |
-| Token introspection | `token_introspection` |
 
 Stream state travels as two tokens split by lifetime — a call token minted
 once by `/init` and a cursor re-minted every turn — so a continuation does not

@@ -125,10 +125,6 @@ struct HttpConfig {
     // Never enable in production.
     bool test_drain_endpoint = false;
 
-    // Token introspection route.  Off unless explicitly enabled — the guard
-    // that stops a worker growing a credential-to-identity oracle.
-    bool token_introspection = false;
-
     // Reject every RPC request with this reason.  Health stays reachable.
     AuthReason reject_all = AuthReason::NONE;
     // Fixture affordance: honour X-Conformance-Auth-Reason on a rejected
