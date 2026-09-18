@@ -394,3 +394,34 @@ TEST_CASE("an externalized exchange input delivers the payload's metadata, with 
     CHECK(seen.find(keys::LOCATION_SHA256) == std::string::npos);
     check_no_transport_keys(seen);
 }
+
+TEST_CASE("a producer turn hands process() its tick's metadata, less the transport's",
+          "[http-stream-metadata]") {
+    ProbeServer server;
+    // /init drives the first tick, so its request metadata is that tick's --
+    // the only way a first-tick validator reaches a producer over HTTP.
+    const Turn init = post(server.port(), kProducePath + "/init",
+                           init_body("produce_probe", count_params(3),
+                                     {{"vgi.cache.if_none_match", "\"etag-init\""}}));
+    REQUIRE(init.seen.size() == 1);
+    CHECK(init.seen[0].find("vgi.cache.if_none_match=\"etag-init\"") != std::string::npos);
+    check_no_transport_keys(init.seen[0]);
+    REQUIRE_FALSE(init.cursor.empty());
+    REQUIRE_FALSE(init.call_token.empty());
+
+    // Each continuation's tick carries its own filter delta.  Exact equality:
+    // the tokens that addressed the turn are bookkeeping, not tick metadata,
+    // and the cursor is a sealed token user code must not be able to read.
+    std::string cursor = init.cursor;
+    for (const std::string delta : {"delta-1", "delta-2"}) {
+        auto md = metadata({{keys::STATE_B64, cursor},
+                            {keys::CALL_STATE_B64, init.call_token},
+                            {"vgi_pushdown_filters", delta}});
+        const Turn turn = post(server.port(), kProducePath + "/exchange",
+                               ipc_body(empty_schema(), make_empty_batch(empty_schema()), md));
+        INFO("producer continuation " << delta);
+        REQUIRE(turn.seen.size() == 1);
+        CHECK(turn.seen[0] == "vgi_pushdown_filters=" + delta);
+        cursor = turn.cursor;
+    }
+}

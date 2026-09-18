@@ -1890,9 +1890,16 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
                                 : writer->WriteRecordBatch(*lb.batch));
                     }
                 }
+                // /init is the producer's first turn, so its request metadata
+                // is the first tick's -- the HTTP equivalent of the real tick
+                // the pipe transport delivers, and the only way first-tick
+                // metadata such as the result-cache validators can reach a
+                // producer over HTTP.
                 const bool finished = run_producer_turns(
                     writer, stream.state, output_schema, ctx, rpc_.server_id(), request_id,
-                    &failure, externalize, AnnotatedBatch::data(make_empty_batch(empty_schema())),
+                    &failure, externalize,
+                    AnnotatedBatch::with_metadata(make_empty_batch(empty_schema()),
+                                                  turn_input_metadata(custom_metadata, nullptr)),
                     response_limit, preferred_response);
                 if (!finished) {
                     VGI_RPC_THROW_NOT_OK(writer->WriteRecordBatch(
@@ -2193,10 +2200,12 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
             TurnFailure failure;
             std::string body = build_body([&](const std::shared_ptr<arrow::io::OutputStream>& out) {
                 auto writer = unwrap(arrow::ipc::MakeStreamWriter(out, output_schema));
-                finished = run_producer_turns(writer, sess->state, output_schema, ctx,
-                                              rpc_.server_id(), request_id, &failure, externalize,
-                                              AnnotatedBatch::with_metadata(batch, custom_metadata),
-                                              response_limit, preferred_response);
+                finished = run_producer_turns(
+                    writer, sess->state, output_schema, ctx, rpc_.server_id(), request_id, &failure,
+                    externalize,
+                    AnnotatedBatch::with_metadata(
+                        batch, turn_input_metadata(custom_metadata, input_provenance)),
+                    response_limit, preferred_response);
                 if (!finished) {
                     VGI_RPC_THROW_NOT_OK(writer->WriteRecordBatch(*make_empty_batch(output_schema),
                                                                   cursor_metadata(cursor)));
