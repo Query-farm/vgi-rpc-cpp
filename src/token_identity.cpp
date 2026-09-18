@@ -161,12 +161,6 @@ bool IsJwsShaped(std::string_view view) {
     return offset == view.size();
 }
 
-/// Seconds on the monotonic clock, for the rate limiter's window.
-double MonotonicSeconds() {
-    const auto now = std::chrono::steady_clock::now().time_since_epoch();
-    return std::chrono::duration<double>(now).count();
-}
-
 /// Seconds since the Unix epoch, for the freshness ceiling.
 ///
 /// Wall clock on purpose: `auth_time` is an absolute OIDC claim, so comparing
@@ -182,35 +176,6 @@ std::string token_digest(const std::string& token) {
     const auto digest =
         crypto::sha256(reinterpret_cast<const uint8_t*>(token.data()), token.size());
     return crypto::hex_encode(digest.data(), digest.size());
-}
-
-// RateLimiter
-
-RateLimiter::RateLimiter(int per_window, double window_seconds)
-    : per_window_(per_window), window_seconds_(window_seconds) {}
-
-bool RateLimiter::allow(const std::string& key) {
-    return allow(key, MonotonicSeconds());
-}
-
-bool RateLimiter::allow(const std::string& key, double now) {
-    std::lock_guard<std::mutex> guard(mutex_);
-    if (now - window_start_ >= window_seconds_) {
-        // Whole-map reset rather than per-key ageing: an attacker cycling keys
-        // cannot grow the map beyond one window's worth.
-        counts_.clear();
-        window_start_ = now;
-    }
-    auto it = counts_.find(key);
-    const int count = it == counts_.end() ? 0 : it->second;
-    if (count >= per_window_) return false;
-    counts_[key] = count + 1;
-    return true;
-}
-
-size_t RateLimiter::tracked_keys() const {
-    std::lock_guard<std::mutex> guard(mutex_);
-    return counts_.size();
 }
 
 // Guards
@@ -334,8 +299,7 @@ std::string IssuedGrant::serialize_to_bytes() const {
 IdentityImpl::IdentityImpl(IdentityOptions options)
     : resolve_token_(std::move(options.resolve_token)),
       mint_grant_(std::move(options.mint_grant)),
-      max_auth_age_(options.max_auth_age),
-      limiter_(options.introspect_rate_limit) {
+      max_auth_age_(options.max_auth_age) {
     // Validated at construction, not at first call: a worker that would refuse
     // every introspection should fail to start rather than serve traffic until
     // someone tries.
@@ -356,15 +320,16 @@ TokenIdentity IdentityImpl::introspect_token(const std::string& token, const Aut
         throw IntrospectionRefusedError("this worker does not resolve credentials");
     }
 
-    // Authorization first, and then the rate limit, and only then anything that
-    // looks at the subject credential.  An unauthorized caller must learn
-    // nothing about it -- including how long looking at it took, which is why
-    // the cheap syntactic checks do not get hoisted above these two for
-    // tidiness.  Reordering this is a timing oracle, not a style preference.
-    const std::string caller = check_introspector(auth, principals_);
-    if (!limiter_.allow(caller)) {
-        throw IntrospectionRefusedError("introspection rate limit exceeded");
-    }
+    // Authorization first, and only then anything that looks at the subject
+    // credential.  An unauthorized caller must learn nothing about it --
+    // including how long looking at it took, which is why the cheap syntactic
+    // checks do not get hoisted above it for tidiness.  Reordering this is a
+    // timing oracle, not a style preference.
+    //
+    // There is no rate limit.  The allowlist is the control: a per-caller
+    // budget is one budget for every user behind the asker, and junk
+    // credentials from unauthenticated clients drain it.
+    (void)check_introspector(auth, principals_);
     reject_jws_shaped(token);
 
     auto identity = resolve_token_(token);

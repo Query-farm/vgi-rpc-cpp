@@ -202,9 +202,9 @@ TEST_CASE("introspection resolves for an allowlisted caller") {
 
 TEST_CASE("a caller off the allowlist is refused") {
     // Authentication is not the same capability as introspection.  A deployment
-    // where any valid credential may introspect lets any user test guesses of
-    // any other user's credential at unlimited rate, and resolve a stolen one
-    // to its owner.
+    // where any valid credential may introspect lets any user resolve a stolen
+    // credential to its owner.  The allowlist is the control -- there is no
+    // rate limit behind it.
     for (const auto& caller : {std::optional<std::string>("alice"), std::optional<std::string>(""),
                                std::optional<std::string>()}) {
         IdentityImpl impl(introspect_only());
@@ -257,26 +257,6 @@ TEST_CASE("authorization is checked before the subject credential is touched") {
         } catch (const KindedError& e) {
             CHECK(e.kind() == "introspection_refused");
         }
-    }
-}
-
-// The rate limit is also ahead of the credential checks, for the same reason:
-// an unauthorized caller must not be able to distinguish "over limit" from
-// "malformed token" by which answer comes back.
-TEST_CASE("the rate limit is checked before the subject credential is touched") {
-    auto options = introspect_only();
-    options.introspect_rate_limit = 1;
-    IdentityImpl impl(std::move(options));
-
-    CHECK(impl.introspect_token("good", make_auth("proxy")).principal == "bob");
-    try {
-        // A JWS-shaped token, which would be `token_unresolved` on a fresh
-        // budget, is `introspection_refused` once the budget is spent.
-        impl.introspect_token("aaa.bbb.ccc", make_auth("proxy"));
-        FAIL("expected a refusal");
-    } catch (const KindedError& e) {
-        CHECK(e.kind() == "introspection_refused");
-        CHECK_THAT(std::string(e.what()), ContainsSubstring("rate limit"));
     }
 }
 
@@ -457,21 +437,57 @@ TEST_CASE("identity_unavailable is transient, not definitive") {
     CHECK(error_kind_of(outage) == "identity_unavailable");
 }
 
-TEST_CASE("introspection is rate limited") {
-    // Bounds, rather than closes, the oracle an allowlisted caller still has.
-    auto options = introspect_only();
-    options.introspect_rate_limit = 2;
-    IdentityImpl impl(std::move(options));
-
+TEST_CASE("introspection is not rate limited") {
+    // The allowlisted caller is answered however often it asks.  The caller is
+    // the asker -- a proxy -- introspecting on behalf of every client that
+    // presents a bearer, so a per-caller limit was one budget for every user's
+    // login.
+    IdentityImpl impl(introspect_only());
     const auto auth = make_auth("proxy");
-    CHECK(impl.introspect_token("good", auth).principal == "bob");
-    CHECK(impl.introspect_token("good", auth).principal == "bob");
-    try {
-        impl.introspect_token("good", auth);
-        FAIL("expected a refusal");
-    } catch (const IntrospectionRefusedError& e) {
-        CHECK_THAT(std::string(e.what()), ContainsSubstring("rate limit"));
+    for (int i = 0; i < 500; ++i) {
+        REQUIRE(impl.introspect_token("good", auth).principal == "bob");
     }
+}
+
+TEST_CASE("junk credentials do not spend a valid user's introspection") {
+    // The failure the limiter caused in production: unauthenticated clients
+    // sent the asker junk bearers, each became an introspection from the one
+    // allowlisted caller, and the next real user's first login was refused.
+    IdentityImpl impl(introspect_only());
+    const auto auth = make_auth("proxy");
+    for (int i = 0; i < 100; ++i) {
+        CHECK_THROWS_AS(impl.introspect_token("junk-" + std::to_string(i), auth),
+                        TokenUnresolvedError);
+    }
+    CHECK(impl.introspect_token("good", auth).principal == "bob");
+}
+
+TEST_CASE("a concurrent burst from the introspector is answered in full") {
+    // Concurrent so the burst lands inside any one-second window however fast
+    // this machine is -- the shape of the shared TestIntrospectionIsNotThrottled,
+    // run in-process.  This port dispatches unrelated calls concurrently, so it
+    // is also the shape real traffic takes.
+    IdentityImpl impl(introspect_only());
+    const auto auth = make_auth("proxy");
+    std::atomic<int> resolved{0};
+    std::atomic<int> refused{0};
+    std::vector<std::thread> threads;
+    for (int t = 0; t < 12; ++t) {
+        threads.emplace_back([&]() {
+            for (int i = 0; i < 5; ++i) {
+                try {
+                    if (impl.introspect_token("good", auth).principal == "bob") {
+                        resolved.fetch_add(1);
+                    }
+                } catch (const std::exception&) {
+                    refused.fetch_add(1);
+                }
+            }
+        });
+    }
+    for (auto& thread : threads) thread.join();
+    CHECK(refused.load() == 0);
+    CHECK(resolved.load() == 60);
 }
 
 TEST_CASE("an introspector allowlist is mandatory") {
@@ -503,7 +519,7 @@ TEST_CASE("an introspector allowlist is mandatory") {
 
 // ── Issuance is not an oracle ─────────────────────────────────────────
 //
-// Issuance is always about the caller, so it needs neither allowlist nor limit.
+// Issuance is always about the caller, so it needs no allowlist.
 
 TEST_CASE("issuance mints for the caller") {
     // The happy path: a present user minting their own standing grant.
@@ -653,60 +669,6 @@ TEST_CASE("error kinds are stable") {
     CHECK(GrantRefusedError("x").kind() == "grant_refused");
     CHECK(IdentityUnavailableError("x").kind() == "identity_unavailable");
     CHECK(IdentityUnavailableError().retry_after() == kDefaultIdentityRetryAfter);
-}
-
-// ── The rate limiter ──────────────────────────────────────────────────
-//
-// Fixed-window, because the state is two integers rather than an aged float.
-
-TEST_CASE("the limiter admits up to the limit within a window") {
-    RateLimiter limiter(3);
-    std::vector<bool> admitted;
-    for (int i = 0; i < 4; ++i) admitted.push_back(limiter.allow("a", 100.0));
-    CHECK(admitted == std::vector<bool>{true, true, true, false});
-}
-
-TEST_CASE("the limiter's window rolls") {
-    RateLimiter limiter(1);
-    CHECK(limiter.allow("a", 100.0));
-    CHECK_FALSE(limiter.allow("a", 100.5));
-    CHECK(limiter.allow("a", 101.5));
-}
-
-TEST_CASE("limiter callers are independent") {
-    // One caller exhausting its budget must not refuse another.
-    RateLimiter limiter(1);
-    CHECK(limiter.allow("a", 100.0));
-    CHECK(limiter.allow("b", 100.0));
-    CHECK_FALSE(limiter.allow("a", 100.0));
-}
-
-TEST_CASE("cycling keys cannot grow the limiter's map") {
-    // Whole-map reset rather than per-key ageing, so an attacker cannot.
-    // Per-key ageing would let a caller cycling keys grow the map without bound
-    // between sweeps.
-    RateLimiter limiter(1);
-    for (int i = 0; i < 1000; ++i) limiter.allow("k" + std::to_string(i), 100.0);
-    limiter.allow("fresh", 200.0);
-    CHECK(limiter.tracked_keys() == 1);
-}
-
-TEST_CASE("the limiter is safe under concurrent callers") {
-    // This port dispatches unrelated HTTP and socket calls concurrently, so an
-    // unsynchronized counter would not merely race -- it would *undercount*,
-    // which is the direction that fails open on a credential oracle.
-    RateLimiter limiter(100);
-    std::atomic<int> admitted{0};
-    std::vector<std::thread> threads;
-    for (int t = 0; t < 8; ++t) {
-        threads.emplace_back([&limiter, &admitted]() {
-            for (int i = 0; i < 200; ++i) {
-                if (limiter.allow("shared", 100.0)) admitted.fetch_add(1);
-            }
-        });
-    }
-    for (auto& thread : threads) thread.join();
-    CHECK(admitted.load() == 100);
 }
 
 // ── The wire: routing, narrowing and reflection ───────────────────────
@@ -1042,19 +1004,6 @@ TEST_CASE("the allowlist refuses, and the resolver is never reached") {
     CHECK_THROWS_AS(impl.introspect_token("anything", make_auth("proxy", /*authenticated=*/false)),
                     IntrospectionRefusedError);
     CHECK(seen.empty());
-}
-
-TEST_CASE("the rate limit refuses, and the resolver is never reached") {
-    std::vector<std::string> seen;
-    auto options = resolves_anything(seen);
-    options.introspect_rate_limit = 1;
-    IdentityImpl impl(std::move(options));
-
-    CHECK(impl.introspect_token("first", make_auth("proxy")).principal == "resolved");
-    CHECK(seen.size() == 1);
-
-    CHECK_THROWS_AS(impl.introspect_token("second", make_auth("proxy")), IntrospectionRefusedError);
-    CHECK(seen.size() == 1);
 }
 
 TEST_CASE("the freshness check refuses, and the minter is never reached") {

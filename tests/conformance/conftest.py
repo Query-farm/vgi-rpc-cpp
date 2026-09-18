@@ -1249,10 +1249,10 @@ def conformance_http_identity_port() -> Iterator[int]:
 
     The fixed deployment policy of ``IDENTITY_CONFORMANCE_FIXTURE.md``:
     the resolver of §3.3, the minter of §3.4, an introspector allowlist of
-    exactly ``["conformance-introspector"]``, ``max_auth_age`` 900 and a rate
-    limit of 100000. Identity is nearly all guards and every guard reads
-    deployment policy, so a cross-port assertion exists only because every
-    port configures these same values.
+    exactly ``["conformance-introspector"]`` and ``max_auth_age`` 900 -- and no
+    rate limit, which ``TestIntrospectionIsNotThrottled`` pins. Identity is
+    nearly all guards and every guard reads deployment policy, so a cross-port
+    assertion exists only because every port configures these same values.
 
     ``--identity`` implies principal-header auth, which is how the group gets
     an authenticated caller — and an ``auth_time`` claim — without an identity

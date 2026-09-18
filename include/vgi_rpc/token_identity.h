@@ -22,13 +22,23 @@
 /// entitlement lookups, policy-tier selection.  "Trust it as much as you trust
 /// the worker" is the wrong frame: it must be trusted *more*.  So every
 /// rejection is uniform, the caller must be on an allowlist with no permissive
-/// default, a JWS-shaped subject never reaches the resolver, and the whole
-/// thing is rate limited.
+/// default, and a JWS-shaped subject never reaches the resolver.
+///
+/// It is deliberately **not** rate limited.  The allowlist is the control.  A
+/// per-caller limit bounded only guessing, which a random credential defeats at
+/// any rate, and not the harm a leaked introspector credential does -- resolving
+/// a *stolen* credential takes one call.  Its cost was real: the caller is the
+/// asker, which introspects on behalf of every client that presents a bearer,
+/// so a per-caller budget was one budget for every user's login, drainable by
+/// unauthenticated clients sending the asker junk credentials.  Throttle
+/// untrusted traffic at the asker, per client.  Anything that throttles here
+/// anyway must answer `identity_unavailable` (transient), never
+/// `introspection_refused`, which is definitive and may be negative-cached.
 ///
 /// `issue_grant` mints a credential for the *calling* user, so it is not an
-/// oracle about anybody else.  It therefore needs no allowlist and no rate
-/// limit, and its rejections are deliberately *actionable*: a console that
-/// cannot tell "your login is too old" from "no" cannot know to re-prompt.
+/// oracle about anybody else.  It therefore needs no allowlist, and its
+/// rejections are deliberately *actionable*: a console that cannot tell "your
+/// login is too old" from "no" cannot know to re-prompt.
 ///
 /// Errors carry a stable `error_kind`.  That is load-bearing rather than
 /// decorative: these used to be a bespoke HTTP route whose callers classified
@@ -41,7 +51,6 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
-#include <mutex>
 #include <optional>
 #include <set>
 #include <string>
@@ -78,9 +87,6 @@ inline constexpr const char* kIdentityProtocolName = "vgi_rpc.Identity.v1";
 /// that says which unit it meant.
 inline constexpr size_t kMaxTokenBytes = 4096;
 
-/// Introspections allowed per caller per window, unless configured otherwise.
-inline constexpr int kDefaultIntrospectRateLimit = 20;
-
 /// How recently a caller must have authenticated to mint a grant, in seconds.
 inline constexpr double kDefaultMaxAuthAge = 900.0;
 
@@ -94,12 +100,14 @@ inline constexpr int kDefaultIdentityRetryAfter = 5;
 /// records without being the credential.
 VGI_RPC_EXPORT std::string token_digest(const std::string& token);
 
-/// The caller may not introspect.
+/// The caller may not introspect -- it is not on the allowlist.
 ///
 /// Definitive: a caller may cache this.  Authentication is not the same
 /// capability as introspection -- a deployment where any valid credential may
-/// introspect lets any user test guesses of any other user's credential at
-/// unlimited rate, and resolve a stolen one to its owner.
+/// introspect lets any user resolve a stolen credential to its owner.
+///
+/// Never a throttle.  Because a caller may cache it, a throttled answer
+/// reported as this kind negative-caches valid credentials.
 class VGI_RPC_EXPORT IntrospectionRefusedError : public KindedError {
 public:
     explicit IntrospectionRefusedError(const std::string& what)
@@ -166,44 +174,6 @@ public:
 private:
     std::string detail_;
     int retry_after_;
-};
-
-/// Fixed-window request limiter, keyed by caller.
-///
-/// Present because introspection is a credential-to-identity oracle even when
-/// correctly restricted: an allowlisted caller whose own credential leaks can
-/// still test guesses.  Rate limiting does not close that, it bounds it.
-///
-/// Fixed-window rather than a token bucket: a window admits at most twice the
-/// rate across a boundary, which is a rounding error here, and the state is two
-/// integers per caller rather than a float that has to be aged.
-///
-/// Thread-safe.  This port's HTTP and socket listeners dispatch unrelated calls
-/// concurrently, so an unsynchronized counter would both race and -- far worse
-/// for a limiter -- undercount, which is the direction that fails open.
-class VGI_RPC_EXPORT RateLimiter {
-public:
-    explicit RateLimiter(int per_window, double window_seconds = 1.0);
-
-    /// Whether `key` may make a request in the current window, using the
-    /// monotonic clock.
-    bool allow(const std::string& key);
-
-    /// Whether `key` may make a request in the window containing `now`.
-    /// Seconds on a monotonic scale; taken explicitly so tests can drive the
-    /// window without sleeping.
-    bool allow(const std::string& key, double now);
-
-    /// How many callers the map is currently holding.  Exposed so the
-    /// whole-map-reset property can be asserted rather than assumed.
-    size_t tracked_keys() const;
-
-private:
-    mutable std::mutex mutex_;
-    int per_window_;
-    double window_seconds_;
-    double window_start_ = 0.0;
-    std::unordered_map<std::string, int> counts_;
 };
 
 /// Validate the introspector allowlist.
@@ -326,14 +296,13 @@ struct VGI_RPC_EXPORT IdentityOptions {
     /// Who may call `introspect_token`.  Required whenever `resolve_token` is
     /// supplied; there is no permissive default.
     std::vector<std::string> introspect_principals;
-    int introspect_rate_limit = kDefaultIntrospectRateLimit;
     double max_auth_age = kDefaultMaxAuthAge;
 };
 
 /// Applies this file's guards, then delegates to worker-supplied hooks.
 ///
 /// The framework owns the guards and owns none of the policy.  It decides who
-/// may ask, how often, and what shape of credential is refused outright; the
+/// may ask and what shape of credential is refused outright; the
 /// worker decides what a credential resolves to and whether a grant is minted.
 /// That split is deliberate -- the guards are the part that is identical in
 /// every deployment and catastrophic to get wrong, and the policy is the part
@@ -374,7 +343,6 @@ private:
     MintGrantHook mint_grant_;
     std::set<std::string> principals_;
     double max_auth_age_;
-    RateLimiter limiter_;
 };
 
 /// The identity protocol's method table, narrowed to `offered`.

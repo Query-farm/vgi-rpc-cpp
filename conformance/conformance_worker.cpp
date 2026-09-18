@@ -1567,7 +1567,6 @@ static std::shared_ptr<arrow::Schema> params(std::vector<std::shared_ptr<arrow::
 namespace identity_fixture {
 
 constexpr const char* kIntrospectorPrincipal = "conformance-introspector";
-constexpr int kIntrospectRateLimit = 100000;
 constexpr double kMaxAuthAge = 900.0;
 
 constexpr const char* kSubjectPrincipal = "subject@conformance.example";
@@ -2239,11 +2238,8 @@ int main(int argc, char** argv) {
         // protocol_hash narrows with it.
         if (identity_mode == "both") identity_options.mint_grant = identity_fixture::mint_grant;
         identity_options.introspect_principals = {identity_fixture::kIntrospectorPrincipal};
-        // Far above the default 20, deliberately.  Nearly every case in the
-        // shared group is an introspection, so a production-tuned limiter would
-        // fire mid-group and every resulting failure would read as the wrong
-        // guard.  The limiter is asserted port-locally instead.
-        identity_options.introspect_rate_limit = identity_fixture::kIntrospectRateLimit;
+        // No rate limit to configure: introspection is not rate limited, and
+        // TestIntrospectionIsNotThrottled pins that against this worker.
         identity_options.max_auth_age = identity_fixture::kMaxAuthAge;
         builder.identity(std::make_shared<vgi_rpc::IdentityImpl>(std::move(identity_options)));
     }
