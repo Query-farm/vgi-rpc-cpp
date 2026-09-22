@@ -59,7 +59,14 @@ jobs:
           -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
 
       - name: Build
-        run: cmake --build --preset sanitizer --parallel
+        # Bounded for the same reason ci.yml bounds its Linux build: the hosted
+        # runner is terminated mid-build ("the runner has received a shutdown
+        # signal") when too many Arrow-linked executables reach the linker at
+        # once. Two, not ci.yml's four, because every binary here also carries
+        # ASan and UBSan instrumentation, so each link costs far more memory —
+        # this job died that way on every run from 2026-09-11 on, always with
+        # ~30 targets terminated together and never with a sanitizer finding.
+        run: cmake --build --preset sanitizer --parallel 2
 
       - name: Test
         run: ctest --test-dir build --output-on-failure --timeout 300 -E conformance
