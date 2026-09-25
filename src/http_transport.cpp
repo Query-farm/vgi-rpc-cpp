@@ -46,6 +46,7 @@
 #include <zlib.h>
 
 #include <algorithm>
+#include <sstream>
 #include <cctype>
 #include <array>
 #include <chrono>
@@ -2316,6 +2317,66 @@ void HttpServer::run() {
     for (const std::string& p : {std::string("/health"), cfg_.prefix + "/health"}) {
         svr.Get(p, health);
         svr.Options(p, health);
+    }
+
+    for (const auto& [path, asset] : cfg_.static_assets) {
+        if (path.empty() || path.front() != '/' || path.find_first_of("?#") != std::string::npos)
+            throw std::invalid_argument(
+                "static asset paths must start with / and contain no query or fragment");
+        const auto digest =
+            crypto::sha256(reinterpret_cast<const uint8_t*>(asset.body.data()), asset.body.size());
+        const std::string etag = "\"" + crypto::hex_encode(digest.data(), digest.size()) + "\"";
+        auto serve = [this, path, etag](const httplib::Request& req, httplib::Response& res) {
+            stamp_common(req, res, random_hex(16));
+            if (refuse_if_unauthorized(req, res, random_hex(16))) return;
+            try {
+                (void)resolve_http_identity(req);
+            } catch (const PeerIdentityUnavailable&) {
+                res.status = 503;
+                res.set_header("Retry-After", "5");
+                return;
+            } catch (const std::exception&) {
+                write_unauthorized(req, res, AuthReason::INVALID_CREDENTIAL);
+                return;
+            }
+            const auto& content = cfg_.static_assets.at(path);
+            const auto accept = req.get_header_value("Accept");
+            const bool json =
+                content.json_body && (req.get_param_value("format") == "json" ||
+                                      (accept.find("application/json") != std::string::npos &&
+                                       accept.find("text/html") == std::string::npos));
+            res.set_header("Cache-Control", json ? "no-store" : "private, no-cache");
+            if (!json) {
+                res.set_header("ETag", etag);
+                std::istringstream validators(req.get_header_value("If-None-Match"));
+                std::string value;
+                while (std::getline(validators, value, ',')) {
+                    const auto start = value.find_first_not_of(" \t");
+                    const auto end = value.find_last_not_of(" \t");
+                    if (start == std::string::npos) continue;
+                    value = value.substr(start, end - start + 1);
+                    if (value.rfind("W/", 0) == 0) value.erase(0, 2);
+                    if (value == etag || value == "*") {
+                        res.status = 304;
+                        return;
+                    }
+                }
+            }
+            res.set_content(json ? *content.json_body : content.body,
+                            json ? "application/json" : content.content_type);
+        };
+        // cpp-httplib patterns are regular expressions; escape literal paths.
+        auto literal = [](const std::string& value) {
+            std::string out;
+            for (const char c : value) {
+                if (std::string(".^$|()[]{}*+?\\").find(c) != std::string::npos) out += '\\';
+                out += c;
+            }
+            return out;
+        };
+        svr.Get(literal(cfg_.prefix + path), serve);
+        if (!cfg_.prefix.empty()) svr.Get(literal(path), serve);
+        if (path == "/" && !cfg_.prefix.empty()) svr.Get(literal(cfg_.prefix), serve);
     }
 
     // `POST {prefix}/__introspect_token__` is deliberately not routed.  It was

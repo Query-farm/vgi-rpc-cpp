@@ -178,3 +178,12 @@ Client  ──      [close]                 ──▸  Server
 <p style="text-align: center; opacity: 0.7;">
   <a href="https://vgi-rpc.query.farm">vgi-rpc</a> &middot; <a href="https://query.farm">Query.Farm</a>
 </p>
+
+## Embedded browser assets
+
+`HttpConfig::static_assets` maps exact URL paths to `HttpStaticAsset` values
+containing a body and content type. Assets are mounted both at the HTTP prefix
+and at the root, use the same authentication and proxy-proof checks as RPC,
+and support HEAD and ETag revalidation. An optional `json_body` supplies the
+representation selected by `?format=json` or an `Accept: application/json`
+request. Paths are literal and never read files from disk.

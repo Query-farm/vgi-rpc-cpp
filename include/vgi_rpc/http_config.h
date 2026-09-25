@@ -53,6 +53,14 @@ struct AuthIdentity {
     nlohmann::json claims = nlohmann::json::object();
 };
 
+/// An application-owned browser asset, mounted relative to the HTTP prefix.
+/// The optional JSON representation is selected by ?format=json or Accept.
+struct HttpStaticAsset {
+    std::string body;
+    std::string content_type;
+    std::optional<std::string> json_body;
+};
+
 struct HttpConfig {
     std::string host = "127.0.0.1";
     int port = 0;
@@ -176,6 +184,10 @@ struct HttpConfig {
     // port it got.  Runs on the serving thread; keep it short.  Stays at the
     // end for positional aggregate source compatibility.
     std::function<void(int)> on_listen;
+
+    // Exact paths ("/", "/client.js", ...); no filesystem access. Served under
+    // the same authentication and proxy-proof policy as RPC requests.
+    std::map<std::string, HttpStaticAsset> static_assets;
 };
 
 }  // namespace vgi_rpc

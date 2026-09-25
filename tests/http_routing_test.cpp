@@ -58,7 +58,7 @@ Result echo_handler(const Request& req, CallContext&) {
 /// One `Server::serve_http` on a background thread, with its bound port.
 class RoutingServer {
 public:
-    RoutingServer() {
+    RoutingServer(HttpConfig cfg = {}) {
         ServerBuilder builder;
         builder.add_unary("echo", value_schema(), value_schema(), echo_handler);
         // Declares the routing key *and* registers a reserved
@@ -69,7 +69,6 @@ public:
         builder.enable_transport_options();
         server_ = builder.build();
 
-        HttpConfig cfg;
         cfg.host = "127.0.0.1";
         cfg.port = 0;
         cfg.prefix = "/vgi";
@@ -148,6 +147,42 @@ bool has_error_kind(const std::string& body, const std::string& kind) {
 }
 
 }  // namespace
+
+TEST_CASE("application browser assets preserve routing, validators and authentication",
+          "[http-routing]") {
+    HttpConfig cfg;
+    cfg.static_assets["/"] = {"<html>catalog</html>", "text/html", "{\"status\":\"ok\"}"};
+    cfg.static_assets["/client.js"] = {"export const value = 1;", "text/javascript", std::nullopt};
+    // RoutingServer, like the other tests in this file, lives until process exit.
+    auto* server = new RoutingServer(cfg);
+    httplib::Client client("127.0.0.1", server->port());
+    for (const std::string path : {"/", "/vgi/", "/vgi/client.js"}) {
+        const auto asset = client.Get(path);
+        REQUIRE(asset);
+        REQUIRE(asset->status == 200);
+        REQUIRE(asset->get_header_value("Cache-Control") == "private, no-cache");
+        const auto etag = asset->get_header_value("ETag");
+        REQUIRE_FALSE(etag.empty());
+        const auto cached = client.Get(path, {{"If-None-Match", "W/" + etag}});
+        REQUIRE(cached);
+        REQUIRE(cached->status == 304);
+        REQUIRE(cached->body.empty());
+        const auto head = client.Head(path);
+        REQUIRE(head);
+        REQUIRE(head->status == 200);
+        REQUIRE(head->body.empty());
+    }
+    const auto json = client.Get("/vgi/?format=json");
+    REQUIRE(json);
+    REQUIRE(json->body == "{\"status\":\"ok\"}");
+    REQUIRE(client.Get("/vgi/clientsjs")->status == 404);
+    cfg.reject_all = AuthReason::MISSING_CREDENTIAL;
+    auto* protected_server = new RoutingServer(cfg);
+    httplib::Client protected_client("127.0.0.1", protected_server->port());
+    REQUIRE(protected_client.Get("/vgi/")->status == 401);
+    REQUIRE(protected_client.Get("/vgi/client.js")->status == 401);
+    REQUIRE(protected_client.Get("/health")->status == 200);
+}
 
 TEST_CASE("an application method is addressed under its protocol", "[http-routing]") {
     RoutingServer server;
