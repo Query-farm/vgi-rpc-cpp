@@ -298,6 +298,15 @@ public:
                           const std::string& request_id,
                           const std::shared_ptr<arrow::io::OutputStream>& output, CallContext& ctx);
 
+    // As above; `external_ref`, when supplied, reports whether the handler
+    // answered with a pre-published ExternalRef.  The transport must then send
+    // the pointer as written: it is never externalized again, and it uploaded
+    // nothing to charge against the externalized-response cap.
+    bool serve_unary_http(const MethodInfo& method_info, const Request& request,
+                          const std::string& request_id,
+                          const std::shared_ptr<arrow::io::OutputStream>& output, CallContext& ctx,
+                          bool* external_ref);
+
 private:
     struct ConnectionState {
         std::shared_ptr<ShmSegment> shm;
@@ -335,7 +344,8 @@ private:
     bool serve_unary_impl(const MethodInfo& method_info, const Request& request,
                           const std::string& request_id,
                           const std::shared_ptr<arrow::io::OutputStream>& output, CallContext& ctx,
-                          const std::shared_ptr<ShmSegment>& call_shm);
+                          const std::shared_ptr<ShmSegment>& call_shm,
+                          bool* external_ref = nullptr);
 
     void serve_stream(const MethodInfo& method_info, const Request& request,
                       const std::string& request_id,

@@ -3,7 +3,14 @@
 
 #include "vgi_rpc/external.h"
 
+#include "vgi_rpc/arrow_utils.h"
 #include "vgi_rpc/crypto.h"
+#include "vgi_rpc/metadata.h"
+#include "vgi_rpc/wire.h"
+
+#include <arrow/buffer.h>
+#include <arrow/io/memory.h>
+#include <arrow/record_batch.h>
 
 #include <httplib.h>
 #include <nlohmann/json.hpp>
@@ -507,6 +514,87 @@ bool gcs_storage_available() {
 #else
     return false;
 #endif
+}
+
+ExternalUpload upload_ipc_stream(const std::string& ipc_bytes, ExternalStorage& storage,
+                                 const std::string& compression) {
+    ExternalUpload out;
+    // The digest covers the payload *before* compression, so a reader that
+    // decompresses and then verifies is checking the same bytes the writer
+    // hashed.
+    const auto digest =
+        crypto::sha256(reinterpret_cast<const uint8_t*>(ipc_bytes.data()), ipc_bytes.size());
+    out.sha256 = crypto::hex_encode(digest.data(), digest.size());
+    out.raw_bytes = static_cast<int64_t>(ipc_bytes.size());
+
+    std::string encoding;
+    if (compression == "zstd") {
+        const size_t bound = ZSTD_compressBound(ipc_bytes.size());
+        std::string compressed(bound, '\0');
+        const size_t written =
+            ZSTD_compress(compressed.data(), bound, ipc_bytes.data(), ipc_bytes.size(), 3);
+        if (!ZSTD_isError(written)) {
+            compressed.resize(written);
+            encoding = "zstd";
+            out.uploaded_bytes = static_cast<int64_t>(compressed.size());
+            out.url = storage.upload(compressed, encoding);
+            return out;
+        }
+    }
+    out.uploaded_bytes = out.raw_bytes;
+    out.url = storage.upload(ipc_bytes, encoding);
+    return out;
+}
+
+namespace {
+
+bool is_lower_hex_sha256(const std::string& value) {
+    return value.size() == 64 && std::all_of(value.begin(), value.end(), [](char c) {
+               return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+           });
+}
+
+}  // namespace
+
+ExternalRef::ExternalRef(std::string url, std::optional<std::string> sha256)
+    : url_(std::move(url)), sha256_(std::move(sha256)) {
+    if (url_.empty()) throw std::invalid_argument("ExternalRef url must be non-empty");
+    if (sha256_ && !is_lower_hex_sha256(*sha256_)) {
+        throw std::invalid_argument(
+            "ExternalRef sha256 must be 64 lowercase hex characters (or absent)");
+    }
+}
+
+AnnotatedBatch ExternalRef::pointer_batch(
+    const std::shared_ptr<arrow::Schema>& result_schema) const {
+    auto md = std::make_shared<arrow::KeyValueMetadata>();
+    md->Append(keys::LOCATION, url_);
+    if (sha256_) md->Append(keys::LOCATION_SHA256, *sha256_);
+    return AnnotatedBatch::with_metadata(make_empty_batch(result_schema), std::move(md));
+}
+
+ExternalRef publish_external(const std::shared_ptr<arrow::RecordBatch>& batch,
+                             ExternalStorage& storage, const std::string& compression,
+                             bool include_sha256) {
+    if (!batch) throw std::invalid_argument("publish_external requires a result batch");
+    if (batch->num_rows() != 1) {
+        throw std::invalid_argument("publish_external expects a 1-row result batch, got " +
+                                    std::to_string(batch->num_rows()) + " rows");
+    }
+    if (!compression.empty() && compression != "zstd") {
+        throw std::invalid_argument("publish_external: unsupported compression '" + compression +
+                                    "' (expected \"zstd\" or empty)");
+    }
+    // Exactly what the per-call externalizer uploads for a result: one IPC
+    // stream holding the schema and this one batch.
+    auto sink = unwrap(arrow::io::BufferOutputStream::Create());
+    write_ipc_stream(sink, batch->schema(), {AnnotatedBatch::data(batch)});
+    const auto buffer = unwrap(sink->Finish());
+    const std::string ipc_bytes(reinterpret_cast<const char*>(buffer->data()),
+                                static_cast<size_t>(buffer->size()));
+    const ExternalUpload uploaded = upload_ipc_stream(ipc_bytes, storage, compression);
+    return ExternalRef(uploaded.url,
+                       include_sha256 ? std::optional<std::string>(uploaded.sha256) : std::nullopt);
 }
 
 std::unique_ptr<ExternalStorage> make_external_storage(const ExternalStorageConfig& config) {

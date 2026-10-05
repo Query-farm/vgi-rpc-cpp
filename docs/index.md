@@ -123,6 +123,45 @@ bucket path, so the client fetches it holding no cloud credentials and linking
 no SDK. `signed_url_ttl_seconds` bounds how long a leaked pointer stays usable.
 Uploaded objects are never deleted — set a lifecycle rule on the bucket.
 
+#### Pre-published references
+
+A result that is large and rarely changes — a whole catalog, say — need not be
+serialized and uploaded on every call. Publish it once with `publish_external`,
+cache the `ExternalRef` it returns, and answer later calls with
+`Result::from_external_ref`:
+
+```cpp
+#include <vgi_rpc/external.h>
+
+auto storage = vgi_rpc::make_external_storage({.uri = "https://objects.example/vgi"});
+std::optional<vgi_rpc::ExternalRef> catalog_ref;  // guard with a mutex under HTTP
+
+builder.add_unary("catalog", vgi_rpc::empty_schema(), catalog_schema,
+    [&](const vgi_rpc::Request&, vgi_rpc::CallContext&) {
+        if (!catalog_ref) {
+            // A 1-row batch on the method's result schema.
+            catalog_ref = vgi_rpc::publish_external(build_catalog_batch(), *storage, "zstd");
+        }
+        return vgi_rpc::Result::from_external_ref(*catalog_ref);
+    });
+```
+
+The server writes the pointer batch (`vgi_rpc.location`, plus
+`vgi_rpc.location.sha256` only when the ref has a digest) directly on every
+transport — pipe, Unix, TCP and HTTP — whether or not the server has storage
+configured and regardless of `externalize_threshold`. Nothing is serialized or
+uploaded during the call, the pointer never takes the shared-memory route, and it
+is not charged against `max_externalized_response_bytes`. Clients resolve it like
+any other pointer. `publish_external` serializes, hashes, compresses and uploads
+exactly as the per-call externalizer does; pass `include_sha256 = false` (or
+build `ExternalRef(url)` by hand) to omit the digest so clients skip the content
+check. Unary methods only.
+
+You own the ref's cache and the object's lifecycle: a long-lived ref must not
+point at an object under the short-TTL lifecycle rule used for per-call uploads,
+and a pre-signed URL expires — re-sign or rebuild the ref before then. Only hand
+a ref to callers who are all entitled to the same content.
+
 ## Three Method Types
 
 ### Unary

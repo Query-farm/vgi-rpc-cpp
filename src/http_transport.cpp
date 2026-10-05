@@ -1002,32 +1002,16 @@ std::string HttpServer::maybe_externalize(const std::string& body,
     if (!storage_ || cfg_.externalize_threshold < 0) return body;
     if (static_cast<int64_t>(body.size()) < cfg_.externalize_threshold) return body;
 
-    // The digest covers the payload *before* compression, so a reader that
-    // decompresses and then verifies is checking the same bytes the writer
-    // hashed.  Sent optionally, but a reader that sees it must verify.
-    auto digest = crypto::sha256(reinterpret_cast<const uint8_t*>(body.data()), body.size());
-
-    std::string payload = body;
-    std::string encoding;
-    if (cfg_.externalize_compression == "zstd") {
-        const size_t bound = ZSTD_compressBound(payload.size());
-        std::string compressed(bound, '\0');
-        const size_t written =
-            ZSTD_compress(compressed.data(), bound, payload.data(), payload.size(), 3);
-        if (!ZSTD_isError(written)) {
-            compressed.resize(written);
-            payload.swap(compressed);
-            encoding = "zstd";
-        }
-    }
-
-    const std::string url = storage_->upload(payload, encoding);
+    // Hashed before compression (see upload_ipc_stream).  Sent optionally, but
+    // a reader that sees the digest must verify it.
+    const ExternalUpload uploaded =
+        upload_ipc_stream(body, *storage_, cfg_.externalize_compression);
     // Charged against the external cap as the bytes the client will fetch.
-    if (externalized_bytes) *externalized_bytes += static_cast<int64_t>(payload.size());
+    if (externalized_bytes) *externalized_bytes += uploaded.uploaded_bytes;
 
     auto md = std::make_shared<arrow::KeyValueMetadata>();
-    md->Append(keys::LOCATION, url);
-    md->Append("vgi_rpc.location.sha256", crypto::hex_encode(digest.data(), digest.size()));
+    md->Append(keys::LOCATION, uploaded.url);
+    md->Append(keys::LOCATION_SHA256, uploaded.sha256);
 
     // One zero-row pointer batch on the original schema replaces the whole
     // cycle; the client fetches the URL and reads the batches back out of it.
@@ -1047,27 +1031,13 @@ std::shared_ptr<arrow::KeyValueMetadata> HttpServer::externalize_cycle(
     });
     if (static_cast<int64_t>(cycle.size()) < cfg_.externalize_threshold) return nullptr;
 
-    auto digest = crypto::sha256(reinterpret_cast<const uint8_t*>(cycle.data()), cycle.size());
-    std::string payload = cycle;
-    std::string encoding;
-    if (cfg_.externalize_compression == "zstd") {
-        const size_t bound = ZSTD_compressBound(payload.size());
-        std::string compressed(bound, '\0');
-        const size_t written =
-            ZSTD_compress(compressed.data(), bound, payload.data(), payload.size(), 3);
-        if (!ZSTD_isError(written)) {
-            compressed.resize(written);
-            payload.swap(compressed);
-            encoding = "zstd";
-        }
-    }
-
-    const std::string url = storage_->upload(payload, encoding);
-    if (externalized_bytes) *externalized_bytes += static_cast<int64_t>(payload.size());
+    const ExternalUpload uploaded =
+        upload_ipc_stream(cycle, *storage_, cfg_.externalize_compression);
+    if (externalized_bytes) *externalized_bytes += uploaded.uploaded_bytes;
 
     auto md = std::make_shared<arrow::KeyValueMetadata>();
-    md->Append(keys::LOCATION, url);
-    md->Append("vgi_rpc.location.sha256", crypto::hex_encode(digest.data(), digest.size()));
+    md->Append(keys::LOCATION, uploaded.url);
+    md->Append(keys::LOCATION_SHA256, uploaded.sha256);
     return md;
 }
 
@@ -1724,13 +1694,19 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
     // ---- Unary ----
     if (!is_init && !is_exchange_ep) {
         auto buf_out = unwrap(arrow::io::BufferOutputStream::Create());
-        const bool errored = rpc_.serve_unary_http(method_info, request, request_id, buf_out, ctx);
+        bool external_ref = false;
+        const bool errored =
+            rpc_.serve_unary_http(method_info, request, request_id, buf_out, ctx, &external_ref);
         auto rbuf = unwrap(buf_out->Finish());
         apply_sticky();
 
         std::string body = buffer_to_string(rbuf);
         int64_t externalized = 0;
-        if (!errored) {
+        // A pre-published ExternalRef is already a pointer: externalizing it
+        // again would upload a pointer to a pointer, and it uploaded nothing
+        // this call, so it is not charged against the external cap.  The wire
+        // cap below still sees the (tiny) body like any other.
+        if (!errored && !external_ref) {
             try {
                 body = maybe_externalize(body, method_info.result_schema, &externalized);
             } catch (const std::exception& e) {

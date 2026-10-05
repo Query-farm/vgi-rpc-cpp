@@ -42,6 +42,8 @@ target_compile_definitions(access_log_test PRIVATE
 )
 vgi_rpc_add_test(token_identity_test)
 vgi_rpc_add_test(client_external_test)
+vgi_rpc_add_test(external_ref_test)
+target_link_libraries(external_ref_test PRIVATE zstd::libzstd)
 vgi_rpc_add_test(client_test)
 vgi_rpc_add_test(http_routing_test)
 vgi_rpc_add_test(http_stream_metadata_test)

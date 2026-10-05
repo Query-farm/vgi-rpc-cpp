@@ -15,9 +15,11 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
+#include "vgi_rpc/annotated_batch.h"
 #include "vgi_rpc/export.h"
 
 namespace vgi_rpc {
@@ -79,5 +81,103 @@ VGI_RPC_EXPORT std::unique_ptr<ExternalStorage> make_external_storage(
 // startup error above.
 VGI_RPC_EXPORT bool s3_storage_available();
 VGI_RPC_EXPORT bool gcs_storage_available();
+
+// ---------------------------------------------------------------------------
+// Uploading a serialized payload
+// ---------------------------------------------------------------------------
+
+// What one upload of a serialized IPC stream produced.
+struct ExternalUpload {
+    // Where a client fetches the object from.
+    std::string url;
+    // Lowercase hex SHA-256 of the raw IPC bytes, *before* compression -- so a
+    // reader that decompresses and then verifies checks the bytes the writer
+    // hashed.
+    std::string sha256;
+    // Byte count before compression.
+    int64_t raw_bytes = 0;
+    // Byte count actually uploaded: what a client will fetch, and what the
+    // externalized-response cap is charged.
+    int64_t uploaded_bytes = 0;
+};
+
+// Hash, optionally compress, and upload one complete Arrow IPC stream.
+//
+// The single choke point every server-side externalization path shares -- the
+// HTTP transport's per-response and per-cycle externalizers, and
+// `publish_external` -- so the bytes a pointer names are always produced the
+// same way.  `compression` is "zstd" or empty (none); a zstd failure falls back
+// to uploading the raw bytes, uncoded.
+VGI_RPC_EXPORT ExternalUpload upload_ipc_stream(const std::string& ipc_bytes,
+                                                ExternalStorage& storage,
+                                                const std::string& compression);
+
+// ---------------------------------------------------------------------------
+// Pre-published references
+// ---------------------------------------------------------------------------
+
+/// A reference to an already-published unary result.
+///
+/// A unary handler may return `Result::from_external_ref(ref)` in place of its
+/// value.  The server then answers with the external-location pointer batch for
+/// `url()` directly -- a zero-row batch on the method's result schema carrying
+/// `vgi_rpc.location`, plus `vgi_rpc.location.sha256` only when the ref has a
+/// digest.  Nothing is serialized, compressed or uploaded during the call; the
+/// pointer is written on every transport, whether or not the server has
+/// external storage configured, regardless of `externalize_threshold`, never
+/// through shared memory, and it is not charged against
+/// `max_externalized_response_bytes`.  Clients resolve it like any other
+/// pointer, so they need no change.
+///
+/// Build one with `publish_external`, or by hand for an object published out of
+/// band.  The object at the URL must be an Arrow IPC stream (optionally
+/// `Content-Encoding`-compressed) whose schema is the method's result schema and
+/// which holds exactly one 1-row data batch.
+///
+/// The caller owns caching the ref and the object's lifecycle: a long-lived ref
+/// must not point at an object under the short-TTL lifecycle rule used for
+/// per-call uploads, and a pre-signed URL expires -- re-sign or rebuild the ref
+/// before then.  Only return a ref to callers who are all entitled to the same
+/// content.
+class VGI_RPC_EXPORT ExternalRef {
+public:
+    /// Throws std::invalid_argument when `url` is empty or `sha256` is present
+    /// but not 64 lowercase hex characters.  A ref without a digest omits
+    /// `vgi_rpc.location.sha256`, so clients skip the content check -- the way
+    /// to opt out for an object rewritten in place or too large to hash.
+    explicit ExternalRef(std::string url, std::optional<std::string> sha256 = std::nullopt);
+
+    const std::string& url() const noexcept { return url_; }
+    const std::optional<std::string>& sha256() const noexcept { return sha256_; }
+
+    /// The zero-row pointer batch announcing this ref on `result_schema`.
+    AnnotatedBatch pointer_batch(const std::shared_ptr<arrow::Schema>& result_schema) const;
+
+    bool operator==(const ExternalRef&) const = default;
+
+private:
+    std::string url_;
+    std::optional<std::string> sha256_;
+};
+
+/// Publish a unary result batch once and return a reusable reference.
+///
+/// Serializes `batch` exactly as the per-call externalizer does (an IPC stream
+/// of its schema plus this one batch), hashes the raw bytes, compresses when
+/// `compression` is "zstd" (pass the server's
+/// `HttpConfig::externalize_compression` to match it), and calls
+/// `storage.upload` once.  Cache the returned ref and return it from the
+/// handler with `Result::from_external_ref`.
+///
+/// Build `batch` against the method's result schema -- a single `result`
+/// column holding the one value.  `include_sha256 = false` leaves the digest
+/// off the ref, so clients skip the content check.
+///
+/// Throws std::invalid_argument when `batch` is null or does not have exactly
+/// one row, or when `compression` is neither empty nor "zstd".
+VGI_RPC_EXPORT ExternalRef publish_external(const std::shared_ptr<arrow::RecordBatch>& batch,
+                                            ExternalStorage& storage,
+                                            const std::string& compression = "",
+                                            bool include_sha256 = true);
 
 }  // namespace vgi_rpc

@@ -558,10 +558,18 @@ bool Server::serve_unary_http(const MethodInfo& method_info, const Request& requ
     return serve_unary_impl(method_info, request, request_id, output, ctx, nullptr);
 }
 
+bool Server::serve_unary_http(const MethodInfo& method_info, const Request& request,
+                              const std::string& request_id,
+                              const std::shared_ptr<arrow::io::OutputStream>& output,
+                              CallContext& ctx, bool* external_ref) {
+    return serve_unary_impl(method_info, request, request_id, output, ctx, nullptr, external_ref);
+}
+
 bool Server::serve_unary_impl(const MethodInfo& method_info, const Request& request,
                               const std::string& request_id,
                               const std::shared_ptr<arrow::io::OutputStream>& output,
-                              CallContext& ctx, const std::shared_ptr<ShmSegment>& call_shm) {
+                              CallContext& ctx, const std::shared_ptr<ShmSegment>& call_shm,
+                              bool* external_ref) {
     auto t0 = std::chrono::steady_clock::now();
     auto log_sink = ctx.log_sink();
 
@@ -587,10 +595,20 @@ bool Server::serve_unary_impl(const MethodInfo& method_info, const Request& requ
     for (auto& log_ab : log_batches) {
         response_batches.push_back(std::move(log_ab));
     }
-    // Log batches are zero-row and pass through untouched; only a data batch
-    // large enough to be worth it becomes a pointer.
-    AnnotatedBatch result_ab = result.annotated_batch();
-    result_ab.batch = maybe_write_to_shm(result_ab.batch, &result_ab.custom_metadata, call_shm);
+    // A pre-published reference goes out as its pointer, as-is: there is no
+    // value to build or validate, nothing to upload, and it never takes the
+    // shared-memory route -- a ref is always a pointer.
+    const bool is_ref = status != "error" && result.external_ref().has_value();
+    if (external_ref) *external_ref = is_ref;
+    AnnotatedBatch result_ab;
+    if (is_ref) {
+        result_ab = result.external_ref()->pointer_batch(method_info.result_schema);
+    } else {
+        // Log batches are zero-row and pass through untouched; only a data
+        // batch large enough to be worth it becomes a pointer.
+        result_ab = result.annotated_batch();
+        result_ab.batch = maybe_write_to_shm(result_ab.batch, &result_ab.custom_metadata, call_shm);
+    }
     response_batches.push_back(std::move(result_ab));
     write_ipc_stream(output, method_info.result_schema, response_batches);
     VGI_RPC_THROW_NOT_OK(output->Flush());

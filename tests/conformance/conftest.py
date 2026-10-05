@@ -654,6 +654,7 @@ _CLIENT_ROLE_BODY_CLASSES = frozenset(
     {
         "TestExternalByteStream",
         "TestExternalLocation",
+        "TestExternalRef",
         "TestHttpResponseCap",
         "TestHttpResponseCapProducer",
         "TestExternalizedResponseCap",

@@ -55,6 +55,12 @@ Result Result::void_result() {
     return Result(std::move(ab));
 }
 
+Result Result::from_external_ref(ExternalRef ref) {
+    Result result = Result::void_result();
+    result.external_ref_ = std::move(ref);
+    return result;
+}
+
 std::shared_ptr<arrow::KeyValueMetadata> make_error_metadata(const std::string& exception_type,
                                                              const std::string& message,
                                                              const std::string& server_id,

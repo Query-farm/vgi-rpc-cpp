@@ -3,10 +3,12 @@
 
 /// Constructs RPC response batches returned from unary method handlers.
 /// Use Result::value() to return data, Result::void_result() for void methods,
-/// and Result::error() to signal an exception to the client.
+/// Result::from_external_ref() to answer with a pre-published object, and
+/// Result::error() to signal an exception to the client.
 #pragma once
 
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -17,6 +19,7 @@
 
 #include "vgi_rpc/annotated_batch.h"
 #include "vgi_rpc/export.h"
+#include "vgi_rpc/external.h"
 
 namespace vgi_rpc {
 
@@ -45,6 +48,12 @@ public:
     // Void result (0-row batch on empty schema)
     static Result void_result();
 
+    // Answer with a pre-published object (see ExternalRef / publish_external).
+    // The server writes the external-location pointer batch for `ref` on the
+    // method's result schema instead of building a value: no serialization,
+    // no upload, never inline or through shared memory, on every transport.
+    static Result from_external_ref(ExternalRef ref);
+
     // Error result (0-row batch with EXCEPTION metadata)
     static Result error(std::shared_ptr<arrow::Schema> schema, const std::string& exception_type,
                         const std::string& message, const std::string& server_id = "",
@@ -53,9 +62,14 @@ public:
     const AnnotatedBatch& annotated_batch() const noexcept { return batch_; }
     const std::shared_ptr<arrow::Schema>& schema() const;
 
+    // The pre-published reference this result answers with, if any.  When
+    // set, annotated_batch() is a placeholder the dispatcher does not send.
+    const std::optional<ExternalRef>& external_ref() const noexcept { return external_ref_; }
+
 private:
     explicit Result(AnnotatedBatch batch) : batch_(std::move(batch)) {}
     AnnotatedBatch batch_;
+    std::optional<ExternalRef> external_ref_;
 };
 
 }  // namespace vgi_rpc

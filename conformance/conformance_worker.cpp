@@ -1,9 +1,10 @@
 // © Copyright 2025-2026, Query.Farm LLC - https://query.farm
 // SPDX-License-Identifier: Apache-2.0
 
-// Conformance worker implementing all 88 methods from ConformanceService.
+// Conformance worker implementing all 90 methods from ConformanceService.
 // Wire-compatible with the Python vgi_rpc conformance test suite.
 
+#include "vgi_rpc/external.h"
 #include "vgi_rpc/server.h"
 #include "vgi_rpc/stream.h"
 #include "vgi_rpc/token_identity.h"
@@ -26,6 +27,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <sstream>
@@ -1685,6 +1687,46 @@ IssuedGrant mint_grant(const std::string& principal, const std::string& purpose,
 
 }  // namespace identity_fixture
 
+// =========================================================================
+// Pre-published external reference (published_string)
+// =========================================================================
+
+// The worker's own external storage and compression, handed to
+// `published_string`, plus its publish-once cache.  The backend is built on
+// first use rather than at startup, so a worker launched with --fake-storage
+// on a transport that never calls the method starts exactly as it did before.
+struct PublishedStrings {
+    ExternalStorageConfig storage_config;
+    std::string compression;
+    std::mutex mutex;
+    std::unique_ptr<ExternalStorage> storage;
+    std::map<std::pair<std::string, bool>, ExternalRef> cache;
+};
+
+static Result published_string_handler(PublishedStrings& published, const Request& req) {
+    const auto value = req.get<std::string>("value");
+    const bool include_sha256 = req.get<bool>("include_sha256");
+    std::lock_guard<std::mutex> lock(published.mutex);
+    if (published.storage_config.uri.empty()) {
+        throw std::runtime_error("published_string requires external storage");
+    }
+    const auto key = std::make_pair(value, include_sha256);
+    auto it = published.cache.find(key);
+    if (it == published.cache.end()) {
+        if (!published.storage) {
+            published.storage = make_external_storage(published.storage_config);
+        }
+        arrow::StringBuilder builder;
+        VGI_RPC_THROW_NOT_OK(builder.Append(value));
+        auto batch = arrow::RecordBatch::Make(str_result_schema(), 1, {unwrap(builder.Finish())});
+        it = published.cache
+                 .emplace(key, publish_external(batch, *published.storage, published.compression,
+                                                include_sha256))
+                 .first;
+    }
+    return Result::from_external_ref(it->second);
+}
+
 int main(int argc, char** argv) {
     // Parse the conformance CLI surface.  --access-log and the HTTP flags are
     // acted on; other access-log tuning flags are accepted (and ignored) so the
@@ -1880,6 +1922,18 @@ int main(int argc, char** argv) {
 
     auto builder = ServerBuilder();
 
+    // published_string publishes through the worker's own storage and
+    // compression -- the same backend and coding the HTTP externalizer uses.
+    auto published = std::make_shared<PublishedStrings>();
+    if (!http_cfg.external_storage_url.empty()) {
+        published->storage_config.uri = http_cfg.external_storage_url;
+        published->storage_config.signed_url_ttl_seconds = http_cfg.signed_url_ttl_seconds;
+        published->storage_config.region = http_cfg.external_storage_region;
+        published->storage_config.endpoint_url = http_cfg.external_storage_endpoint;
+        published->storage_config.signing_account = http_cfg.external_storage_signing_account;
+        published->compression = http_cfg.externalize_compression;
+    }
+
     int serve_start_attempts = 0;
     if (fail_serve_start_once) {
         builder.on_serve_start([&](TransportKind) {
@@ -1922,6 +1976,17 @@ int main(int argc, char** argv) {
                    float_result_schema(), echo_float_handler, "Echo a float value.")
         .add_unary("echo_bool", params({arrow::field("value", arrow::boolean())}),
                    bool_result_schema(), echo_bool_handler, "Echo a boolean value.");
+
+    // --- Pre-published external reference ---
+    builder.add_unary(
+        "published_string",
+        params({arrow::field("value", arrow::utf8()),
+                arrow::field("include_sha256", arrow::boolean())}),
+        str_result_schema(),
+        [published](const Request& req, CallContext&) {
+            return published_string_handler(*published, req);
+        },
+        "Return value through a pre-published ExternalRef (publish once, reuse).");
 
     // --- Void ---
     builder.add_void("void_noop", empty_schema(), void_noop_handler, "No-op returning void.")

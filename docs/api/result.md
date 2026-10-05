@@ -40,6 +40,35 @@ static Result void_result();
 
 Create a void result (zero-row batch on an empty schema). Use for `add_void()` handlers that need to return explicitly.
 
+### `from_external_ref`
+
+```cpp
+static Result from_external_ref(ExternalRef ref);
+```
+
+Answer a unary call with a pre-published object (`#include <vgi_rpc/external.h>`;
+build the ref with `publish_external`). The server writes the external-location
+pointer batch for `ref` on the method's result schema — `vgi_rpc.location`, plus
+`vgi_rpc.location.sha256` only when `ref.sha256()` is set — on every transport,
+with no serialization or upload during the call, regardless of
+`externalize_threshold` or whether storage is configured, never through shared
+memory, and without charging `max_externalized_response_bytes`. Unary methods
+only.
+
+```cpp
+ExternalRef(std::string url, std::optional<std::string> sha256 = std::nullopt);
+
+ExternalRef publish_external(const std::shared_ptr<arrow::RecordBatch>& batch,  // 1 row
+                             ExternalStorage& storage,
+                             const std::string& compression = "",  // "" or "zstd"
+                             bool include_sha256 = true);
+```
+
+`ExternalRef` throws `std::invalid_argument` for an empty URL or a digest that
+is not 64 lowercase hex characters. `publish_external` serializes the batch as
+the per-call externalizer would, hashes the raw bytes, compresses when asked,
+uploads once and returns the ref; cache it and own the object's lifecycle.
+
 ### `error`
 
 ```cpp
@@ -66,6 +95,15 @@ const AnnotatedBatch& annotated_batch() const noexcept;
 ```cpp
 const std::shared_ptr<arrow::Schema>& schema() const;
 ```
+
+### `external_ref`
+
+```cpp
+const std::optional<ExternalRef>& external_ref() const noexcept;
+```
+
+The pre-published reference this result answers with, if any. When set,
+`annotated_batch()` is a placeholder the dispatcher does not send.
 
 ## `make_error_metadata`
 
