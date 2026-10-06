@@ -23,6 +23,7 @@
 #include "vgi_rpc/crypto.h"
 #include "vgi_rpc/errors.h"
 #include "vgi_rpc/external.h"
+#include "vgi_rpc/grants.h"
 #include "vgi_rpc/log_sink.h"
 #include "vgi_rpc/metadata.h"
 #include "vgi_rpc/output_collector.h"
@@ -63,6 +64,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -79,6 +81,18 @@ constexpr const char* ACCEPT_MAX_RESPONSE_BYTES_SUPPORT_HEADER =
 constexpr int64_t MAX_SAFE_RESPONSE_BYTES = 9'007'199'254'740'991LL;
 constexpr int64_t MIN_RESPONSE_BYTES = 64LL << 10;
 constexpr const char* AUTH_REASON_HEADER = "VGI-Auth-Reason";
+
+// A bearer the authentication chain refused, with the 401 reason to report.
+// Never carries the credential.
+class BearerRejected : public std::runtime_error {
+public:
+    explicit BearerRejected(AuthReason reason)
+        : std::runtime_error("bearer credential rejected"), reason_(reason) {}
+    AuthReason reason() const noexcept { return reason_; }
+
+private:
+    AuthReason reason_;
+};
 constexpr const char* AUTH_PROXY_REQUIRED_HEADER = "VGI-Auth-Proxy-Required";
 constexpr const char* PROOF_HEADER = "VGI-Proxy-Proof";
 constexpr const char* PROOF_REQUIRED_HEADER = "VGI-Proxy-Proof-Required";
@@ -783,6 +797,13 @@ public:
                                             " must be between 1 and 9007199254740991");
             }
         }
+        if (cfg.peer_authentication_policy && identity_bearer_active()) {
+            throw std::invalid_argument(
+                "this server authenticates from peer evidence (peer_authentication_policy), and "
+                "accepting sealed grants or resolve_token bearers would be an OR beside it that "
+                "bypasses that requirement. Compose the bearer check into the policy yourself and "
+                "set HttpConfig::identity_bearer = false.");
+        }
         if (cfg.peer_authentication_policy && cfg.peer_identity_providers.empty()) {
             throw std::invalid_argument(
                 "peer authentication policy requires at least one identity provider");
@@ -832,7 +853,20 @@ private:
         AuthContext auth = AuthContext::anonymous();
         PeerEvidenceSet evidence;
     };
+    // The deployment's authenticators, then the identity bearers.
     ResolvedHttpIdentity resolve_http_identity(const httplib::Request& req) const;
+    // The fixture principal header and the peer providers/policy.
+    ResolvedHttpIdentity resolve_deployment_identity(const httplib::Request& req) const;
+    // Whether the bearer chain (deployment bearer, grants, resolve_token) runs.
+    bool bearer_chain_active() const noexcept {
+        return static_cast<bool>(cfg_.bearer_authenticate) || identity_bearer_active();
+    }
+    bool identity_bearer_active() const noexcept {
+        const auto& identity = rpc_.identity();
+        return cfg_.identity_bearer && identity != nullptr &&
+               (identity->grant_keys().has_value() ||
+                static_cast<bool>(identity->resolve_token_hook()));
+    }
     // Returns true when the request was refused; `res` is then complete.
     bool refuse_if_unauthorized(const httplib::Request& req, httplib::Response& res,
                                 const std::string& request_id);
@@ -1115,6 +1149,93 @@ AuthIdentity HttpServer::identify(const httplib::Request& req) const {
 
 HttpServer::ResolvedHttpIdentity HttpServer::resolve_http_identity(
     const httplib::Request& req) const {
+    ResolvedHttpIdentity resolved = resolve_deployment_identity(req);
+    // The fixture header or a peer policy accepted the caller: done.
+    if (resolved.auth.authenticated || !bearer_chain_active()) return resolved;
+
+    const std::string header = req.get_header_value("Authorization");
+    if (header.empty()) {
+        // A deployment bearer authenticator is the server's only door, so no
+        // credential is a refusal; without one, nothing changes for a request
+        // that carries none.
+        if (cfg_.bearer_authenticate) throw BearerRejected(AuthReason::INVALID_CREDENTIAL);
+        return resolved;
+    }
+    constexpr std::string_view kBearer = "Bearer ";
+    if (header.compare(0, kBearer.size(), kBearer) != 0) {
+        throw BearerRejected(AuthReason::INVALID_CREDENTIAL);
+    }
+    const std::string token = header.substr(kBearer.size());
+
+    if (cfg_.bearer_authenticate) {
+        if (auto accepted = cfg_.bearer_authenticate(token)) {
+            resolved.auth = std::move(*accepted);
+            return resolved;
+        }
+    }
+    if (!identity_bearer_active()) throw BearerRejected(AuthReason::INVALID_CREDENTIAL);
+    const auto& identity = *rpc_.identity();
+
+    // Sealed grants: only the exact prefix reaches the verifier, and a grant
+    // that does not verify stops the chain here -- a forged or stale grant must
+    // never get a second chance from a resolver that might answer for it.
+    const bool grant_shaped = token.rfind(kGrantTokenPrefix, 0) == 0;
+    if (grant_shaped && identity.grant_keys()) {
+        GrantClaims claims;
+        try {
+            claims = verify_grant_token(*identity.grant_keys(), token);
+        } catch (const GrantInvalidError& e) {
+            throw BearerRejected(e.expired() ? AuthReason::EXPIRED_CREDENTIAL
+                                             : AuthReason::INVALID_CREDENTIAL);
+        }
+        AuthContext auth;
+        auth.domain = "grant";
+        auth.authenticated = true;
+        auth.principal = claims.principal;
+        // No auth_time, deliberately: a grant-authenticated caller cannot
+        // issue_grant, so grants never mint grants.
+        auth.claims = nlohmann::json{
+            {"grant_id", claims.grant_id}, {"scopes", claims.scopes}, {"purpose", claims.purpose}};
+        resolved.auth = std::move(auth);
+        return resolved;
+    }
+
+    // resolve_token never sees a `vgig1.` token, a JWS, a blank token or one
+    // over the byte cap -- the introspection shape guards.
+    const auto& resolve_token = identity.resolve_token_hook();
+    if (!grant_shaped && resolve_token) {
+        bool shaped_ok = true;
+        try {
+            reject_jws_shaped(token);
+        } catch (const std::exception&) {
+            shaped_ok = false;
+        }
+        if (shaped_ok) {
+            std::optional<TokenIdentity> found;
+            try {
+                found = resolve_token(token);
+            } catch (const IdentityUnavailableError& e) {
+                // Not knowable is not a rejection: 503 with the hook's hint.
+                throw AuthUnavailableError(
+                    e.detail().empty() ? "identity lookup unavailable" : e.detail(),
+                    e.retry_after());
+            }
+            if (found) {
+                AuthContext auth;
+                auth.domain = "token";
+                auth.authenticated = true;
+                auth.principal = found->principal;
+                auth.claims = nlohmann::json{{"token_name", found->token_name}};
+                resolved.auth = std::move(auth);
+                return resolved;
+            }
+        }
+    }
+    throw BearerRejected(AuthReason::INVALID_CREDENTIAL);
+}
+
+HttpServer::ResolvedHttpIdentity HttpServer::resolve_deployment_identity(
+    const httplib::Request& req) const {
     const AuthIdentity application = identify(req);
     AuthContext auth = AuthContext::anonymous();
     auth.authenticated = application.authenticated;
@@ -1286,6 +1407,9 @@ void HttpServer::handle_session_delete(const httplib::Request& req, httplib::Res
         res.status = 503;
         res.set_header("Retry-After", std::to_string(std::max(0, e.retry_after())));
         return;
+    } catch (const BearerRejected& e) {
+        write_unauthorized(req, res, e.reason());
+        return;
     } catch (const std::exception&) {
         write_unauthorized(req, res, AuthReason::INVALID_CREDENTIAL);
         return;
@@ -1322,6 +1446,9 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
     } catch (const AuthUnavailableError& e) {
         res.status = 503;
         res.set_header("Retry-After", std::to_string(std::max(0, e.retry_after())));
+        return;
+    } catch (const BearerRejected& e) {
+        write_unauthorized(req, res, e.reason());
         return;
     } catch (const std::exception&) {
         write_unauthorized(req, res, AuthReason::INVALID_CREDENTIAL);
@@ -1595,6 +1722,7 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
         rec.method = method_name;
         rec.request_id = request_id;
         rec.is_stream = false;
+        rec.set_auth(resolved.auth);
         AccessLogWriter* upload_log = rpc_.access_log();
         if (upload_log != nullptr && upload_log->enabled()) {
             fill_request_data(*upload_log, rec, batch);
@@ -1819,6 +1947,7 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
         rec.method = method_name;
         rec.request_id = request_id;
         rec.is_stream = true;
+        rec.set_auth(resolved.auth);
         rec.stream_id = stream_id;
         AccessLogWriter* stream_log = rpc_.access_log();
         // request_data rides the init record and only the init record: it is
@@ -2085,6 +2214,7 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
     rec.method = sess->method_name;
     rec.request_id = request_id;
     rec.is_stream = true;
+    rec.set_auth(resolved.auth);
     // The init's id, not this turn's cursor: reassembling a call's turns is
     // the whole reason the field exists.
     rec.stream_id = sess->stream_id;
@@ -2364,6 +2494,9 @@ void HttpServer::run() {
             } catch (const AuthUnavailableError& e) {
                 res.status = 503;
                 res.set_header("Retry-After", std::to_string(std::max(0, e.retry_after())));
+                return;
+            } catch (const BearerRejected& e) {
+                write_unauthorized(req, res, e.reason());
                 return;
             } catch (const std::exception&) {
                 write_unauthorized(req, res, AuthReason::INVALID_CREDENTIAL);

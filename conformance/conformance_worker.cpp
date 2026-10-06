@@ -1777,6 +1777,46 @@ IssuedGrant mint_grant(const std::string& principal, const std::string& purpose,
     return IssuedGrant{std::move(token), kGrantExpiresAt, kGrantId};
 }
 
+// Sealed-grant fixture (IDENTITY_CONFORMANCE_FIXTURE.md §10): the current key
+// mints, the previous one only verifies.  Published, so the shared suite can
+// mint and open tokens against this worker with the reference implementation.
+GrantKeys grant_keys() {
+    GrantKeys keys;
+    GrantKey current{};
+    GrantKey previous{};
+    for (uint8_t i = 0; i < 32; ++i) {
+        current[i] = static_cast<uint8_t>(0x10 + i);
+        previous[i] = static_cast<uint8_t>(0x30 + i);
+    }
+    keys.keys = {current, previous};
+    keys.audience = "conformance";
+    keys.max_ttl_seconds = 3600;
+    keys.clock_skew_seconds = 60;
+    return keys;
+}
+
+/// `conformance.Whoami.v1`: report how this request was authenticated, so a
+/// test can read back what a bearer authenticated as.  Compact, sorted-key
+/// JSON with non-ASCII escaped -- byte-identical to the reference.
+ProtocolBuilder whoami_protocol() {
+    ProtocolBuilder whoami("conformance.Whoami.v1");
+    whoami.add_unary(
+        "whoami", params({}), str_result_schema(),
+        [](const Request&, CallContext& ctx) -> Result {
+            const auto& auth = ctx.auth();
+            nlohmann::json body = {
+                {"authenticated", auth.authenticated},
+                {"claims", auth.claims.is_object() ? auth.claims : nlohmann::json::object()},
+                {"domain", auth.domain},
+                {"principal", auth.principal.value_or("")}};
+            arrow::StringBuilder builder;
+            VGI_RPC_THROW_NOT_OK(builder.Append(body.dump(-1, ' ', /*ensure_ascii=*/true)));
+            return Result::value(str_result_schema(), {unwrap(builder.Finish())});
+        },
+        "Report the request's authentication outcome.");
+    return whoami;
+}
+
 }  // namespace identity_fixture
 
 // =========================================================================
@@ -1948,8 +1988,9 @@ int main(int argc, char** argv) {
         } else if (arg == "--identity") {
             identity_mode = take_value(i);
             if (identity_mode != "off" && identity_mode != "both" &&
-                identity_mode != "introspect-only") {
-                std::cerr << "vgi_rpc: --identity must be one of off, both, introspect-only\n";
+                identity_mode != "introspect-only" && identity_mode != "grants") {
+                std::cerr
+                    << "vgi_rpc: --identity must be one of off, both, introspect-only, grants\n";
                 return 2;
             }
             if (identity_mode != "off") {
@@ -2439,7 +2480,14 @@ int main(int argc, char** argv) {
         // No rate limit to configure: introspection is not rate limited, and
         // TestIntrospectionIsNotThrottled pins that against this worker.
         identity_options.max_auth_age = identity_fixture::kMaxAuthAge;
+        // "grants": no mint hook, so the framework mints sealed grants with the
+        // fixture keys -- and the HTTP transport accepts them back as bearers.
+        if (identity_mode == "grants") identity_options.grant_keys = identity_fixture::grant_keys();
         builder.identity(std::make_shared<vgi_rpc::IdentityImpl>(std::move(identity_options)));
+        if (identity_mode == "grants") {
+            builder.grant_keys(identity_fixture::grant_keys());
+            builder.add_protocol(identity_fixture::whoami_protocol());
+        }
     }
     if (!server_id.empty()) builder.server_id(server_id);
     if (!access_log_path.empty()) {

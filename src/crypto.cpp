@@ -13,6 +13,7 @@
 
 #include "vgi_rpc/crypto.h"
 
+#include <algorithm>
 #include <cstring>
 #include <stdexcept>
 
@@ -94,22 +95,32 @@ static_assert(kAeadKeyBytes == crypto_aead_xchacha20poly1305_ietf_KEYBYTES);
 static_assert(kAeadNonceBytes == crypto_aead_xchacha20poly1305_ietf_NPUBBYTES);
 static_assert(kAeadTagBytes == crypto_aead_xchacha20poly1305_ietf_ABYTES);
 
-std::string aead_seal(const std::array<uint8_t, kAeadKeyBytes>& key, const std::string& plaintext,
-                      const std::string& aad) {
+std::string aead_seal_with_nonce(const std::array<uint8_t, kAeadKeyBytes>& key,
+                                 const std::string& plaintext, const std::string& aad,
+                                 const std::array<uint8_t, kAeadNonceBytes>& nonce) {
     require_sodium();
-    // nonce || ciphertext || tag. The nonce is generated here and never taken
-    // from the caller, so a caller cannot repeat one.
+    // nonce || ciphertext || tag.
     std::string out(kAeadNonceBytes + plaintext.size() + kAeadTagBytes, '\0');
-    auto* nonce = reinterpret_cast<uint8_t*>(out.data());
-    randombytes_buf(nonce, kAeadNonceBytes);
+    auto* head = reinterpret_cast<uint8_t*>(out.data());
+    std::copy(nonce.begin(), nonce.end(), head);
 
     unsigned long long sealed_len = 0;
     crypto_aead_xchacha20poly1305_ietf_encrypt(
-        nonce + kAeadNonceBytes, &sealed_len, reinterpret_cast<const uint8_t*>(plaintext.data()),
+        head + kAeadNonceBytes, &sealed_len, reinterpret_cast<const uint8_t*>(plaintext.data()),
         plaintext.size(), reinterpret_cast<const uint8_t*>(aad.data()), aad.size(),
-        /*nsec=*/nullptr, nonce, key.data());
+        /*nsec=*/nullptr, head, key.data());
     out.resize(kAeadNonceBytes + static_cast<size_t>(sealed_len));
     return out;
+}
+
+std::string aead_seal(const std::array<uint8_t, kAeadKeyBytes>& key, const std::string& plaintext,
+                      const std::string& aad) {
+    require_sodium();
+    // The nonce is generated here and never taken from the caller, so a
+    // caller of this function cannot repeat one.
+    std::array<uint8_t, kAeadNonceBytes> nonce{};
+    randombytes_buf(nonce.data(), nonce.size());
+    return aead_seal_with_nonce(key, plaintext, aad, nonce);
 }
 
 std::optional<std::string> aead_open(const std::array<uint8_t, kAeadKeyBytes>& key,

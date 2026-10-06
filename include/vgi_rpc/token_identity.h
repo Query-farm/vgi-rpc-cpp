@@ -61,6 +61,7 @@
 
 #include "vgi_rpc/errors.h"
 #include "vgi_rpc/export.h"
+#include "vgi_rpc/grants.h"
 #include "vgi_rpc/identity.h"
 #include "vgi_rpc/server.h"
 
@@ -304,7 +305,20 @@ struct VGI_RPC_EXPORT IdentityOptions {
     /// supplied; there is no permissive default.
     std::vector<std::string> introspect_principals;
     double max_auth_age = kDefaultMaxAuthAge;
+    /// Sealed-grant configuration (WIRE_PROTOCOL.md §16).  When set and
+    /// `mint_grant` is not, the framework mints sealed grants itself
+    /// (`sealed_mint_grant`), and an HTTP server hosting this identity accepts
+    /// them back as bearer credentials.  Unset changes nothing.
+    std::optional<GrantKeys> grant_keys;
 };
+
+/// A `mint_grant` hook that issues sealed grants with `keys`.
+///
+/// What `IdentityImpl` installs when grant keys are configured and the worker
+/// supplied no hook of its own.  A non-positive lifetime, or a field too long to
+/// encode, is `grant_refused`; `expires_at` is the sealed expiry and
+/// `grant_id` the sealed id.
+VGI_RPC_EXPORT MintGrantHook sealed_mint_grant(GrantKeys keys);
 
 /// Applies this file's guards, then delegates to worker-supplied hooks.
 ///
@@ -345,11 +359,19 @@ public:
     IssuedGrant issue_grant(const std::string& purpose, const std::vector<std::string>& scopes,
                             int64_t ttl_seconds, const AuthContext& auth);
 
+    /// The sealed-grant configuration, when this deployment has one.
+    const std::optional<GrantKeys>& grant_keys() const noexcept { return grant_keys_; }
+
+    /// The worker's `resolve_token`, which an HTTP server also consults for
+    /// bearer credentials.  Empty when none was supplied.
+    const ResolveTokenHook& resolve_token_hook() const noexcept { return resolve_token_; }
+
 private:
     ResolveTokenHook resolve_token_;
     MintGrantHook mint_grant_;
     std::set<std::string> principals_;
     double max_auth_age_;
+    std::optional<GrantKeys> grant_keys_;
 };
 
 /// The identity protocol's method table, narrowed to `offered`.

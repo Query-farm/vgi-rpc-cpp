@@ -13,6 +13,7 @@
 #include <string>
 
 #include "vgi_rpc/export.h"
+#include "vgi_rpc/identity.h"
 
 namespace vgi_rpc {
 
@@ -54,6 +55,16 @@ struct AccessRecord {
     // lets the writer derive it from error_type.  Never emitted on success.
     std::string error_code;
     double duration_ms = 0.0;
+    // The caller as the transport authenticated it (docs/access-log-spec.md
+    // §3): empty principal and domain, unauthenticated, when anonymous.
+    std::string principal;
+    std::string auth_domain;
+    bool authenticated = false;
+    void set_auth(const AuthContext& auth) {
+        principal = auth.principal.value_or("");
+        auth_domain = auth.domain;
+        authenticated = auth.authenticated;
+    }
     std::string request_id;        // per-request correlation id
     std::string stream_id;         // 32 lowercase hex; set when is_stream
     bool cancelled = false;        // client cancelled a stream

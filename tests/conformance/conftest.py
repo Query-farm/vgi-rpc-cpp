@@ -1344,3 +1344,17 @@ def conformance_http_identity_introspect_only_port() -> Iterator[int]:
     """
     with spawn_http("--identity", "introspect-only") as port:
         yield port
+
+
+@pytest.fixture(scope="session")
+def conformance_http_grant_port() -> Iterator[int]:
+    """The sealed-grant worker of ``IDENTITY_CONFORMANCE_FIXTURE.md`` §10.
+
+    The fixture resolver plus the fixture's grant keys and no mint hook, so the
+    framework mints and accepts its own grants; hosts ``conformance.Whoami.v1``
+    so a test can read back how a bearer was authenticated.  Backs
+    ``TestSealedGrants``, ``TestSealedGrantRejections``,
+    ``TestGrantPrefixRouting`` and ``TestResolveTokenBearer``.
+    """
+    with spawn_http("--identity", "grants") as port:
+        yield port

@@ -110,9 +110,9 @@ void AccessLogWriter::emit(const AccessRecord& rec) {
     j["protocol_hash"] = rec.protocol_hash;
     j["method"] = rec.method;
     j["method_type"] = rec.is_stream ? "stream" : "unary";
-    j["principal"] = "";
-    j["auth_domain"] = "";
-    j["authenticated"] = false;
+    j["principal"] = rec.principal;
+    j["auth_domain"] = rec.auth_domain;
+    j["authenticated"] = rec.authenticated;
     j["remote_addr"] = "";
     j["duration_ms"] = std::round(rec.duration_ms * 100.0) / 100.0;
     j["status"] = rec.status;

@@ -299,7 +299,14 @@ std::string IssuedGrant::serialize_to_bytes() const {
 IdentityImpl::IdentityImpl(IdentityOptions options)
     : resolve_token_(std::move(options.resolve_token)),
       mint_grant_(std::move(options.mint_grant)),
-      max_auth_age_(options.max_auth_age) {
+      max_auth_age_(options.max_auth_age),
+      grant_keys_(std::move(options.grant_keys)) {
+    if (grant_keys_) {
+        grant_keys_->validate();
+        // Grants on and no hook of the worker's own: the framework mints, with
+        // the same keys the HTTP transport verifies with.
+        if (!mint_grant_) mint_grant_ = sealed_mint_grant(*grant_keys_);
+    }
     // Validated at construction, not at first call: a worker that would refuse
     // every introspection should fail to start rather than serve traffic until
     // someone tries.
@@ -376,6 +383,26 @@ IssuedGrant IdentityImpl::issue_grant(const std::string& purpose,
     } catch (const AuthUnavailableError& e) {
         throw identity_unavailable_from(e);
     }
+}
+
+MintGrantHook sealed_mint_grant(GrantKeys keys) {
+    keys.validate();
+    return [keys = std::move(keys)](const std::string& principal, const std::string& purpose,
+                                    const std::vector<std::string>& scopes,
+                                    int64_t ttl_seconds) -> IssuedGrant {
+        if (ttl_seconds <= 0) throw GrantRefusedError("ttl_seconds must be positive");
+        MintedGrantToken minted;
+        try {
+            minted = mint_grant_token(keys, principal, scopes, purpose, ttl_seconds);
+        } catch (const std::invalid_argument& e) {
+            throw GrantRefusedError(e.what());
+        }
+        IssuedGrant grant;
+        grant.expires_at = static_cast<double>(minted.claims.expires_at);
+        grant.grant_id = minted.claims.grant_id;
+        grant.token = std::move(minted.token);
+        return grant;
+    };
 }
 
 // The protocol surface
@@ -457,7 +484,7 @@ bool Server::serve_identity(const std::shared_ptr<arrow::io::OutputStream>& outp
         VGI_RPC_THROW_NOT_OK(output->Flush());
         if (!identity_binding_.name.empty()) {
             log_framework_call(identity_binding_, method_name, request_id, request_batch, t0, type,
-                               message, code_name(default_error_code(type, kind)));
+                               message, code_name(default_error_code(type, kind)), &auth);
         }
         return true;
     };
@@ -517,7 +544,7 @@ bool Server::serve_identity(const std::shared_ptr<arrow::io::OutputStream>& outp
         write_ipc_stream(output, empty_schema(), {err.annotated_batch()});
         VGI_RPC_THROW_NOT_OK(output->Flush());
         log_framework_call(identity_binding_, method_name, request_id, request_batch, t0,
-                           exception_type_of(e), e.what(), code_name(error_code_of(e)));
+                           exception_type_of(e), e.what(), code_name(error_code_of(e)), &auth);
         return true;
     }
 
@@ -529,7 +556,8 @@ bool Server::serve_identity(const std::shared_ptr<arrow::io::OutputStream>& outp
     auto result = Result::value(batch);
     write_ipc_stream(output, info.result_schema, {result.annotated_batch()});
     VGI_RPC_THROW_NOT_OK(output->Flush());
-    log_framework_call(identity_binding_, method_name, request_id, request_batch, t0, "", "");
+    log_framework_call(identity_binding_, method_name, request_id, request_batch, t0, "", "", "",
+                       &auth);
     return true;
 }
 

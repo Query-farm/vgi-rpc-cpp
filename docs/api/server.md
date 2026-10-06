@@ -123,7 +123,61 @@ details are sent either way.
 
 Registration is sealed once `build()` runs: calling any registration method
 (`add_*`, `add_protocol`, `protocol`, `protocol_version`, `identity`,
-`include_tracebacks`) afterwards throws `std::logic_error`.
+`grant_keys`, `include_tracebacks`) afterwards throws `std::logic_error`.
+
+#### `grant_keys`
+
+```cpp
+ServerBuilder& grant_keys(std::optional<GrantKeys> keys);
+```
+
+Sealed grants (WIRE_PROTOCOL §16, "Accepting identity credentials"). Unless
+this is called, `build()` reads the environment:
+
+| Variable | Meaning |
+|---|---|
+| `VGI_RPC_GRANT_KEYS` | Comma-separated standard base64 keys, exactly 32 bytes each. The first mints; every key verifies. Unset means grants are off and nothing changes. |
+| `VGI_RPC_GRANT_AUDIENCE` | Bound into every grant's associated data (default empty). |
+| `VGI_RPC_GRANT_MAX_TTL_SECONDS` | Lifetime ceiling at minting and verification (default 604800, seven days). |
+
+A malformed key, two equal keys, or a non-positive lifetime makes `build()`
+throw, so the worker refuses to start. `grant_keys(std::nullopt)` turns grants
+off regardless of the environment.
+
+With keys configured the framework mints `vgig1.` sealed grants through
+`issue_grant` (unless `IdentityOptions::mint_grant` is set) and the HTTP
+transport accepts them back as `Authorization: Bearer` credentials. With keys
+and no `identity()`, `vgi_rpc.Identity.v1` is hosted with `issue_grant` alone.
+An `identity()` whose `IdentityOptions::grant_keys` is unset is refused, so the
+minter and the verifier always share one configuration.
+
+A grant authenticates with `domain = "grant"`, the grant's principal, claims
+`{grant_id, scopes, purpose}`, and **no `auth_time`** — so a grant-authenticated
+caller cannot `issue_grant` (`stale_auth`): grants never mint grants. Grants are
+not individually revocable; expiry is the revocation, and removing a key revokes
+everything it minted.
+
+The HTTP authentication order is: the deployment's own authenticators
+(`sticky_header_auth`, `peer_authentication_policy`,
+`HttpConfig::bearer_authenticate`), then sealed grants, then the identity's
+`resolve_token`:
+
+- Only the exact `vgig1.` prefix reaches the grant verifier. A `vgig1.` token
+  that does not verify is a 401 (`VGI-Auth-Reason: invalid_credential`, or
+  `expired_credential` for an authentic grant outside its lifetime) that stops
+  the chain — it never reaches `resolve_token`.
+- `resolve_token` returning an identity authenticates with `domain = "token"`
+  and claims `{token_name}`; `std::nullopt` falls through (401 if nothing else
+  accepts); `IdentityUnavailableError` or `AuthUnavailableError` is a 503 with
+  the hook's `Retry-After`. JWS-shaped, blank and over-4096-byte tokens are
+  never passed to it.
+- With no deployment bearer authenticator, a request with no `Authorization`
+  header stays anonymous.
+
+A `peer_authentication_policy` is transport- or proxy-injected evidence — a
+gate. Bearer alternatives OR-ed beside it would bypass it, so `serve_http`
+refuses that combination; compose the bearer check into the policy yourself and
+set `HttpConfig::identity_bearer = false`.
 
 #### `build`
 

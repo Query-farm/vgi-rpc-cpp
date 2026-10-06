@@ -42,6 +42,10 @@ target_compile_definitions(access_log_test PRIVATE
     VGI_RPC_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/.."
 )
 vgi_rpc_add_test(token_identity_test)
+vgi_rpc_add_test(grants_test)
+target_compile_definitions(grants_test PRIVATE
+    VGI_RPC_GRANT_VECTORS="${CMAKE_CURRENT_SOURCE_DIR}/data/grant_token_vectors.json"
+)
 vgi_rpc_add_test(client_external_test)
 vgi_rpc_add_test(external_ref_test)
 target_link_libraries(external_ref_test PRIVATE zstd::libzstd)

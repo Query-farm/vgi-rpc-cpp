@@ -188,6 +188,32 @@ struct HttpConfig {
     // Exact paths ("/", "/client.js", ...); no filesystem access. Served under
     // the same authentication and proxy-proof policy as RPC requests.
     std::map<std::string, HttpStaticAsset> static_assets;
+
+    // The deployment's own bearer authenticator (static tokens, a JWT
+    // validator, ...), handed the credential after `Bearer `.  Return the
+    // caller's context to accept it, `std::nullopt` for "not my credential"
+    // (the chain moves on), throw `AuthUnavailableError` for "could not find
+    // out" (503 + Retry-After); any other exception is a 401.  When set, a
+    // request whose credential nothing accepts -- or that carries none -- is
+    // refused 401.  Consulted after the fixture principal header and the peer
+    // policy, and before the identity bearers below.  Appended for positional
+    // aggregate source compatibility.
+    std::function<std::optional<AuthContext>(const std::string& token)> bearer_authenticate;
+
+    // Accept `vgi_rpc.Identity.v1` credentials as bearers when the server
+    // hosts Identity with grant keys or a `resolve_token` hook
+    // (WIRE_PROTOCOL.md §16, "Accepting identity credentials"): after the
+    // deployment's own authenticators come sealed grants (`vgig1.` only; one
+    // that does not verify is a 401 that stops the chain), then
+    // `resolve_token`.  With no deployment authenticator, a request with no
+    // `Authorization` header stays anonymous; one whose bearer nothing
+    // accepts is 401.
+    //
+    // A `peer_authentication_policy` is proxy- or transport-injected evidence
+    // -- a gate.  OR-ing bearer alternatives beside it would let a grant
+    // bypass it, so that combination refuses to start; compose explicitly and
+    // set this to `false`.
+    bool identity_bearer = true;
 };
 
 }  // namespace vgi_rpc

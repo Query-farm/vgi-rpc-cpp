@@ -17,6 +17,7 @@
 #include "vgi_rpc/access_log.h"
 #include "vgi_rpc/call_context.h"
 #include "vgi_rpc/export.h"
+#include "vgi_rpc/grants.h"
 #include "vgi_rpc/http_config.h"
 #include "vgi_rpc/proxy_protocol_v2.h"
 #include "vgi_rpc/request.h"
@@ -205,6 +206,20 @@ public:
     // hosted, and the protocol hash narrows with them.
     ServerBuilder& identity(std::shared_ptr<IdentityImpl> impl);
 
+    // Sealed-grant configuration (WIRE_PROTOCOL.md §16).  Unless this is
+    // called, `build()` reads `VGI_RPC_GRANT_KEYS` and friends -- unset means
+    // grants are off and nothing changes; a malformed key makes `build()`
+    // throw, so the worker refuses to start rather than run with a key it
+    // misread.  `std::nullopt` turns grants off regardless of the environment.
+    //
+    // With keys, the framework mints sealed grants through `issue_grant`
+    // (unless the identity implementation supplies `mint_grant`) and the HTTP
+    // transport accepts them back as bearer credentials.  With keys and no
+    // `identity()`, an identity hosting `issue_grant` alone is created.  An
+    // `identity()` built without the same keys is refused: the minter and the
+    // verifier must use one configuration.
+    ServerBuilder& grant_keys(std::optional<GrantKeys> keys);
+
     // Host one more application protocol beside the primary.
     //
     // Any number may be added; they are fixed when `build()` runs and hosted
@@ -261,6 +276,8 @@ private:
     std::string server_id_;
     std::string access_log_path_;
     std::shared_ptr<IdentityImpl> identity_;
+    bool grant_keys_explicit_ = false;
+    std::optional<GrantKeys> grant_keys_;
     bool transport_options_enabled_ = false;
     std::function<void(TransportKind)> on_serve_start_;
     int64_t access_log_max_record_bytes_ = kDefaultMaxRecordBytes;
@@ -460,7 +477,7 @@ private:
                             const std::shared_ptr<arrow::RecordBatch>& request_batch,
                             std::chrono::steady_clock::time_point started,
                             const std::string& error_type, const std::string& error_message,
-                            const std::string& error_code = "");
+                            const std::string& error_code = "", const AuthContext* auth = nullptr);
 
     void serve_unary(const MethodInfo& method_info, const ProtocolIdentity& owner,
                      const Request& request, const std::string& request_id,

@@ -138,7 +138,7 @@ void Server::log_framework_call(const ProtocolIdentity& owner, const std::string
                                 const std::shared_ptr<arrow::RecordBatch>& request_batch,
                                 std::chrono::steady_clock::time_point started,
                                 const std::string& error_type, const std::string& error_message,
-                                const std::string& error_code) {
+                                const std::string& error_code, const AuthContext* auth) {
     if (!access_log_ || !access_log_->enabled()) return;
     // `owner`, not this server's primary.  Reflection and identity are
     // protocols in their own right; filing their calls under the application's
@@ -149,6 +149,7 @@ void Server::log_framework_call(const ProtocolIdentity& owner, const std::string
     rec.method = method;
     rec.request_id = request_id;
     rec.is_stream = false;
+    if (auth != nullptr) rec.set_auth(*auth);
     rec.status = error_type.empty() ? "ok" : "error";
     rec.error_type = error_type;
     rec.error_message = error_message;
@@ -682,6 +683,7 @@ bool Server::serve_unary_impl(const MethodInfo& method_info, const ProtocolIdent
         rec.method = method_info.name;
         rec.request_id = request_id;
         rec.is_stream = false;
+        rec.set_auth(ctx.auth());
         rec.status = status;
         rec.error_type = error_type;
         rec.error_message = error_message;
@@ -944,6 +946,7 @@ void Server::serve_stream(const MethodInfo& method_info, const ProtocolIdentity&
         rec.method = method_info.name;
         rec.request_id = request_id;
         rec.is_stream = true;
+        rec.set_auth(auth);
         rec.status = status;
         rec.error_type = error_type;
         rec.error_message = error_message;

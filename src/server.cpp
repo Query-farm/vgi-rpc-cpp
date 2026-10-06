@@ -208,6 +208,14 @@ ServerBuilder& ServerBuilder::identity(std::shared_ptr<IdentityImpl> impl) {
     return *this;
 }
 
+ServerBuilder& ServerBuilder::grant_keys(std::optional<GrantKeys> keys) {
+    check_not_built("grant_keys");
+    if (keys) keys->validate();
+    grant_keys_ = std::move(keys);
+    grant_keys_explicit_ = true;
+    return *this;
+}
+
 ServerBuilder& ServerBuilder::protocol_version(std::string version) {
     check_not_built("protocol_version");
     primary_.version_ = std::move(version);
@@ -307,6 +315,25 @@ std::unique_ptr<Server> ServerBuilder::build() {
         hosted.version = std::move(extra.version_);
         hosted.methods = method_map(std::move(extra.methods_));
         protocols.push_back(std::move(hosted));
+    }
+
+    // Read at build, so a malformed key refuses to start the worker rather
+    // than failing the first mint.
+    std::optional<GrantKeys> grant_keys =
+        grant_keys_explicit_ ? std::move(grant_keys_) : GrantKeys::from_env();
+    if (grant_keys) {
+        if (!identity_) {
+            // Grants on and no other identity hooks: the framework mints and
+            // accepts its own, and hosts issue_grant alone.
+            IdentityOptions options;
+            options.grant_keys = std::move(grant_keys);
+            identity_ = std::make_shared<IdentityImpl>(std::move(options));
+        } else if (!identity_->grant_keys()) {
+            throw std::invalid_argument(
+                "grant keys were configured (ServerBuilder::grant_keys or VGI_RPC_GRANT_KEYS) and "
+                "an IdentityImpl was supplied without them. Set IdentityOptions::grant_keys so the "
+                "minter and the verifier use the same keys.");
+        }
     }
 
     // Identity, when the deployment configured it, is hosted as its own

@@ -77,6 +77,15 @@ inline constexpr size_t kAeadTagBytes = 16;
 VGI_RPC_EXPORT std::string aead_seal(const std::array<uint8_t, kAeadKeyBytes>& key,
                                      const std::string& plaintext, const std::string& aad);
 
+// aead_seal with a caller-supplied nonce, **for published test vectors only**.
+// Reusing a nonce under one key destroys both confidentiality and
+// authenticity, so production code never calls this: it exists so a vector
+// fixing key, nonce and plaintext can be reproduced byte for byte.
+VGI_RPC_EXPORT std::string aead_seal_with_nonce(const std::array<uint8_t, kAeadKeyBytes>& key,
+                                                const std::string& plaintext,
+                                                const std::string& aad,
+                                                const std::array<uint8_t, kAeadNonceBytes>& nonce);
+
 // Inverse of aead_seal.  Returns nullopt on any failure — a wrong key, a
 // wrong AAD, a truncated envelope, or a tampered byte — with no distinction
 // between them, deliberately.
