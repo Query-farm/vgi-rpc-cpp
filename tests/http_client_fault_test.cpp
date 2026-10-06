@@ -238,10 +238,10 @@ private:
     }
 
     void install_init(const std::string& method) {
-        server_.Post(
-            "/" + method + "/init", [this](const httplib::Request&, httplib::Response& response) {
-                arrow_response(response, exchange_init_response(schema_, "cursor", "call-state"));
-            });
+        server_.Post("/Test.v1/" + method + "/init", [this](const httplib::Request&,
+                                                            httplib::Response& response) {
+            arrow_response(response, exchange_init_response(schema_, "cursor", "call-state"));
+        });
     }
 
     void install_handlers() {
@@ -273,92 +273,94 @@ private:
                 response.set_header("VGI-Max-Upload-Bytes", "456789");
                 response.set_header("VGI-Supported-Encodings", "ZSTD, gzip");
             });
-        server_.Post("/preflight", [this](const httplib::Request&, httplib::Response& response) {
-            ++preflight_requests;
-            arrow_response(response, good_response_);
-        });
-        server_.Post("/encoded-request-cap",
+        server_.Post("/Test.v1/preflight",
+                     [this](const httplib::Request&, httplib::Response& response) {
+                         ++preflight_requests;
+                         arrow_response(response, good_response_);
+                     });
+        server_.Post("/Test.v1/encoded-request-cap",
                      [this](const httplib::Request&, httplib::Response& response) {
                          ++encoded_request_cap_requests;
                          arrow_response(response, good_response_);
                      });
-        server_.Post("/ok", [this](const httplib::Request& request, httplib::Response& response) {
-            ++recovery_requests;
-            accepted_response_budget_seen.store(
-                accepted_response_budget_seen.load() &&
-                request.get_header_value("VGI-Accept-Max-Response-Bytes") ==
-                    std::to_string(256LL * 1024 * 1024));
-            last_accepted_response_budget.store(
-                std::stoll(request.get_header_value("VGI-Accept-Max-Response-Bytes")));
-            arrow_response(response, good_response_);
-        });
-        server_.Post("/support-missing",
+        server_.Post("/Test.v1/ok",
+                     [this](const httplib::Request& request, httplib::Response& response) {
+                         ++recovery_requests;
+                         accepted_response_budget_seen.store(
+                             accepted_response_budget_seen.load() &&
+                             request.get_header_value("VGI-Accept-Max-Response-Bytes") ==
+                                 std::to_string(256LL * 1024 * 1024));
+                         last_accepted_response_budget.store(
+                             std::stoll(request.get_header_value("VGI-Accept-Max-Response-Bytes")));
+                         arrow_response(response, good_response_);
+                     });
+        server_.Post("/Test.v1/support-missing",
                      [this](const httplib::Request&, httplib::Response& response) {
                          arrow_response(response, good_response_);
                          response.set_header("X-Test-Omit-Budget-Support", "1");
                      });
-        server_.Post("/support-duplicate",
+        server_.Post("/Test.v1/support-duplicate",
                      [this](const httplib::Request&, httplib::Response& response) {
                          arrow_response(response, good_response_);
                          response.set_header("VGI-Accept-Max-Response-Bytes-Support", "true");
                          response.headers.emplace("VGI-Accept-Max-Response-Bytes-Support", "true");
                      });
-        server_.Post("/support-uppercase",
+        server_.Post("/Test.v1/support-uppercase",
                      [this](const httplib::Request&, httplib::Response& response) {
                          arrow_response(response, good_response_);
                          response.set_header("VGI-Accept-Max-Response-Bytes-Support", "TRUE");
                      });
-        server_.Post(
-            "/compressed", [this](const httplib::Request& request, httplib::Response& response) {
-                compressed_request_valid.store(
-                    request.get_header_value("Content-Encoding") == "zstd" &&
-                    request.get_header_value("Accept-Encoding").find("zstd") != std::string::npos &&
-                    request.get_header_value("X-VGI-Accept-Encoding").find("zstd") !=
-                        std::string::npos &&
-                    !request_body(request).empty());
-                arrow_response(response, zstd_encode(good_response_));
-                response.set_header("Content-Encoding", "ZSTD");
-                response.set_header("VGI-Supported-Encodings", "zstd");
-            });
-        server_.Post("/decoded-large",
+        server_.Post("/Test.v1/compressed", [this](const httplib::Request& request,
+                                                   httplib::Response& response) {
+            compressed_request_valid.store(
+                request.get_header_value("Content-Encoding") == "zstd" &&
+                request.get_header_value("Accept-Encoding").find("zstd") != std::string::npos &&
+                request.get_header_value("X-VGI-Accept-Encoding").find("zstd") !=
+                    std::string::npos &&
+                !request_body(request).empty());
+            arrow_response(response, zstd_encode(good_response_));
+            response.set_header("Content-Encoding", "ZSTD");
+            response.set_header("VGI-Supported-Encodings", "zstd");
+        });
+        server_.Post("/Test.v1/decoded-large",
                      [this](const httplib::Request&, httplib::Response& response) {
                          arrow_response(response, zstd_encode(std::string(256 * 1024, 'd')));
                          response.set_header("Content-Encoding", "zstd");
                      });
-        server_.Post("/encoded-large",
+        server_.Post("/Test.v1/encoded-large",
                      [this](const httplib::Request&, httplib::Response& response) {
                          arrow_response(response, std::string(128 * 1024, 'z'));
                          response.set_header("Content-Encoding", "zstd");
                      });
-        server_.Post("/truncated-zstd",
+        server_.Post("/Test.v1/truncated-zstd",
                      [this](const httplib::Request&, httplib::Response& response) {
                          std::string encoded = zstd_encode(good_response_);
                          encoded.resize(encoded.size() / 2);
                          arrow_response(response, encoded);
                          response.set_header("Content-Encoding", "zstd");
                      });
-        server_.Post(
-            "/fallback", [this](const httplib::Request& request, httplib::Response& response) {
-                const int attempt = fallback_requests.fetch_add(1);
-                const std::string header_id = request.get_header_value("X-Request-ID");
-                const std::string arrow_id = request_metadata_value(request, keys::REQUEST_ID);
-                {
-                    std::lock_guard<std::mutex> lock(fallback_mutex_);
-                    if (attempt == 0) fallback_request_id_ = header_id;
-                    fallback_request_ids_valid.store(
-                        fallback_request_ids_valid.load() && !header_id.empty() &&
-                        header_id != "caller-spoof" && header_id == arrow_id &&
-                        header_id == fallback_request_id_);
-                }
-                if (request.get_header_value("Content-Encoding") == "zstd") {
-                    response.status = 415;
-                    response.set_content("unsupported", "text/plain");
-                    response.set_header("VGI-Supported-Encodings", "");
-                    return;
-                }
-                arrow_response(response, good_response_);
-            });
-        server_.Post("/advertise-none",
+        server_.Post("/Test.v1/fallback", [this](const httplib::Request& request,
+                                                 httplib::Response& response) {
+            const int attempt = fallback_requests.fetch_add(1);
+            const std::string header_id = request.get_header_value("X-Request-ID");
+            const std::string arrow_id = request_metadata_value(request, keys::REQUEST_ID);
+            {
+                std::lock_guard<std::mutex> lock(fallback_mutex_);
+                if (attempt == 0) fallback_request_id_ = header_id;
+                fallback_request_ids_valid.store(
+                    fallback_request_ids_valid.load() && !header_id.empty() &&
+                    header_id != "caller-spoof" && header_id == arrow_id &&
+                    header_id == fallback_request_id_);
+            }
+            if (request.get_header_value("Content-Encoding") == "zstd") {
+                response.status = 415;
+                response.set_content("unsupported", "text/plain");
+                response.set_header("VGI-Supported-Encodings", "");
+                return;
+            }
+            arrow_response(response, good_response_);
+        });
+        server_.Post("/Test.v1/advertise-none",
                      [this](const httplib::Request& request, httplib::Response& response) {
                          if (request.get_header_value("Content-Encoding").empty()) {
                              ++advertised_identity_requests;
@@ -366,27 +368,27 @@ private:
                          arrow_response(response, good_response_);
                          response.set_header("VGI-Supported-Encodings", "");
                      });
-        server_.Post(
-            "/row-log-metadata", [this](const httplib::Request&, httplib::Response& response) {
-                auto metadata = std::make_shared<arrow::KeyValueMetadata>();
-                metadata->Append(keys::LOG_LEVEL, "EXCEPTION");
-                metadata->Append(keys::LOG_MESSAGE, "application-owned metadata");
-                arrow_response(
-                    response,
-                    encode_response(schema_, {AnnotatedBatch::with_metadata(
-                                                 value_batch(schema_, 88), std::move(metadata))}));
-            });
+        server_.Post("/Test.v1/row-log-metadata", [this](const httplib::Request&,
+                                                         httplib::Response& response) {
+            auto metadata = std::make_shared<arrow::KeyValueMetadata>();
+            metadata->Append(keys::LOG_LEVEL, "EXCEPTION");
+            metadata->Append(keys::LOG_MESSAGE, "application-owned metadata");
+            arrow_response(
+                response,
+                encode_response(schema_, {AnnotatedBatch::with_metadata(value_batch(schema_, 88),
+                                                                        std::move(metadata))}));
+        });
 
-        server_.Post("/sticky-open", [this](const httplib::Request& request,
-                                            httplib::Response& response) {
+        server_.Post("/Test.v1/sticky-open", [this](const httplib::Request& request,
+                                                    httplib::Response& response) {
             sticky_headers_valid.store(request.get_header_value("VGI-Session-Accept") == "true" &&
                                        request.get_header_value("VGI-Session").empty());
             arrow_response(response, good_response_);
             response.set_header("VGI-Session", "sticky-token");
             response.set_header("VGI-Echo-X-Route", "worker-a");
         });
-        server_.Post("/sticky-oversized", [this](const httplib::Request& request,
-                                                 httplib::Response& response) {
+        server_.Post("/Test.v1/sticky-oversized", [this](const httplib::Request& request,
+                                                         httplib::Response& response) {
             sticky_headers_valid.store(sticky_headers_valid.load() &&
                                        request.get_header_value("VGI-Session") == "sticky-token" &&
                                        request.get_header_value("X-Route") == "worker-a");
@@ -397,38 +399,40 @@ private:
                                     std::string(7000, 'x'));
             }
         });
-        server_.Post("/sticky-reserved",
+        server_.Post("/Test.v1/sticky-reserved",
                      [this](const httplib::Request&, httplib::Response& response) {
                          arrow_response(response, good_response_);
                          response.set_header("VGI-Session", "must-not-persist");
                          response.set_header("VGI-Echo-Content-Type", "text/plain");
                      });
-        server_.Post("/sticky-credential",
+        server_.Post("/Test.v1/sticky-credential",
                      [this](const httplib::Request&, httplib::Response& response) {
                          arrow_response(response, good_response_);
                          response.set_header("VGI-Session", "must-not-persist");
                          response.set_header("VGI-Echo-Authorization", "Bearer reflected");
                      });
-        server_.Post("/sticky-malformed", [](const httplib::Request&, httplib::Response& response) {
-            response.set_content("not an Arrow stream", kArrowContentType);
-            response.set_header("VGI-Session", "must-not-persist");
-            response.set_header("VGI-Echo-X-Route", "wrong-worker");
-        });
-        server_.Post("/sticky-recover", [this](const httplib::Request& request,
-                                               httplib::Response& response) {
+        server_.Post("/Test.v1/sticky-malformed",
+                     [](const httplib::Request&, httplib::Response& response) {
+                         response.set_content("not an Arrow stream", kArrowContentType);
+                         response.set_header("VGI-Session", "must-not-persist");
+                         response.set_header("VGI-Echo-X-Route", "wrong-worker");
+                     });
+        server_.Post("/Test.v1/sticky-recover", [this](const httplib::Request& request,
+                                                       httplib::Response& response) {
             sticky_headers_valid.store(sticky_headers_valid.load() &&
                                        request.get_header_value("VGI-Session") == "sticky-token" &&
                                        request.get_header_value("X-Route") == "worker-a");
             arrow_response(response, good_response_);
         });
-        server_.Post("/sticky-block", [this](const httplib::Request&, httplib::Response& response) {
-            sticky_block_entered.store(true);
-            while (!sticky_block_release.load()) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            }
-            arrow_response(response, good_response_);
-        });
-        server_.Post("/transport-block",
+        server_.Post("/Test.v1/sticky-block",
+                     [this](const httplib::Request&, httplib::Response& response) {
+                         sticky_block_entered.store(true);
+                         while (!sticky_block_release.load()) {
+                             std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                         }
+                         arrow_response(response, good_response_);
+                     });
+        server_.Post("/Test.v1/transport-block",
                      [this](const httplib::Request&, httplib::Response& response) {
                          transport_block_entered.store(true);
                          while (!transport_block_release.load()) {
@@ -436,16 +440,17 @@ private:
                          }
                          arrow_response(response, good_response_);
                      });
-        server_.Post("/post-retry", [this](const httplib::Request&, httplib::Response& response) {
-            if (post_retry_requests.fetch_add(1) < 2) {
-                response.status = 503;
-                response.set_content("retry", "text/plain");
-                return;
-            }
-            arrow_response(response, good_response_);
-        });
+        server_.Post("/Test.v1/post-retry",
+                     [this](const httplib::Request&, httplib::Response& response) {
+                         if (post_retry_requests.fetch_add(1) < 2) {
+                             response.status = 503;
+                             response.set_content("retry", "text/plain");
+                             return;
+                         }
+                         arrow_response(response, good_response_);
+                     });
         install_init("producer-retry");
-        server_.Post("/producer-retry/exchange",
+        server_.Post("/Test.v1/producer-retry/exchange",
                      [this](const httplib::Request&, httplib::Response& response) {
                          if (producer_retry_requests.fetch_add(1) < 2) {
                              response.status = 503;
@@ -458,11 +463,12 @@ private:
             response.status = 204;
         });
 
-        server_.Post("/fixed-large", [this](const httplib::Request&, httplib::Response& response) {
-            response.set_content(std::string(128 * 1024, 'f'), kArrowContentType);
-        });
+        server_.Post("/Test.v1/fixed-large",
+                     [this](const httplib::Request&, httplib::Response& response) {
+                         response.set_content(std::string(128 * 1024, 'f'), kArrowContentType);
+                     });
         server_.Post(
-            "/chunked-large", [this](const httplib::Request&, httplib::Response& response) {
+            "/Test.v1/chunked-large", [this](const httplib::Request&, httplib::Response& response) {
                 auto payload = std::make_shared<std::string>(128 * 1024, 'c');
                 response.set_chunked_content_provider(
                     kArrowContentType, [payload](size_t offset, httplib::DataSink& sink) {
@@ -476,59 +482,62 @@ private:
                         return true;
                     });
             });
-        server_.Post("/unsupported-encoding",
+        server_.Post("/Test.v1/unsupported-encoding",
                      [this](const httplib::Request&, httplib::Response& response) {
                          arrow_response(response, good_response_);
                          response.set_header("Content-Encoding", "br");
                      });
-        server_.Post("/unsupported-type",
+        server_.Post("/Test.v1/unsupported-type",
                      [this](const httplib::Request&, httplib::Response& response) {
                          response.set_content(good_response_, "application/octet-stream");
                      });
-        server_.Post("/header-error", [this](const httplib::Request&, httplib::Response& response) {
-            arrow_response(response, good_response_);
-            response.set_header("X-VGI-RPC-Error", "true");
-        });
-        server_.Post("/arrow-400", [this](const httplib::Request&, httplib::Response& response) {
-            arrow_response(response, good_response_);
-            response.status = 400;
-        });
-        server_.Post("/metadata-sanitize",
+        server_.Post("/Test.v1/header-error",
+                     [this](const httplib::Request&, httplib::Response& response) {
+                         arrow_response(response, good_response_);
+                         response.set_header("X-VGI-RPC-Error", "true");
+                     });
+        server_.Post("/Test.v1/arrow-400",
+                     [this](const httplib::Request&, httplib::Response& response) {
+                         arrow_response(response, good_response_);
+                         response.status = 400;
+                     });
+        server_.Post("/Test.v1/metadata-sanitize",
                      [this](const httplib::Request& request, httplib::Response& response) {
                          pointer_metadata_sanitized.store(request_omits_pointer_controls(request));
                          arrow_response(response, good_response_);
                      });
-        server_.Post("/external-pointer",
+        server_.Post("/Test.v1/external-pointer",
                      [this](const httplib::Request&, httplib::Response& response) {
                          arrow_response(response, pointer_response(schema_, keys::LOCATION));
                      });
-        server_.Post("/shm-pointer", [this](const httplib::Request&, httplib::Response& response) {
-            arrow_response(response, pointer_response(schema_, keys::SHM_OFFSET));
-        });
+        server_.Post("/Test.v1/shm-pointer",
+                     [this](const httplib::Request&, httplib::Response& response) {
+                         arrow_response(response, pointer_response(schema_, keys::SHM_OFFSET));
+                     });
 
         install_init("ambiguous");
-        server_.Post("/ambiguous/exchange",
+        server_.Post("/Test.v1/ambiguous/exchange",
                      [this](const httplib::Request&, httplib::Response& response) {
                          ++ambiguous_exchange_requests;
                          arrow_response(response, ambiguous_exchange_response(schema_));
                      });
 
         install_init("explicit-close");
-        server_.Post("/explicit-close/exchange",
+        server_.Post("/Test.v1/explicit-close/exchange",
                      [this](const httplib::Request&, httplib::Response& response) {
                          ++explicit_close_exchange_requests;
                          arrow_response(response, good_response_);
                      });
         install_init("destructor");
-        server_.Post("/destructor/exchange",
+        server_.Post("/Test.v1/destructor/exchange",
                      [this](const httplib::Request&, httplib::Response& response) {
                          ++destructor_exchange_requests;
                          arrow_response(response, good_response_);
                      });
 
         install_init("cancel");
-        server_.Post("/cancel/exchange", [this](const httplib::Request& request,
-                                                httplib::Response& response) {
+        server_.Post("/Test.v1/cancel/exchange", [this](const httplib::Request& request,
+                                                        httplib::Response& response) {
             ++cancel_exchange_requests;
             try {
                 cancel_metadata_valid.store(request_has_cancel(request));
@@ -539,8 +548,8 @@ private:
         });
 
         install_init("codec-fallback");
-        server_.Post("/codec-fallback/exchange", [this](const httplib::Request& request,
-                                                        httplib::Response& response) {
+        server_.Post("/Test.v1/codec-fallback/exchange", [this](const httplib::Request& request,
+                                                                httplib::Response& response) {
             ++exchange_fallback_requests;
             if (request.get_header_value("Content-Encoding") == "zstd") {
                 response.status = 415;
@@ -588,6 +597,7 @@ HttpClientError require_http_client_error(Function&& function, const std::string
 void test_request_preflight(const FaultServer& server, const std::string& origin) {
     HttpClientConfig config;
     config.prefix = "";
+    config.protocol = "Test.v1";
     config.max_request_bytes = 1;
     HttpClient client(origin, config);
     (void)require_http_client_error([&] { (void)client.call("preflight", empty_request()); },
@@ -608,6 +618,7 @@ void test_encoded_request_cap(const FaultServer& server, const std::string& orig
 
     HttpClientConfig config;
     config.prefix = "";
+    config.protocol = "Test.v1";
     config.max_request_bytes = static_cast<int64_t>(raw.size());
     // The fastest zstd mode emits this deliberately tiny, literal-heavy frame
     // slightly larger than its Arrow input.  That pins the post-compression
@@ -626,6 +637,7 @@ void test_response_caps(FaultServer& server, const std::string& origin,
                         const std::shared_ptr<arrow::Schema>& schema) {
     HttpClientConfig config;
     config.prefix = "";
+    config.protocol = "Test.v1";
     config.max_response_bytes = 8 * 1024 * 1024;
     config.accepted_max_response_bytes = 64 * 1024;
     HttpClient client(origin, config);
@@ -657,6 +669,7 @@ void test_compression(FaultServer& server, const std::string& origin,
                       const std::shared_ptr<arrow::Schema>& schema) {
     HttpClientConfig config;
     config.prefix = "";
+    config.protocol = "Test.v1";
     config.max_encoded_response_bytes = 64 * 1024;
     config.max_decoded_response_bytes = 1024 * 1024;
     HttpClient client(origin, config);
@@ -669,6 +682,7 @@ void test_compression(FaultServer& server, const std::string& origin,
 
     HttpClientConfig decoded_cap;
     decoded_cap.prefix = "";
+    decoded_cap.protocol = "Test.v1";
     decoded_cap.max_encoded_response_bytes = 64 * 1024;
     decoded_cap.max_decoded_response_bytes = 64 * 1024;
     HttpClient decoded_limited(origin, decoded_cap);
@@ -681,6 +695,7 @@ void test_compression(FaultServer& server, const std::string& origin,
 
     HttpClientConfig encoded_cap;
     encoded_cap.prefix = "";
+    encoded_cap.protocol = "Test.v1";
     encoded_cap.max_encoded_response_bytes = 64 * 1024;
     encoded_cap.max_decoded_response_bytes = 1024 * 1024;
     HttpClient encoded_limited(origin, encoded_cap);
@@ -702,6 +717,7 @@ void test_compression_negotiation(FaultServer& server, const std::string& origin
                                   const std::shared_ptr<arrow::Schema>& schema) {
     HttpClientConfig config;
     config.prefix = "";
+    config.protocol = "Test.v1";
     HttpClient fallback(origin, config);
     auto spoofed = empty_request();
     spoofed.custom_metadata = std::make_shared<arrow::KeyValueMetadata>();
@@ -735,7 +751,8 @@ void test_post_retry_requires_idempotency(FaultServer& server, const std::string
     RetryPolicy policy;
     policy.initial_backoff = std::chrono::milliseconds(0);
     policy.retryable_status_codes = {503};
-    auto client = HttpClient::builder(origin).prefix("").retry_policy(policy).build();
+    auto client =
+        HttpClient::builder(origin).prefix("").protocol("Test.v1").retry_policy(policy).build();
     const auto error =
         require_http_client_error([&] { (void)client.call("post-retry", empty_request(), schema); },
                                   "non-idempotent POST status");
@@ -754,7 +771,8 @@ void test_producer_retry_requires_idempotency(FaultServer& server, const std::st
     RetryPolicy policy;
     policy.initial_backoff = std::chrono::milliseconds(0);
     policy.retryable_status_codes = {503};
-    auto client = HttpClient::builder(origin).prefix("").retry_policy(policy).build();
+    auto client =
+        HttpClient::builder(origin).prefix("").protocol("Test.v1").retry_policy(policy).build();
 
     auto default_session = client.open_producer("producer-retry", empty_request(), schema);
     const auto error = require_http_client_error([&] { (void)default_session.tick(); },
@@ -774,6 +792,7 @@ void test_capabilities_and_row_metadata(FaultServer& server, const std::string& 
                                         const std::shared_ptr<arrow::Schema>& schema) {
     HttpClientConfig config;
     config.prefix = "";
+    config.protocol = "Test.v1";
     HttpClient client(origin, config);
     const auto caps = client.capabilities();
     require(caps.accept_max_response_bytes_support,
@@ -801,6 +820,7 @@ void test_response_budget_support_is_mandatory(const std::shared_ptr<arrow::Sche
     FaultServer legacy(schema, false);
     HttpClientConfig config;
     config.prefix = "";
+    config.protocol = "Test.v1";
     HttpClient client(legacy.origin(), config);
     const auto error =
         require_http_client_error([&] { (void)client.call("ok", empty_request(), schema); },
@@ -817,6 +837,7 @@ void test_response_budget_support_is_required_on_every_response(
     const std::string& origin, const std::shared_ptr<arrow::Schema>& schema) {
     HttpClientConfig config;
     config.prefix = "";
+    config.protocol = "Test.v1";
     for (const std::string method : {"support-missing", "support-duplicate", "support-uppercase"}) {
         HttpClient client(origin, config);
         const auto error = require_http_client_error(
@@ -832,6 +853,7 @@ void test_advertised_response_budget_is_strict_and_bounds_decoded_bytes(
     FaultServer& server, const std::string& origin, const std::shared_ptr<arrow::Schema>& schema) {
     HttpClientConfig narrowed;
     narrowed.prefix = "";
+    narrowed.protocol = "Test.v1";
     narrowed.accepted_max_response_bytes = 512 * 1024;
     narrowed.max_encoded_response_bytes = 512 * 1024;
     narrowed.max_decoded_response_bytes = 1024 * 1024;
@@ -861,6 +883,7 @@ void test_response_headers(const std::string& origin,
                            const std::shared_ptr<arrow::Schema>& schema) {
     HttpClientConfig config;
     config.prefix = "";
+    config.protocol = "Test.v1";
     HttpClient client(origin, config);
 
     const auto encoding_error = require_http_client_error(
@@ -910,6 +933,7 @@ void test_pointer_metadata_sanitization(FaultServer& server, const std::string& 
                                         const std::shared_ptr<arrow::Schema>& schema) {
     HttpClientConfig config;
     config.prefix = "";
+    config.protocol = "Test.v1";
     HttpClient client(origin, config);
     auto metadata = std::make_shared<arrow::KeyValueMetadata>();
     for (const char* key :
@@ -930,6 +954,7 @@ void test_sticky_session_hardening(FaultServer& server, const std::string& origi
                                    const std::shared_ptr<arrow::Schema>& schema) {
     HttpClientConfig config;
     config.prefix = "";
+    config.protocol = "Test.v1";
     HttpClient client(origin, config);
     auto session = client.with_session_token();
     (void)session.call("sticky-open", empty_request(), schema);
@@ -977,6 +1002,7 @@ void test_sticky_session_hardening(FaultServer& server, const std::string& origi
     }
     HttpClientConfig credential_opt_in;
     credential_opt_in.prefix = "";
+    credential_opt_in.protocol = "Test.v1";
     credential_opt_in.allow_insecure_credentials = true;
     auto credential_client =
         HttpClient::builder(origin).config(std::move(credential_opt_in)).build();
@@ -1051,6 +1077,7 @@ void test_sticky_session_hardening(FaultServer& server, const std::string& origi
     std::atomic<int> auth_calls{0};
     auto callback_client = HttpClient::builder(origin)
                                .prefix("")
+                               .protocol("Test.v1")
                                .auth_callback([&](const HttpAuthRequest&) {
                                    ++auth_calls;
                                    std::this_thread::sleep_for(std::chrono::seconds(1));
@@ -1132,6 +1159,7 @@ void test_accepted_budget_controls_decoded_willingness(
     FaultServer server(schema);
     HttpClientConfig config;
     config.prefix = "";
+    config.protocol = "Test.v1";
     config.max_response_bytes = 256 * 1024 * 1024;
     config.max_encoded_response_bytes = 256 * 1024;
     config.accepted_max_response_bytes = 1024LL * 1024 * 1024;
@@ -1141,6 +1169,7 @@ void test_accepted_budget_controls_decoded_willingness(
 
     (void)HttpClient::builder(server.origin())
         .prefix("")
+        .protocol("Test.v1")
         .accepted_max_response_bytes(1024LL * 1024 * 1024)
         .build()
         .capabilities();
@@ -1149,6 +1178,7 @@ void test_accepted_budget_controls_decoded_willingness(
 
     (void)HttpClient::builder(server.origin())
         .prefix("")
+        .protocol("Test.v1")
         .accepted_max_response_bytes(192 * 1024)
         .response_limits(80 * 1024, 96 * 1024)
         .build()
@@ -1158,6 +1188,7 @@ void test_accepted_budget_controls_decoded_willingness(
 
     (void)HttpClient::builder(server.origin())
         .prefix("")
+        .protocol("Test.v1")
         .response_limits(80 * 1024, 96 * 1024)
         .accepted_max_response_bytes(192 * 1024)
         .build()
@@ -1167,6 +1198,7 @@ void test_accepted_budget_controls_decoded_willingness(
 
     (void)HttpClient::builder(server.origin())
         .prefix("")
+        .protocol("Test.v1")
         .accepted_max_response_bytes(192 * 1024)
         .response_limits(256 * 1024, 96 * 1024)
         .build()
@@ -1176,6 +1208,7 @@ void test_accepted_budget_controls_decoded_willingness(
 
     (void)HttpClient::builder(server.origin())
         .prefix("")
+        .protocol("Test.v1")
         .response_limits(256 * 1024, 96 * 1024)
         .accepted_max_response_bytes(192 * 1024)
         .build()
@@ -1188,6 +1221,7 @@ void test_ambiguous_exchange(FaultServer& server, const std::string& origin,
                              const std::shared_ptr<arrow::Schema>& schema) {
     HttpClientConfig config;
     config.prefix = "";
+    config.protocol = "Test.v1";
     HttpClient client(origin, config);
     auto session = client.open_exchange("ambiguous", empty_request(), schema, schema);
     (void)require_http_client_error(
@@ -1207,6 +1241,7 @@ void test_local_close_and_cancel(FaultServer& server, const std::string& origin,
                                  const std::shared_ptr<arrow::Schema>& schema) {
     HttpClientConfig config;
     config.prefix = "";
+    config.protocol = "Test.v1";
     HttpClient client(origin, config);
 
     {

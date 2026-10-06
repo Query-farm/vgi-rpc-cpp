@@ -341,6 +341,7 @@ TEST_CASE("the raw client resolves external pointers on its header and data stre
 
     std::vector<Message> logs;
     RpcClientOptions options;
+    options.protocol = "Test.v1";
     options.external_http = loopback_options();
     options.on_log = [&](const Message& message) { logs.push_back(message); };
 
@@ -384,6 +385,7 @@ TEST_CASE("a raw client with no external policy refuses pointer batches",
                    {AnnotatedBatch::with_metadata(make_empty_batch(value_schema()), metadata)});
 
     RpcClientOptions options;
+    options.protocol = "Test.v1";
     options.external_http = std::nullopt;
 
     auto output = unwrap(arrow::io::BufferOutputStream::Create());

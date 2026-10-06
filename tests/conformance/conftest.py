@@ -585,11 +585,19 @@ def conformance_transport_kind_probes() -> Iterator[
 # ---------------------------------------------------------------------------
 
 
-def client_driver() -> Any:
-    """The `ClientDriver` this run drives, or a skip if it is not built."""
+def client_driver(service: Any = None) -> Any:
+    """The `ClientDriver` this run drives, or a skip if it is not built.
+
+    *service* binds the proxy to a protocol other than ``ConformanceService``;
+    the driver's ``connect`` op carries that protocol's name as its routing key.
+    """
+    from vgi_rpc.conformance import ConformanceService
     from vgi_rpc.conformance.client_driver import ClientDriver
 
-    driver = ClientDriver.from_env(default=[str(_DEFAULT_DRIVER)])
+    driver = ClientDriver.from_env(
+        default=[str(_DEFAULT_DRIVER)],
+        service=service if service is not None else ConformanceService,
+    )
     binary = Path(driver.command[0])
     if not binary.is_absolute() or binary.is_file():
         return driver
@@ -600,6 +608,7 @@ def _driver_connection(
     request: pytest.FixtureRequest,
     param: str,
     on_log: Callable[..., None] | None,
+    service: Any = None,
 ) -> Any:
     """Open one driver-backed connection for a `conformance_conn` parameter."""
     from vgi_rpc.external import ExternalLocationConfig
@@ -631,7 +640,7 @@ def _driver_connection(
 
     @contextlib.contextmanager
     def _conn() -> Iterator[Any]:
-        proxy = client_driver().connect(
+        proxy = client_driver(service).connect(
             transport, target, on_log, external_config=external_config
         )
         try:
@@ -799,6 +808,79 @@ def conformance_conn(
         return http_connect(
             ConformanceService, f"http://127.0.0.1:{conformance_http_port}", on_log=on_log
         )
+
+    return factory
+
+
+@pytest.fixture
+def conformance_protocol_connector(
+    request: pytest.FixtureRequest,
+    cpp_transport: Any,
+) -> Callable[..., contextlib.AbstractContextManager[Any]]:
+    """Bind a proxy to *any* protocol on the worker a ``conformance_conn`` transport reaches.
+
+    The runner contract of ``MULTI_PROTOCOL_HOSTING.md`` §4:
+    ``connector(transport, protocol, on_log=None)``.  The proxy routes on
+    *protocol*'s wire name and talks to **the same worker** that transport
+    reaches, which is what lets one test hold a primary and a secondary proxy
+    and watch one method name resolve to two bindings.  In client role every
+    connection is the C++ client's, through the driver, bound to *protocol*.
+    """
+    from vgi_rpc.external import ExternalLocationConfig
+    from vgi_rpc.http import http_connect
+    from vgi_rpc.rpc import SubprocessTransport, _RpcProxy, connect, tcp_connect, unix_connect
+
+    def factory(
+        transport: str,
+        protocol: type,
+        on_log: Callable[..., None] | None = None,
+    ) -> contextlib.AbstractContextManager[Any]:
+        if CONFORMANCE_ROLE == "client":
+            return _driver_connection(request, transport, on_log, service=protocol)
+        if transport == "pipe":
+            return connect(protocol, stdio_server_argv(), on_log=on_log)
+        if transport == "subprocess":
+
+            @contextlib.contextmanager
+            def _shared() -> Iterator[Any]:
+                yield _RpcProxy(protocol, cpp_transport, on_log)
+
+            return _shared()
+        if transport == "shm":
+            from vgi_rpc.shm import ShmSegment
+
+            @contextlib.contextmanager
+            def _shm() -> Iterator[Any]:
+                segment = ShmSegment.create(64 * 1024 * 1024)
+                sub = SubprocessTransport(stdio_server_argv())
+                try:
+                    yield _RpcProxy(protocol, _ShmAdapter(sub, segment), on_log)
+                finally:
+                    sub.close()
+                    with contextlib.suppress(BufferError):
+                        segment.close()
+                    segment.unlink()
+
+            return _shm()
+        if transport == "http":
+            port: int = request.getfixturevalue("conformance_http_port")
+            return http_connect(protocol, f"http://127.0.0.1:{port}", on_log=on_log)
+        if transport == "http_externalize_always":
+            ext_port: int = request.getfixturevalue("conformance_http_externalize_always_port")
+            return http_connect(
+                protocol,
+                f"http://127.0.0.1:{ext_port}",
+                on_log=on_log,
+                external_location=ExternalLocationConfig(url_validator=None),
+            )
+        if transport == "unix":
+            return unix_connect(
+                protocol, request.getfixturevalue("conformance_unix_path"), on_log=on_log
+            )
+        if transport == "tcp":
+            host, tcp_port = request.getfixturevalue("conformance_tcp_addr")
+            return tcp_connect(protocol, host, tcp_port, on_log=on_log)
+        raise ValueError(f"no conformance transport named {transport!r}")
 
     return factory
 

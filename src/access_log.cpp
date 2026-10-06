@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "vgi_rpc/access_log.h"
+#include "vgi_rpc/errors.h"
 
 #include <nlohmann/json.hpp>
 
@@ -118,6 +119,12 @@ void AccessLogWriter::emit(const AccessRecord& rec) {
     j["error_type"] = rec.error_type;
     if (rec.status == "error") {
         j["error_message"] = rec.error_message.empty() ? std::string("error") : rec.error_message;
+        // What an operator alerts on ("page on UNAVAILABLE"): the code the
+        // client received.  A site that did not record one is classified the
+        // way the wire would have been, from its type; absent on success.
+        j["error_code"] = rec.error_code.empty()
+                              ? std::string(code_name(default_error_code(rec.error_type, "")))
+                              : rec.error_code;
     }
     if (!rec.request_id.empty()) {
         // Must equal the X-Request-ID the response carried.  An id that
@@ -160,7 +167,10 @@ void AccessLogWriter::emit(const AccessRecord& rec) {
         for (const char* key : kEnvelopeKeys) {
             if (j.contains(key)) s[key] = j[key];
         }
-        if (rec.status == "error") s["error_message"] = j["error_message"];
+        if (rec.status == "error") {
+            s["error_message"] = j["error_message"];
+            s["error_code"] = j["error_code"];
+        }
         s["truncated"] = "record_too_large";
         line = s.dump();
     }

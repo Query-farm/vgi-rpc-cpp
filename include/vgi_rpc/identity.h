@@ -12,6 +12,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include "vgi_rpc/errors.h"
 #include "vgi_rpc/export.h"
 
 namespace vgi_rpc {
@@ -107,9 +108,14 @@ struct VGI_RPC_EXPORT PeerIdentityResult {
     static PeerIdentityResult available(PeerIdentity identity);
 };
 
-class VGI_RPC_EXPORT PeerIdentityUnavailable : public std::runtime_error {
+// The peer-identity spelling of the transport-auth "could not find out" error.
+// An `AuthUnavailableError`, so the HTTP transport answers both with 503 and
+// the error's own `Retry-After`, and an identity hook that lets one escape is
+// translated to `identity_unavailable` like any other.
+class VGI_RPC_EXPORT PeerIdentityUnavailable : public AuthUnavailableError {
 public:
-    using std::runtime_error::runtime_error;
+    explicit PeerIdentityUnavailable(const std::string& what, int retry_after = 5)
+        : AuthUnavailableError("PeerIdentityUnavailable", what, retry_after) {}
 };
 class VGI_RPC_EXPORT PeerIdentityRejected : public std::runtime_error {
 public:

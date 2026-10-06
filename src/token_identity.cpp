@@ -313,6 +313,23 @@ std::set<std::string> IdentityImpl::offered_methods() const {
     return offered;
 }
 
+namespace {
+
+/// Translate the transport-auth "could not find out" into `identity_unavailable`.
+///
+/// A hook calling the same backing store an authenticator does throws what an
+/// authenticator throws when that store is down.  Left untranslated it reaches
+/// the wire with no kind, and a caller can no longer tell an outage from a
+/// refusal -- the one distinction this protocol's error kinds exist to carry.
+/// The retry hint is kept, never replaced with a default: the store that is
+/// down is the one that knows how long (WIRE_PROTOCOL.md §16).
+IdentityUnavailableError identity_unavailable_from(const AuthUnavailableError& e) {
+    return IdentityUnavailableError(e.detail().empty() ? std::string(e.what()) : e.detail(),
+                                    e.retry_after());
+}
+
+}  // namespace
+
 TokenIdentity IdentityImpl::introspect_token(const std::string& token, const AuthContext& auth) {
     // The belt to method-level narrowing's braces: the method is not hosted
     // when the hook is absent, and refuses for a caller that reached it anyway.
@@ -332,7 +349,12 @@ TokenIdentity IdentityImpl::introspect_token(const std::string& token, const Aut
     (void)check_introspector(auth, principals_);
     reject_jws_shaped(token);
 
-    auto identity = resolve_token_(token);
+    std::optional<TokenIdentity> identity;
+    try {
+        identity = resolve_token_(token);
+    } catch (const AuthUnavailableError& e) {
+        throw identity_unavailable_from(e);
+    }
     if (!identity.has_value()) {
         // Uniform with malformed and expired: reporting which would confirm
         // that a guessed credential exists.
@@ -349,7 +371,11 @@ IssuedGrant IdentityImpl::issue_grant(const std::string& purpose,
     // The subject is the caller, never a parameter: cross-subject minting is
     // closed by construction rather than by a check that could be forgotten in
     // one of several ports.
-    return mint_grant_(auth.principal.value_or(""), purpose, scopes, ttl_seconds);
+    try {
+        return mint_grant_(auth.principal.value_or(""), purpose, scopes, ttl_seconds);
+    } catch (const AuthUnavailableError& e) {
+        throw identity_unavailable_from(e);
+    }
 }
 
 // The protocol surface
@@ -431,7 +457,7 @@ bool Server::serve_identity(const std::shared_ptr<arrow::io::OutputStream>& outp
         VGI_RPC_THROW_NOT_OK(output->Flush());
         if (!identity_binding_.name.empty()) {
             log_framework_call(identity_binding_, method_name, request_id, request_batch, t0, type,
-                               message);
+                               message, code_name(default_error_code(type, kind)));
         }
         return true;
     };
@@ -451,9 +477,10 @@ bool Server::serve_identity(const std::shared_ptr<arrow::io::OutputStream>& outp
             if (!available.empty()) available += ", ";
             available += "'" + name + "'";
         }
-        return fail("AttributeError", std::string("Protocol '") + kIdentityProtocolName +
-                                          "' has no method '" + method_name + "'. Available: [" +
-                                          available + "]");
+        return fail("MethodNotImplementedError",
+                    std::string("Protocol '") + kIdentityProtocolName + "' has no method '" +
+                        method_name + "'. Available: [" + available + "]",
+                    ERROR_KIND_METHOD_NOT_IMPLEMENTED);
     }
 
     const auto& info = identity_methods_.at(method_name);
@@ -483,7 +510,15 @@ bool Server::serve_identity(const std::shared_ptr<arrow::io::OutputStream>& outp
         // these are protocol methods rather than HTTP statuses: a caller that
         // negative-caches a transient failure locks out valid users, and one
         // that retries a definitive rejection hammers the worker.
-        return fail(exception_type_of(e), e.what(), error_kind_of(e));
+        // The exception's whole error model rides: code, kind and details --
+        // `identity_unavailable` MUST carry its RetryInfo.
+        if (errored != nullptr) *errored = true;
+        auto err = Result::error(empty_schema(), e, server_id_, request_id);
+        write_ipc_stream(output, empty_schema(), {err.annotated_batch()});
+        VGI_RPC_THROW_NOT_OK(output->Flush());
+        log_framework_call(identity_binding_, method_name, request_id, request_batch, t0,
+                           exception_type_of(e), e.what(), code_name(error_code_of(e)));
+        return true;
     }
 
     arrow::BinaryBuilder builder;

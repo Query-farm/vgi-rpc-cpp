@@ -147,10 +147,13 @@ struct HttpClientConfig {
     // Sent on every request. Native clients default to 256 MiB. Appended for
     // positional aggregate source compatibility.
     int64_t accepted_max_response_bytes = 256LL * 1024 * 1024;
-    // Routing key of the protocol this client addresses. When set, application
-    // methods are posted to {prefix}/{protocol}/{method} and carry
-    // vgi_rpc.protocol; reserved __name__ methods, being server-level surface
-    // owned by no protocol, stay flat and carry no key either way.
+    // Routing key of the protocol this client addresses. Application methods
+    // are posted to {prefix}/{protocol}/{method} and carry vgi_rpc.protocol;
+    // reserved __name__ methods, being server-level surface owned by no
+    // protocol, stay flat and carry no key. Required for application calls:
+    // there is no flat fallback (WIRE_PROTOCOL.md §3.1), so an application
+    // call without one throws std::invalid_argument before anything is sent.
+    // Reflection, capabilities and health need none.
     //
     // Empty keeps the flat {prefix}/{method} shape a peer that predates
     // multi-service routing serves. Appended, again, for positional aggregate
@@ -226,19 +229,21 @@ private:
     std::string www_authenticate_;
 };
 
-class VGI_RPC_EXPORT RpcRemoteError : public HttpClientError {
+/// A remote EXCEPTION batch received over HTTP.  The error model
+/// (WIRE_PROTOCOL.md §8) comes from `RemoteStatus`; see `RpcException`.
+class VGI_RPC_EXPORT RpcRemoteError : public HttpClientError, public RemoteStatus {
 public:
     RpcRemoteError(std::string exception_type, std::string message, std::string error_kind,
                    std::string server_id, std::string request_id, int http_status = 200);
+    RpcRemoteError(std::string exception_type, std::string message, RemoteStatus status,
+                   std::string server_id, std::string request_id, int http_status = 200);
 
     const std::string& exception_type() const noexcept { return exception_type_; }
-    const std::string& error_kind() const noexcept { return error_kind_; }
     const std::string& server_id() const noexcept { return server_id_; }
     const std::string& request_id() const noexcept { return request_id_; }
 
 private:
     std::string exception_type_;
-    std::string error_kind_;
     std::string server_id_;
     std::string request_id_;
 };
@@ -246,6 +251,8 @@ private:
 class VGI_RPC_EXPORT HttpSessionLostError : public RpcRemoteError {
 public:
     HttpSessionLostError(std::string message, std::string error_kind, std::string server_id,
+                         std::string request_id, int http_status = 200);
+    HttpSessionLostError(std::string message, RemoteStatus status, std::string server_id,
                          std::string request_id, int http_status = 200);
 };
 

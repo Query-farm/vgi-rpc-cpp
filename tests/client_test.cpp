@@ -83,12 +83,17 @@ struct InjectedClient {
     std::shared_ptr<RecordingOutputStream> output;
     RpcClient client;
 
-    explicit InjectedClient(std::shared_ptr<arrow::Buffer> response,
-                            const RpcClientOptions& options = {})
+    explicit InjectedClient(std::shared_ptr<arrow::Buffer> response, RpcClientOptions options = {})
         : output(std::make_shared<RecordingOutputStream>()),
           client(ClientTransport::from_streams(
                      std::make_shared<arrow::io::BufferReader>(std::move(response)), output),
-                 options) {}
+                 with_protocol(std::move(options))) {}
+
+    // Every application request names its protocol; the fixtures address one.
+    static RpcClientOptions with_protocol(RpcClientOptions options) {
+        if (options.protocol.empty()) options.protocol = "Test.v1";
+        return options;
+    }
 };
 
 #ifndef _WIN32
@@ -160,6 +165,23 @@ int64_t value_of(const AnnotatedBatch& response) {
 
 }  // namespace
 
+TEST_CASE("an application call with no protocol is refused before anything is sent", "[client]") {
+    // WIRE_PROTOCOL.md §3.1: every request names its protocol; there is no
+    // unrouted fallback to fall back to.
+    auto output = std::make_shared<RecordingOutputStream>();
+    RpcClient client(
+        ClientTransport::from_streams(
+            std::make_shared<arrow::io::BufferReader>(arrow::Buffer::FromString("")), output),
+        RpcClientOptions{});
+    REQUIRE_THROWS_AS(client.call_unary("answer", make_empty_batch(empty_schema())),
+                      std::invalid_argument);
+    REQUIRE(output->bytes().empty());
+
+    auto http = HttpClient::builder("http://127.0.0.1:9").build();
+    REQUIRE_THROWS_AS(http.call("answer", AnnotatedBatch::data(make_empty_batch(empty_schema()))),
+                      std::invalid_argument);
+}
+
 TEST_CASE("raw unary client owns reserved request metadata and dispatches logs", "[client]") {
     auto log_md = std::make_shared<arrow::KeyValueMetadata>();
     log_md->Append(keys::LOG_LEVEL, "INFO");
@@ -195,6 +217,7 @@ TEST_CASE("raw unary client owns reserved request metadata and dispatches logs",
     REQUIRE(request->batches.size() == 1);
     const auto& metadata = request->batches[0].custom_metadata;
     REQUIRE(get_metadata_value(metadata, keys::METHOD) == "answer");
+    REQUIRE(get_metadata_value(metadata, keys::PROTOCOL) == "Test.v1");
     REQUIRE(get_metadata_value(metadata, keys::REQUEST_VERSION) == REQUEST_VERSION_VALUE);
     REQUIRE(get_metadata_value(metadata, keys::PROTOCOL_VERSION) == "2026-08");
     REQUIRE(get_metadata_value(metadata, keys::REQUEST_ID).size() == 32);
@@ -387,6 +410,7 @@ TEST_CASE("negotiated SHM externalizes exchange input and releases its allocatio
     });
 
     RpcClientOptions client_options;
+    client_options.protocol = "Test.v1";
     client_options.shared_memory_bytes = 1024 * 1024;
     auto socket_owner = std::make_shared<SocketOwner>(sockets[0]);
     RpcClient client(
@@ -639,6 +663,7 @@ TEST_CASE("HTTP SOCKS5h sends unresolved origins only to the proxy and bounds he
 
     HttpClientConfig config;
     config.prefix = "";
+    config.protocol = "Test.v1";
     config.compression_level = std::nullopt;
     config.tcp_proxy = "socks5h://127.0.0.1:" + std::to_string(ntohs(address.sin_port));
     auto http_client =

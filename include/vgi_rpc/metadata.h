@@ -77,6 +77,12 @@ inline constexpr const char* CALL_STATE_B64 = "vgi_rpc.call_state#b64";
 // a sticky-aware client must recognize.
 inline constexpr const char* ERROR_KIND = "vgi_rpc.error_kind";
 
+// The other two layers of the error model (WIRE_PROTOCOL.md §8), EXCEPTION
+// batches only: the canonical code's *name*, required on every one, and a JSON
+// array of typed details, at most 4 KiB and omitted whole when larger.
+inline constexpr const char* ERROR_CODE = "vgi_rpc.error_code";
+inline constexpr const char* ERROR_DETAILS = "vgi_rpc.error_details";
+
 }  // namespace keys
 
 // Well-known error_kind values.
@@ -88,6 +94,11 @@ inline constexpr const char* ERROR_KIND_METHOD_NOT_IMPLEMENTED = "method_not_imp
 // and a capability probe reads both.
 inline constexpr const char* ERROR_KIND_PROTOCOL_NOT_SUPPORTED = "protocol_not_supported";
 inline constexpr const char* ERROR_KIND_PROTOCOL_NOT_SPECIFIED = "protocol_not_specified";
+inline constexpr const char* ERROR_KIND_PROTOCOL_VERSION_MISMATCH = "protocol_version_mismatch";
+
+/// The prefix reserved for framework protocols.  No application protocol may
+/// be registered under it, however its name was derived (WIRE_PROTOCOL.md §3.1).
+inline constexpr const char* kReservedProtocolPrefix = "vgi_rpc.";
 
 /// The wire name of the reflection protocol.
 ///

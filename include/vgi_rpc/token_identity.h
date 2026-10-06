@@ -162,8 +162,14 @@ class VGI_RPC_EXPORT IdentityUnavailableError : public KindedError {
 public:
     explicit IdentityUnavailableError(const std::string& detail = "",
                                       int retry_after = kDefaultIdentityRetryAfter)
-        : KindedError("identity_unavailable", "IdentityUnavailableError",
-                      detail.empty() ? "identity lookup unavailable" : detail),
+        : KindedError(
+              "identity_unavailable", "IdentityUnavailableError",
+              detail.empty() ? "identity lookup unavailable" : detail, Code::UNAVAILABLE,
+              // Required on this kind (WIRE_PROTOCOL.md §16).  The hint
+              // sat on this class in every port and reached the wire in
+              // none, so a caller learned the failure was transient and
+              // then had to guess when to ask again.
+              nlohmann::json::array({RetryInfo{static_cast<double>(retry_after)}.to_json()})),
           detail_(detail),
           retry_after_(retry_after) {}
 
@@ -280,8 +286,9 @@ struct VGI_RPC_EXPORT IssuedGrant {
 };
 
 /// `(token) -> TokenIdentity`.  An empty optional means the store answered and
-/// the credential is unknown; throw `IdentityUnavailableError` for "not
-/// knowable".
+/// the credential is unknown; throw `IdentityUnavailableError` -- or the
+/// transport-auth `AuthUnavailableError`, which the framework translates to it
+/// with the same retry hint -- for "not knowable".
 using ResolveTokenHook = std::function<std::optional<TokenIdentity>(const std::string& token)>;
 
 /// `(principal, purpose, scopes, ttl_seconds) -> IssuedGrant`.

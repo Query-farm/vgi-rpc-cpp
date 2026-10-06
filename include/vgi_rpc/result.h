@@ -18,6 +18,7 @@
 #include <arrow/util/key_value_metadata.h>
 
 #include "vgi_rpc/annotated_batch.h"
+#include "vgi_rpc/errors.h"
 #include "vgi_rpc/export.h"
 #include "vgi_rpc/external.h"
 
@@ -28,10 +29,24 @@ namespace vgi_rpc {
 // `error_kind`, when non-empty, is the machine-readable class a client
 // branches on (e.g. "session_lost"); `exception_type` stays the human-facing
 // name.  See docs/sticky-sessions-spec.md §6.
+//
+// Every batch it builds carries the error model (WIRE_PROTOCOL.md §8):
+// `vgi_rpc.error_code` always -- `extras.code`, or the framework table's code
+// for the type and kind when that is empty, `UNKNOWN` when unclassified --
+// and `vgi_rpc.error_details` when `extras.details` is non-empty and obeys the
+// catalog rules and the 4 KiB cap (dropped whole otherwise).  All three are
+// mirrored into `log_extra`.  `extras.traceback`, when non-empty, rides as
+// `log_extra.traceback`; callers decide per transport whether to pass one.
 VGI_RPC_EXPORT std::shared_ptr<arrow::KeyValueMetadata> make_error_metadata(
     const std::string& exception_type, const std::string& message,
     const std::string& server_id = "", const std::string& request_id = "",
-    const std::string& error_kind = "");
+    const std::string& error_kind = "", const ErrorExtras& extras = ErrorExtras{});
+
+// The error batch metadata for a caught exception: its type, message, kind,
+// code and details, plus `traceback` when non-empty.
+VGI_RPC_EXPORT std::shared_ptr<arrow::KeyValueMetadata> make_exception_metadata(
+    const std::exception& e, const std::string& server_id, const std::string& request_id,
+    const std::string& traceback = "");
 
 class VGI_RPC_EXPORT Result {
 public:
@@ -57,7 +72,13 @@ public:
     // Error result (0-row batch with EXCEPTION metadata)
     static Result error(std::shared_ptr<arrow::Schema> schema, const std::string& exception_type,
                         const std::string& message, const std::string& server_id = "",
-                        const std::string& request_id = "", const std::string& error_kind = "");
+                        const std::string& request_id = "", const std::string& error_kind = "",
+                        const ErrorExtras& extras = ErrorExtras{});
+
+    // Error result for a caught exception, carrying its whole error model.
+    static Result error(std::shared_ptr<arrow::Schema> schema, const std::exception& e,
+                        const std::string& server_id, const std::string& request_id,
+                        const std::string& traceback = "");
 
     const AnnotatedBatch& annotated_batch() const noexcept { return batch_; }
     const std::shared_ptr<arrow::Schema>& schema() const;

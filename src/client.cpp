@@ -75,14 +75,23 @@ std::shared_ptr<arrow::KeyValueMetadata> request_metadata(
     const std::shared_ptr<arrow::KeyValueMetadata>& extras,
     const std::shared_ptr<ShmSegment>& shm) {
     if (method.empty()) throw std::invalid_argument("RPC method must not be empty");
+    // Every application request names its protocol (WIRE_PROTOCOL.md §3.1);
+    // there is no unrouted fallback.  Refused here, before anything is
+    // written, so a misconfigured client fails with this message rather than
+    // with a server's protocol_not_specified.  Reserved `__name__` methods are
+    // server-level and carry no key.
+    if (protocol.empty() && !is_reserved_method(method)) {
+        throw std::invalid_argument(
+            "RpcClient: no protocol configured for '" + method +
+            "': every application request must name the protocol it addresses "
+            "(WIRE_PROTOCOL.md §3.1). Set RpcClientOptions::protocol.");
+    }
     auto metadata = copy_metadata(extras);
     strip_transport_controls(metadata);
     // Framework-owned keys win over caller extras so a caller cannot make the
     // request id logged locally disagree with the one sent on the wire.
     replace_metadata(metadata, keys::METHOD, method);
-    if (!protocol.empty() && !is_reserved_method(method)) {
-        replace_metadata(metadata, keys::PROTOCOL, protocol);
-    }
+    if (!is_reserved_method(method)) replace_metadata(metadata, keys::PROTOCOL, protocol);
     replace_metadata(metadata, keys::REQUEST_VERSION, REQUEST_VERSION_VALUE);
     replace_metadata(metadata, keys::REQUEST_ID, random_hex(32));
     // A configured protocol_version wins, as every other framework-owned key
@@ -107,11 +116,13 @@ RpcException remote_exception(const AnnotatedBatch& response) {
     const std::string message =
         get_metadata_value(response.custom_metadata, keys::LOG_MESSAGE, "remote RPC exception");
     std::string exception_type = "RemoteError";
+    nlohmann::json extra_object = nlohmann::json::object();
     const std::string extra = get_metadata_value(response.custom_metadata, keys::LOG_EXTRA);
     if (!extra.empty()) {
         try {
             const auto object = nlohmann::json::parse(extra);
             if (object.is_object()) {
+                extra_object = object;
                 if (const auto it = object.find("exception_type");
                     it != object.end() && it->is_string()) {
                     exception_type = it->get<std::string>();
@@ -122,8 +133,11 @@ RpcException remote_exception(const AnnotatedBatch& response) {
             // promise that LOG_EXTRA was parseable on exception envelopes.
         }
     }
+    // Every raw-transport decode path (unary, stream init, stream turn,
+    // external) funnels through here, so this is the one place the error
+    // model is read.  Top-level keys first, the log_extra mirror as fallback.
     return RpcException(exception_type, message,
-                        get_metadata_value(response.custom_metadata, keys::ERROR_KIND),
+                        decode_remote_status(response.custom_metadata.get(), extra_object),
                         get_metadata_value(response.custom_metadata, keys::SERVER_ID),
                         get_metadata_value(response.custom_metadata, keys::REQUEST_ID));
 }
@@ -493,9 +507,15 @@ public:
 
 RpcException::RpcException(std::string exception_type, std::string message, std::string error_kind,
                            std::string server_id, std::string request_id)
+    : RpcException(std::move(exception_type), std::move(message),
+                   RemoteStatus("", std::move(error_kind), nlohmann::json::array()),
+                   std::move(server_id), std::move(request_id)) {}
+
+RpcException::RpcException(std::string exception_type, std::string message, RemoteStatus status,
+                           std::string server_id, std::string request_id)
     : std::runtime_error(std::move(message)),
+      RemoteStatus(std::move(status)),
       exception_type_(std::move(exception_type)),
-      error_kind_(std::move(error_kind)),
       server_id_(std::move(server_id)),
       request_id_(std::move(request_id)) {}
 

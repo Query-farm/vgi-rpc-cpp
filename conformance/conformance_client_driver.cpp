@@ -203,16 +203,27 @@ json schema_b64(const std::shared_ptr<arrow::Schema>& schema) {
 // the client decoded and never translated into a C++ class name.
 // ---------------------------------------------------------------------------
 
-json error_object(const std::string& error_type, const std::string& message) {
-    return json{{"error_type", error_type}, {"error_message", message}, {"traceback", ""}};
+json error_object(const std::string& error_type, const std::string& message,
+                  const RemoteStatus* remote = nullptr) {
+    // The error model is relayed exactly as the client library decoded it --
+    // never defaulted or normalised here.  `""` (the server sent no code) and
+    // `"UNKNOWN"` (it sent that) are different answers, and a driver that
+    // filled one in would hide the client defect this field exists to catch.
+    json object{{"error_type", error_type},
+                {"error_message", message},
+                {"traceback", remote != nullptr ? remote->remote_traceback() : std::string()},
+                {"error_code", remote != nullptr ? remote->error_code() : std::string()},
+                {"error_kind", remote != nullptr ? remote->error_kind() : std::string()},
+                {"error_details", remote != nullptr ? remote->error_details() : json::array()}};
+    return object;
 }
 
 json error_from_exception(const std::exception& error) {
     if (const auto* remote = dynamic_cast<const RpcRemoteError*>(&error)) {
-        return error_object(remote->exception_type(), remote->what());
+        return error_object(remote->exception_type(), remote->what(), remote);
     }
     if (const auto* raw = dynamic_cast<const RpcException*>(&error)) {
-        return error_object(raw->exception_type(), raw->what());
+        return error_object(raw->exception_type(), raw->what(), raw);
     }
     if (const auto* kinded = dynamic_cast<const KindedError*>(&error)) {
         return error_object(kinded->exception_type(), kinded->what());

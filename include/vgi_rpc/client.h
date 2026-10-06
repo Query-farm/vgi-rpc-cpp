@@ -28,6 +28,7 @@
 #include "vgi_rpc/annotated_batch.h"
 #include "vgi_rpc/client_description.h"
 #include "vgi_rpc/client_external.h"
+#include "vgi_rpc/errors.h"
 #include "vgi_rpc/export.h"
 #include "vgi_rpc/log.h"
 
@@ -227,19 +228,25 @@ VGI_RPC_EXPORT std::string native_iroh_endpoint_id(const IrohTransportOptions& o
 
 /// A remote exception envelope, preserving both human- and machine-readable
 /// fields from the wire.
-class VGI_RPC_EXPORT RpcException : public std::runtime_error {
+///
+/// The error model (WIRE_PROTOCOL.md §8) comes from `RemoteStatus`:
+/// `error_code()`, `error_kind()`, `error_details()`, the typed accessors
+/// (`retry_info()`, `bad_request()`, ...) and `is_retryable()`.  Nothing in
+/// this client retries an RPC error automatically; `is_retryable()` is a
+/// classification for the caller's own policy.
+class VGI_RPC_EXPORT RpcException : public std::runtime_error, public RemoteStatus {
 public:
     RpcException(std::string exception_type, std::string message, std::string error_kind = {},
                  std::string server_id = {}, std::string request_id = {});
+    RpcException(std::string exception_type, std::string message, RemoteStatus status,
+                 std::string server_id, std::string request_id);
 
     const std::string& exception_type() const noexcept { return exception_type_; }
-    const std::string& error_kind() const noexcept { return error_kind_; }
     const std::string& server_id() const noexcept { return server_id_; }
     const std::string& request_id() const noexcept { return request_id_; }
 
 private:
     std::string exception_type_;
-    std::string error_kind_;
     std::string server_id_;
     std::string request_id_;
 };
@@ -254,8 +261,11 @@ struct RpcClientOptions {
     /// `(protocol, method)`. Reserved `__name__` methods are server-level
     /// surface owned by no protocol and carry no key.
     ///
-    /// Empty sends no key at all -- the pre-multi-service shape, which is
-    /// still what a peer that has not been migrated expects.
+    /// Required for application calls: there is no unrouted fallback
+    /// (WIRE_PROTOCOL.md §3.1), so an application call on a client with no
+    /// protocol throws `std::invalid_argument` before anything is sent.
+    /// Reflection (`list_protocols`, `describe`) and reserved methods need
+    /// none.
     std::string protocol;
     std::string protocol_version;
     ClientLogHandler on_log;

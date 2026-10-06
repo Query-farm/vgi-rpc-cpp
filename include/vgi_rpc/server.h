@@ -73,6 +73,73 @@ struct VGI_RPC_EXPORT ProtocolIdentity {
 VGI_RPC_EXPORT void fill_request_data(const AccessLogWriter& log, AccessRecord& rec,
                                       const std::shared_ptr<arrow::RecordBatch>& batch);
 
+/// One application protocol's method table, before it is hosted.
+///
+/// The unit of hosting: a server hosts any number of these, each a
+/// `(name, version, implementation)` triple whose implementation is the
+/// handlers registered here.  `ServerBuilder` registers its primary through the
+/// same methods (`ServerBuilder::add_unary` and friends delegate to a
+/// `ProtocolBuilder`), and `ServerBuilder::add_protocol` hosts further ones
+/// beside it.
+///
+/// There is no API for hosting a subset of a protocol's methods, and none for
+/// capability tokens: the protocol is the unit of optionality
+/// (WIRE_PROTOCOL.md §3.1).  A capability that may be absent is its own
+/// protocol, which a client discovers through `list_protocols`.
+class VGI_RPC_EXPORT ProtocolBuilder {
+public:
+    /// `name` is the routing key (`MyService.v2`; the major belongs in the
+    /// name).  `version`, when non-empty, is canonical semver and gates every
+    /// call to this protocol -- and only this protocol (WIRE_PROTOCOL.md §13).
+    explicit ProtocolBuilder(std::string name = "", std::string version = "");
+
+    ProtocolBuilder& add_unary(const std::string& name,
+                               std::shared_ptr<arrow::Schema> params_schema,
+                               std::shared_ptr<arrow::Schema> result_schema,
+                               std::function<Result(const Request&, CallContext&)> handler,
+                               const std::string& doc = "");
+
+    ProtocolBuilder& add_void(const std::string& name, std::shared_ptr<arrow::Schema> params_schema,
+                              std::function<void(const Request&, CallContext&)> handler,
+                              const std::string& doc = "");
+
+    ProtocolBuilder& add_producer(const std::string& name,
+                                  std::shared_ptr<arrow::Schema> params_schema,
+                                  std::shared_ptr<arrow::Schema> output_schema,
+                                  std::function<Stream(const Request&, CallContext&)> factory,
+                                  const std::string& doc = "",
+                                  std::shared_ptr<arrow::Schema> header_schema = nullptr);
+
+    ProtocolBuilder& add_exchange(const std::string& name,
+                                  std::shared_ptr<arrow::Schema> params_schema,
+                                  std::shared_ptr<arrow::Schema> input_schema,
+                                  std::shared_ptr<arrow::Schema> output_schema,
+                                  std::function<Stream(const Request&, CallContext&)> factory,
+                                  const std::string& doc = "",
+                                  std::shared_ptr<arrow::Schema> header_schema = nullptr);
+
+    const std::string& name() const noexcept { return name_; }
+    const std::string& version() const noexcept { return version_; }
+    const std::vector<MethodInfo>& methods() const noexcept { return methods_; }
+
+private:
+    friend class ServerBuilder;
+    void check_duplicate(const std::string& name) const;
+
+    std::string name_;
+    std::string version_;
+    std::vector<MethodInfo> methods_;
+};
+
+/// One protocol a built server hosts: its routing key, declared version,
+/// method table, and canonical digest.
+struct VGI_RPC_EXPORT HostedProtocol {
+    std::string name;
+    std::string version;
+    std::unordered_map<std::string, MethodInfo> methods;
+    ProtocolIdentity binding;
+};
+
 class VGI_RPC_EXPORT ServerBuilder {
 public:
     ServerBuilder() = default;
@@ -138,6 +205,29 @@ public:
     // hosted, and the protocol hash narrows with them.
     ServerBuilder& identity(std::shared_ptr<IdentityImpl> impl);
 
+    // Host one more application protocol beside the primary.
+    //
+    // Any number may be added; they are fixed when `build()` runs and hosted
+    // on every transport the server is offered on, so reflection output and
+    // every protocol hash are stable for the server's life.  `list_protocols`
+    // lists application protocols in registration order, the primary first.
+    // Each is versioned, gated and hashed independently.
+    //
+    // `build()` refuses: a name under the reserved `vgi_rpc.` prefix (for the
+    // primary too), a name registered twice, a malformed name or version, and
+    // additional protocols on a server whose primary declared no name (it
+    // would have no routing key to tell them apart by).
+    ServerBuilder& add_protocol(ProtocolBuilder protocol);
+
+    // Whether EXCEPTION batches carry `log_extra.traceback`, on every
+    // transport.  Included by default everywhere (WIRE_PROTOCOL.md §8): the
+    // DuckDB extension puts the remote traceback into the user-visible error,
+    // and omitting it hid chained causes.  `false` turns it off on all
+    // transports at once.  C++ exceptions capture no stack, so the traceback
+    // is synthesized: the `protocol/method` that raised and `Type: message`.
+    // The exception type, message, code, kind and details are sent either way.
+    ServerBuilder& include_tracebacks(bool include);
+
     // Declare the application protocol surface version (canonical semver
     // MAJOR.MINOR.PATCH).  Reported by `vgi_rpc.Reflection.v1` as
     // `protocol_version` so version-aware clients can discover it.
@@ -159,13 +249,16 @@ public:
     std::unique_ptr<Server> build();
 
 private:
-    void check_duplicate(const std::string& name) const;
+    // Registration is sealed once `build()` has run: the server's protocol set
+    // is fixed before it can serve (WIRE_PROTOCOL.md §3.1), so a late call
+    // fails loudly rather than being silently dropped.
+    void check_not_built(const char* what) const;
 
-    std::vector<MethodInfo> methods_;
+    ProtocolBuilder primary_;
+    std::vector<ProtocolBuilder> extra_protocols_;
+    bool include_tracebacks_ = true;
     bool built_ = false;
-    std::string protocol_name_;
     std::string server_id_;
-    std::string protocol_version_;
     std::string access_log_path_;
     std::shared_ptr<IdentityImpl> identity_;
     bool transport_options_enabled_ = false;
@@ -205,7 +298,20 @@ public:
     void serve_tcp(const std::string& host, int port, const TcpServerOptions& options);
 
     const std::string& server_id() const noexcept { return server_id_; }
-    const std::string& protocol_name() const noexcept { return protocol_name_; }
+    /// The primary application protocol's name (empty when it declared none).
+    const std::string& protocol_name() const noexcept { return protocols_.front().name; }
+
+    /// Every application protocol this server hosts, in registration order,
+    /// the primary first.
+    const std::vector<HostedProtocol>& application_protocols() const noexcept { return protocols_; }
+
+    /// The hosted application protocol named `name`, or null.  Framework
+    /// protocols (`vgi_rpc.*`) are never returned: they are dispatched apart.
+    const HostedProtocol* find_protocol(const std::string& name) const noexcept;
+
+    /// Whether error batches carry a (synthesized) traceback -- the
+    /// `ServerBuilder::include_tracebacks` setting, true unless turned off.
+    bool include_tracebacks() const noexcept { return include_tracebacks_; }
 
     /// Serve one call to the co-hosted reflection protocol.
     ///
@@ -242,7 +348,9 @@ public:
     /// (`__transport_options__`, `__upload_url__`), which
     /// docs/access-log-spec.md §3 prescribes log the server's primary rather
     /// than merely tolerating it.
-    const ProtocolIdentity& application_binding() const noexcept { return application_binding_; }
+    const ProtocolIdentity& application_binding() const noexcept {
+        return protocols_.front().binding;
+    }
 
     /// The configured access-log writer, or nullptr when none was configured.
     ///
@@ -253,7 +361,11 @@ public:
     /// writer holds no protocol identity, and `AccessRecord` has no default
     /// constructor, so a caller still has to name a binding to build a record.
     AccessLogWriter* access_log() noexcept { return access_log_.get(); }
-    const std::unordered_map<std::string, MethodInfo>& methods() const noexcept { return methods_; }
+    /// The primary protocol's method table (plus the server-level reserved
+    /// `__name__` methods, which are registered alongside it).
+    const std::unordered_map<std::string, MethodInfo>& methods() const noexcept {
+        return protocols_.front().methods;
+    }
     // The reason a request's declared application protocol version is
     // incompatible with this server's, or empty when it is fine.
     //
@@ -264,6 +376,18 @@ public:
     // only — a patch release does not change the surface. A server that
     // declared no version enforces nothing.
     std::string protocol_version_error(
+        const std::shared_ptr<arrow::KeyValueMetadata>& custom_metadata) const;
+
+    // The same check against one hosted protocol's own declared version.  A
+    // protocol that declared none enforces nothing, whatever the others say.
+    std::string protocol_version_error(
+        const HostedProtocol& protocol,
+        const std::shared_ptr<arrow::KeyValueMetadata>& custom_metadata) const;
+
+    // The full error batch extras for a version mismatch on `protocol`: the
+    // `PreconditionFailure` naming the protocol and both versions.
+    ErrorExtras protocol_version_extras(
+        const HostedProtocol& protocol,
         const std::shared_ptr<arrow::KeyValueMetadata>& custom_metadata) const;
 
     // Returns false on EOF (clean shutdown), true when a request was served.
@@ -294,16 +418,19 @@ public:
     // when the method raised — the caller needs that to set X-VGI-RPC-Error,
     // which is the only thing distinguishing a failure from a result on a
     // response that is 200 either way.
-    bool serve_unary_http(const MethodInfo& method_info, const Request& request,
-                          const std::string& request_id,
+    //
+    // `owner` is the binding the method belongs to; its access record is filed
+    // under it.
+    bool serve_unary_http(const MethodInfo& method_info, const ProtocolIdentity& owner,
+                          const Request& request, const std::string& request_id,
                           const std::shared_ptr<arrow::io::OutputStream>& output, CallContext& ctx);
 
     // As above; `external_ref`, when supplied, reports whether the handler
     // answered with a pre-published ExternalRef.  The transport must then send
     // the pointer as written: it is never externalized again, and it uploaded
     // nothing to charge against the externalized-response cap.
-    bool serve_unary_http(const MethodInfo& method_info, const Request& request,
-                          const std::string& request_id,
+    bool serve_unary_http(const MethodInfo& method_info, const ProtocolIdentity& owner,
+                          const Request& request, const std::string& request_id,
                           const std::shared_ptr<arrow::io::OutputStream>& output, CallContext& ctx,
                           bool* external_ref);
 
@@ -318,11 +445,10 @@ private:
     // digest of every binding it hosts, which is the same value reflection
     // reports.  Passing one in is what let the access log carry a digest the
     // wire never advertised.
-    Server(std::unordered_map<std::string, MethodInfo> methods, std::string server_id,
-           std::string protocol_name, std::string protocol_version,
+    Server(std::vector<HostedProtocol> protocols, std::string server_id,
            const std::string& access_log_path, int64_t access_log_max_record_bytes,
            std::function<void(TransportKind)> on_serve_start,
-           std::shared_ptr<IdentityImpl> identity);
+           std::shared_ptr<IdentityImpl> identity, bool include_tracebacks);
 
     // Emit one access record for a unary call to a co-hosted framework
     // protocol.  `owner` is the binding that owns the method, never this
@@ -333,22 +459,23 @@ private:
                             const std::string& request_id,
                             const std::shared_ptr<arrow::RecordBatch>& request_batch,
                             std::chrono::steady_clock::time_point started,
-                            const std::string& error_type, const std::string& error_message);
+                            const std::string& error_type, const std::string& error_message,
+                            const std::string& error_code = "");
 
-    void serve_unary(const MethodInfo& method_info, const Request& request,
-                     const std::string& request_id,
+    void serve_unary(const MethodInfo& method_info, const ProtocolIdentity& owner,
+                     const Request& request, const std::string& request_id,
                      const std::shared_ptr<arrow::io::OutputStream>& output,
                      TransportKind transport_kind, const std::shared_ptr<ShmSegment>& call_shm,
                      const AuthContext& auth, const PeerEvidenceSet& peer_evidence);
 
-    bool serve_unary_impl(const MethodInfo& method_info, const Request& request,
-                          const std::string& request_id,
+    bool serve_unary_impl(const MethodInfo& method_info, const ProtocolIdentity& owner,
+                          const Request& request, const std::string& request_id,
                           const std::shared_ptr<arrow::io::OutputStream>& output, CallContext& ctx,
                           const std::shared_ptr<ShmSegment>& call_shm,
                           bool* external_ref = nullptr);
 
-    void serve_stream(const MethodInfo& method_info, const Request& request,
-                      const std::string& request_id,
+    void serve_stream(const MethodInfo& method_info, const ProtocolIdentity& owner,
+                      const Request& request, const std::string& request_id,
                       const std::shared_ptr<arrow::io::InputStream>& input,
                       const std::shared_ptr<arrow::io::OutputStream>& output,
                       TransportKind transport_kind, ConnectionState& connection,
@@ -374,10 +501,11 @@ private:
     void refresh_shm(ConnectionState& connection,
                      const std::shared_ptr<arrow::KeyValueMetadata>& custom_metadata);
 
-    std::unordered_map<std::string, MethodInfo> methods_;
+    // Every application protocol, in registration order; [0] is the primary.
+    // Never empty.
+    std::vector<HostedProtocol> protocols_;
     std::string server_id_;
-    std::string protocol_name_;
-    std::string protocol_version_;
+    bool include_tracebacks_ = true;
 
     // Every binding this server hosts, fingerprinted once at construction.
     //
@@ -387,7 +515,6 @@ private:
     // is usable as a registry key.  `identity_binding_.name` is empty when no
     // identity implementation was configured, because the protocol is then
     // absent rather than hosted-and-empty.
-    ProtocolIdentity application_binding_;
     ProtocolIdentity reflection_binding_;
     ProtocolIdentity identity_binding_;
     std::unordered_map<std::string, MethodInfo> identity_methods_;

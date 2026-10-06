@@ -80,7 +80,7 @@ static Result error(
     const std::string& request_id = "");
 ```
 
-Create an error result with EXCEPTION metadata. Typically you don't need this — throwing an exception from a handler is the preferred way to signal errors.
+Create an error result with EXCEPTION metadata. Typically you don't need this — throwing an exception from a handler is the preferred way to signal errors. See [Errors](errors.md) for the code, kind and details every error batch carries.
 
 ## Accessors
 
@@ -112,10 +112,12 @@ std::shared_ptr<arrow::KeyValueMetadata> make_error_metadata(
     const std::string& exception_type,
     const std::string& message,
     const std::string& server_id = "",
-    const std::string& request_id = "");
+    const std::string& request_id = "",
+    const std::string& error_kind = "",
+    const ErrorExtras& extras = ErrorExtras{});
 ```
 
-Build the standard error metadata used for both unary error results and mid-stream error batches.
+Build the standard error metadata used for both unary error results and mid-stream error batches. Every batch carries `vgi_rpc.error_code` (from `extras.code`, or the framework table's code for the type and kind, `UNKNOWN` when unclassified), `vgi_rpc.error_kind` when set, and `vgi_rpc.error_details` when the details obey the catalog rules and fit 4 KiB; all three are mirrored in `log_extra`.
 
 ## Example
 

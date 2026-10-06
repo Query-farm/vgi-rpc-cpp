@@ -38,6 +38,11 @@ namespace {
 
 constexpr const char* kArrowContentType = "application/vnd.apache.arrow.stream";
 
+// The protocol every client in this file addresses.  Every application request
+// must name it -- as the `{prefix}/{protocol}/{method}` path segment and as the
+// `vgi_rpc.protocol` metadata key -- so the fixture servers route nothing else.
+constexpr const char* kProtocol = "Test.v1";
+
 void require(bool condition, const std::string& message) {
     if (!condition) throw std::runtime_error(message);
 }
@@ -73,16 +78,41 @@ std::string request_id_from_arrow(const httplib::Request& request) {
     return get_metadata_value(contents->batches[0].custom_metadata, keys::REQUEST_ID);
 }
 
+std::string protocol_from_arrow(const httplib::Request& request) {
+    auto buffer = arrow::Buffer::FromString(request.body);
+    auto input = std::make_shared<arrow::io::BufferReader>(std::move(buffer));
+    try {
+        const auto contents = read_ipc_stream(input);
+        if (!contents || contents->batches.empty()) return {};
+        return get_metadata_value(contents->batches[0].custom_metadata, keys::PROTOCOL);
+    } catch (const std::exception&) {
+        return {};
+    }
+}
+
 class PlainFaultServer {
 public:
     explicit PlainFaultServer(std::shared_ptr<arrow::Schema> schema)
         : schema_(std::move(schema)), response_(unary_response(schema_, 17)) {
         install_handlers();
-        server_.set_post_routing_handler([](const httplib::Request&, httplib::Response& response) {
-            if (!response.has_header("VGI-Accept-Max-Response-Bytes-Support")) {
-                response.set_header("VGI-Accept-Max-Response-Bytes-Support", "true");
-            }
-        });
+        server_.set_post_routing_handler(
+            [this](const httplib::Request& request, httplib::Response& response) {
+                // Every POST must carry the protocol both ways: the path segment
+                // and the `vgi_rpc.protocol` metadata key.  Checked after routing,
+                // when the body has been read; a request whose missing segment
+                // sent it to a 404 has an unread body and is counted too.
+                if (request.method == "POST") {
+                    ++posts;
+                    const bool segment =
+                        request.path.find(std::string("/") + kProtocol + "/") != std::string::npos;
+                    if (!segment || protocol_from_arrow(request) != kProtocol) ++unrouted_posts;
+                }
+                if (!response.has_header("VGI-Accept-Max-Response-Bytes-Support")) {
+                    response.set_header("VGI-Accept-Max-Response-Bytes-Support", "true");
+                }
+            });
+        // As the real HTTP transport configures it.
+        server_.set_tcp_nodelay(true);
         port_ = server_.bind_to_any_port("127.0.0.1");
         if (port_ <= 0) throw std::runtime_error("failed to bind HTTP resilience server");
         thread_ = std::thread([this] { (void)server_.listen_after_bind(); });
@@ -96,6 +126,8 @@ public:
 
     std::string origin() const { return "http://127.0.0.1:" + std::to_string(port_); }
 
+    std::atomic<int> posts{0};
+    std::atomic<int> unrouted_posts{0};
     std::atomic<int> ok_requests{0};
     std::atomic<int> redirect_target_requests{0};
     std::atomic<int> retry_requests{0};
@@ -135,15 +167,16 @@ private:
                             response.status = 204;
                             response.set_header("VGI-Accept-Max-Response-Bytes-Support", "true");
                         });
-        server_.Post("/ok", [this](const httplib::Request&, httplib::Response& response) {
+        server_.Post("/Test.v1/ok", [this](const httplib::Request&, httplib::Response& response) {
             ++ok_requests;
             arrow_response(response);
         });
-        server_.Post("/large/ok", [this](const httplib::Request&, httplib::Response& response) {
-            ++ok_requests;
-            arrow_response(response);
-        });
-        server_.Post("/redirect", [](const httplib::Request&, httplib::Response& response) {
+        server_.Post("/large/Test.v1/ok",
+                     [this](const httplib::Request&, httplib::Response& response) {
+                         ++ok_requests;
+                         arrow_response(response);
+                     });
+        server_.Post("/Test.v1/redirect", [](const httplib::Request&, httplib::Response& response) {
             response.status = 307;
             response.set_header("Location", "/redirect-target");
             response.set_header("Retry-After", "9");
@@ -154,14 +187,14 @@ private:
                          ++redirect_target_requests;
                          arrow_response(response);
                      });
-        server_.Post("/auth", [](const httplib::Request&, httplib::Response& response) {
+        server_.Post("/Test.v1/auth", [](const httplib::Request&, httplib::Response& response) {
             response.status = 401;
             response.set_header("WWW-Authenticate", "Bearer realm=\"vgi\"");
             response.set_header("VGI-Auth-Reason", "expired");
             response.set_header("Retry-After", "7");
             response.set_content(std::string(16 * 1024, 'x'), "text/plain");
         });
-        server_.Post("/headers",
+        server_.Post("/Test.v1/headers",
                      [this](const httplib::Request& request, httplib::Response& response) {
                          call_headers_valid.store(
                              request.get_header_value("Authorization") == "Bearer dynamic" &&
@@ -171,7 +204,7 @@ private:
                          arrow_response(response);
                      });
         server_.Post(
-            "/retry", [this](const httplib::Request& request, httplib::Response& response) {
+            "/Test.v1/retry", [this](const httplib::Request& request, httplib::Response& response) {
                 const int attempt = retry_requests.fetch_add(1);
                 const std::string header_id = request.get_header_value("X-Request-ID");
                 const std::string arrow_id = request_id_from_arrow(request);
@@ -190,7 +223,7 @@ private:
                 }
                 arrow_response(response);
             });
-        server_.Post("/slow", [this](const httplib::Request&, httplib::Response& response) {
+        server_.Post("/Test.v1/slow", [this](const httplib::Request&, httplib::Response& response) {
             ++slow_requests;
             std::this_thread::sleep_for(std::chrono::milliseconds(300));
             arrow_response(response);
@@ -357,7 +390,7 @@ public:
             response.status = 204;
             response.set_header("VGI-Accept-Max-Response-Bytes-Support", "true");
         });
-        server_.Post("/ok", [this](const httplib::Request&, httplib::Response& response) {
+        server_.Post("/Test.v1/ok", [this](const httplib::Request&, httplib::Response& response) {
             response.set_content(response_, kArrowContentType);
         });
         port_ = server_.bind_to_any_port("127.0.0.1");
@@ -396,6 +429,7 @@ HttpClientError require_client_error(Function&& function, const std::string& con
 
 HttpClientBuilder plain_builder(const std::string& origin) {
     HttpClientConfig config;
+    config.protocol = kProtocol;
     config.prefix = "";
     config.compression_level = std::nullopt;
     config.allow_insecure_credentials = true;
@@ -435,6 +469,7 @@ void test_builder_errors_and_redirects(PlainFaultServer& server,
 
     HttpClientConfig limited_config;
     limited_config.prefix = "/large";
+    limited_config.protocol = kProtocol;
     limited_config.compression_level = std::nullopt;
     limited_config.max_encoded_response_bytes = 64 * 1024;
     limited_config.max_decoded_response_bytes = 64 * 1024;
@@ -569,6 +604,7 @@ void test_tls(const std::shared_ptr<arrow::Schema>& schema) {
         [&] {
             auto client = HttpClient::builder(server.origin())
                               .prefix("")
+                              .protocol(kProtocol)
                               .compression_level(std::nullopt)
                               .retry_policy(RetryPolicy::disabled())
                               .build();
@@ -580,6 +616,7 @@ void test_tls(const std::shared_ptr<arrow::Schema>& schema) {
 
     auto trusted = HttpClient::builder(server.origin())
                        .prefix("")
+                       .protocol(kProtocol)
                        .compression_level(std::nullopt)
                        .custom_ca_file(fixture.ca_file)
                        .build();
@@ -588,6 +625,7 @@ void test_tls(const std::shared_ptr<arrow::Schema>& schema) {
 
     auto insecure = HttpClient::builder(server.origin())
                         .prefix("")
+                        .protocol(kProtocol)
                         .compression_level(std::nullopt)
                         .dangerous_disable_tls_verification_for_testing()
                         .build();
@@ -600,6 +638,7 @@ void test_tls(const std::shared_ptr<arrow::Schema>& schema) {
         [&] {
             auto client = HttpClient::builder(mtls_server.origin())
                               .prefix("")
+                              .protocol(kProtocol)
                               .compression_level(std::nullopt)
                               .custom_ca_file(fixture.ca_file)
                               .retry_policy(RetryPolicy::disabled())
@@ -615,6 +654,7 @@ void test_tls(const std::shared_ptr<arrow::Schema>& schema) {
     auto mtls =
         HttpClient::builder(mtls_server.origin())
             .prefix("")
+            .protocol(kProtocol)
             .compression_level(std::nullopt)
             .custom_ca_file(fixture.ca_file)
             .client_certificate(fixture.client_certificate_file, fixture.client_private_key_file)
@@ -629,6 +669,30 @@ void test_tls(const std::shared_ptr<arrow::Schema>& schema) {
 
 }  // namespace
 
+// Back-to-back calls on one keep-alive connection must not each wait out a
+// delayed ACK.  cpp-httplib writes a request's headers and body with separate
+// send() calls; with Nagle on, the body sits in the kernel until the server's
+// delayed ACK (~40 ms on Linux) arrives.  That is invisible on one call and
+// dominant on a stream of small turns: the shared suite's 100-turn
+// zero-column exchange took ~5.5 s over this client against ~0.4 s on every
+// raw transport, and timed out.  The fix is TCP_NODELAY on the client socket;
+// this pins it with a bound an order of magnitude above the fixed cost and an
+// order of magnitude below the Nagle cost.
+void test_small_turns_are_not_delayed(PlainFaultServer& server,
+                                      const std::shared_ptr<arrow::Schema>& schema) {
+    auto client = plain_builder(server.origin()).retry_policy(RetryPolicy::disabled()).build();
+    (void)client.call("ok", empty_request(), schema);  // capability probe + connect
+    constexpr int kTurns = 100;
+    const auto started = std::chrono::steady_clock::now();
+    for (int i = 0; i < kTurns; ++i) (void)client.call("ok", empty_request(), schema);
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - started);
+    require(elapsed < std::chrono::milliseconds(1500),
+            std::to_string(kTurns) + " small keep-alive calls took " +
+                std::to_string(elapsed.count()) +
+                " ms; each is waiting on a delayed ACK (TCP_NODELAY not set on the client)");
+}
+
 int main() {
     try {
         const auto schema = value_schema();
@@ -637,6 +701,25 @@ int main() {
         test_auth_callback_and_call_options(server, schema);
         test_retry_ids(server, schema);
         test_deadline_cancel_and_recovery(server, schema);
+        test_small_turns_are_not_delayed(server, schema);
+        // Every POST above -- unary, retried, redirected, refused, timed out --
+        // named its protocol in the path and in the metadata.
+        require(server.posts.load() > 100 && server.unrouted_posts.load() == 0,
+                std::to_string(server.unrouted_posts.load()) + " of " +
+                    std::to_string(server.posts.load()) +
+                    " HTTP requests did not carry the protocol segment and routing key");
+        // And a client with no protocol refuses rather than falling back to a
+        // flat route.
+        auto unbound = HttpClient::builder(server.origin()).prefix("").build();
+        const int before = server.posts.load();
+        bool refused = false;
+        try {
+            (void)unbound.call("ok", empty_request(), schema);
+        } catch (const std::invalid_argument&) {
+            refused = true;
+        }
+        require(refused && server.posts.load() == before,
+                "a client with no protocol sent a request instead of refusing");
         test_tls(schema);
     } catch (const std::exception& error) {
         std::cerr << "native HTTP resilience regression failed: " << error.what() << "\n";

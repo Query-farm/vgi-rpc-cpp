@@ -8,6 +8,7 @@ exchanges over VGI-RPC's HTTP transport.
 
 auto client = vgi_rpc::HttpClient::builder("https://rpc.example.com")
                   .prefix("/vgi")
+                  .protocol("MyService.v1")  // required for application calls
                   .custom_ca_file("/etc/my-company/ca.pem")
                   .auth_callback([](const vgi_rpc::HttpAuthRequest&) {
                       return std::map<std::string, std::string>{
@@ -42,10 +43,13 @@ and defaulted ones default: a version-mismatched client calls reflection to
 learn *what* mismatched, so the decoder must survive minor skew.
 
 `protocol` on `HttpClientConfig` (or `HttpClientBuilder::protocol()`) is the
-routing key. When set, application methods are posted to
-`{prefix}/{protocol}/{method}` and carry `vgi_rpc.protocol`; reserved
-`__name__` methods stay flat. Leave it empty for a peer that predates
-multi-service routing.
+routing key, and every application request carries it (WIRE_PROTOCOL §3.1):
+methods are posted to `{prefix}/{protocol}/{method}` and carry
+`vgi_rpc.protocol`. There is no flat `{prefix}/{method}` fallback; an
+application call on a client with no protocol throws `std::invalid_argument`
+before anything is sent. Reserved `__name__` methods (`__upload_url__`, ...)
+stay flat by design, and reflection, `capabilities()` and health need no
+protocol.
 
 ## HTTPS and authentication
 

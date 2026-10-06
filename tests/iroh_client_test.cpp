@@ -151,6 +151,7 @@ TEST_CASE("typed HTTP client reuses its state machine over an Iroh provider") {
                       .iroh_transport_provider(provider)
                       .iroh_transport_options(transport_options)
                       .compression_level(std::nullopt)
+                      .protocol("Test.v1")
                       .header("Authorization", "Bearer secret")
                       .build();
     const auto capabilities = client.capabilities();
@@ -163,7 +164,7 @@ TEST_CASE("typed HTTP client reuses its state machine over an Iroh provider") {
     CHECK(authorization_seen);
     REQUIRE(paths.size() == 2);
     CHECK(paths[0] == "OPTIONS /api/v1/health");
-    CHECK(paths[1] == "POST /api/v1/answer");
+    CHECK(paths[1] == "POST /api/v1/Test.v1/answer");
 }
 
 TEST_CASE("HTTP-over-Iroh rejects a mismatched authenticated peer") {

@@ -128,6 +128,16 @@ std::shared_ptr<arrow::KeyValueMetadata> request_metadata(
     const std::shared_ptr<arrow::KeyValueMetadata>& original, const std::string& method,
     const std::string& protocol, const std::string& protocol_version,
     const std::string& request_id) {
+    // Every application request names its protocol (WIRE_PROTOCOL.md §3.1),
+    // in the path and in the metadata; there is no flat fallback.  Refused
+    // before anything is sent.  Reserved `__name__` methods are server-level
+    // and carry no key.
+    if (protocol.empty() && !is_reserved_method(method)) {
+        throw std::invalid_argument(
+            "HttpClient: no protocol configured for '" + method +
+            "': every application request must name the protocol it addresses "
+            "(WIRE_PROTOCOL.md §3.1). Set HttpClientBuilder::protocol().");
+    }
     // `sanitized_metadata` strips every transport key, protocol_version among
     // them.  A configured version replaces it below; an unconfigured client
     // restores whatever the caller supplied, because the peer's version gate
@@ -144,11 +154,8 @@ std::shared_ptr<arrow::KeyValueMetadata> request_metadata(
     replace_metadata(metadata, keys::REQUEST_VERSION, REQUEST_VERSION_VALUE);
     replace_metadata(metadata, keys::REQUEST_ID, request_id);
     // The routing key names the protocol the request addresses. Reserved names
-    // belong to no protocol and carry none; an unconfigured protocol sends none
-    // either, which is what a peer predating multi-service routing expects.
-    if (!protocol.empty() && !is_reserved_method(method)) {
-        replace_metadata(metadata, keys::PROTOCOL, protocol);
-    }
+    // belong to no protocol and carry none.
+    if (!is_reserved_method(method)) replace_metadata(metadata, keys::PROTOCOL, protocol);
     if (!protocol_version.empty()) {
         replace_metadata(metadata, keys::PROTOCOL_VERSION, protocol_version);
     }
@@ -347,23 +354,29 @@ enum class ResponseShape {
     const auto& metadata = batch.custom_metadata;
     std::string message = get_metadata_value(metadata, keys::LOG_MESSAGE, "remote RPC error");
     std::string exception_type = "RpcError";
-    std::string error_kind = get_metadata_value(metadata, keys::ERROR_KIND);
+    nlohmann::json extra_object = nlohmann::json::object();
     const std::string extra = get_metadata_value(metadata, keys::LOG_EXTRA);
     if (!extra.empty()) {
         try {
             const auto parsed = nlohmann::json::parse(extra);
-            exception_type = parsed.value("exception_type", exception_type);
-            if (error_kind.empty()) error_kind = parsed.value("error_kind", std::string());
+            if (parsed.is_object()) {
+                extra_object = parsed;
+                exception_type = parsed.value("exception_type", exception_type);
+            }
         } catch (const std::exception&) {
         }
     }
+    // Every HTTP decode path -- unary, stream init, turn, an externalized
+    // error -- reaches the EXCEPTION batch through here, so this is the one
+    // place the error model is read.
+    RemoteStatus remote = decode_remote_status(metadata.get(), extra_object);
     const std::string server_id = get_metadata_value(metadata, keys::SERVER_ID);
     const std::string request_id = get_metadata_value(metadata, keys::REQUEST_ID);
     if (exception_type == "SessionLostError") {
-        throw HttpSessionLostError(std::move(message), std::move(error_kind), server_id, request_id,
+        throw HttpSessionLostError(std::move(message), std::move(remote), server_id, request_id,
                                    status);
     }
-    throw RpcRemoteError(std::move(exception_type), std::move(message), std::move(error_kind),
+    throw RpcRemoteError(std::move(exception_type), std::move(message), std::move(remote),
                          server_id, request_id, status);
 }
 
@@ -1130,6 +1143,13 @@ public:
                                       "failed to initialize HTTP/TLS client", 0, {}, {});
             }
             client->set_keep_alive(config.keep_alive);
+            // cpp-httplib sends a request's headers and body in separate
+            // writes and leaves Nagle on by default, so on a kept-alive
+            // connection every small request waits out the server's delayed
+            // ACK (~40 ms on Linux) before its body leaves.  A stream of small
+            // exchange turns then runs ~50 ms per turn.  The server side has
+            // set this all along; the raw socket clients do too.
+            client->set_tcp_nodelay(true);
             client->set_follow_location(false);
             client->set_decompress(false);
             client->set_connection_timeout(config.connection_timeout_seconds);
@@ -1994,14 +2014,19 @@ public:
                method + suffix;
     }
 
-    /// The route for an application method.
+    /// The route for an application method: always `{prefix}/{protocol}/{method}`.
     ///
-    /// Falls back to the flat `{prefix}/{method}` when no protocol is
-    /// configured -- the pre-multi-service shape, which is still what a peer
-    /// that has not been migrated serves.  Reserved `__name__` methods are
-    /// server-level surface owned by no protocol and stay flat either way.
+    /// There is no flat fallback (WIRE_PROTOCOL.md §3.1); `request_metadata`
+    /// has already refused an application call with no protocol, and this
+    /// refuses again so no path can be built without one.  Reserved
+    /// `__name__` methods (`__upload_url__`, ...) are server-level surface
+    /// owned by no protocol and stay flat by design.
     std::string method_path(const std::string& method, const char* suffix = "") const {
-        if (config.protocol.empty() || is_reserved_method(method)) return path(method, suffix);
+        if (is_reserved_method(method)) return path(method, suffix);
+        if (config.protocol.empty()) {
+            throw std::invalid_argument("HttpClient: no protocol configured for '" + method +
+                                        "'; set HttpClientBuilder::protocol()");
+        }
         return protocol_path(config.protocol, method, suffix);
     }
 
@@ -2194,14 +2219,20 @@ private:
 RpcRemoteError::RpcRemoteError(std::string exception_type, std::string message,
                                std::string error_kind, std::string server_id,
                                std::string request_id, int http_status)
+    : RpcRemoteError(std::move(exception_type), std::move(message),
+                     RemoteStatus("", std::move(error_kind), nlohmann::json::array()),
+                     std::move(server_id), std::move(request_id), http_status) {}
+
+RpcRemoteError::RpcRemoteError(std::string exception_type, std::string message, RemoteStatus status,
+                               std::string server_id, std::string request_id, int http_status)
     // The peer's message verbatim, not `type + ": " + message`.  The class is
     // already on `exception_type()`, the raw transports' `RpcException` carries
     // the message unadorned, and the peer's own message routinely begins with
     // its class name -- so composing here produced `ValueError: ValueError: ...`
     // over HTTP and `ValueError: ...` over a pipe for one and the same error.
     : HttpClientError(HttpClientErrorKind::REMOTE, message, http_status, {}, request_id),
+      RemoteStatus(std::move(status)),
       exception_type_(std::move(exception_type)),
-      error_kind_(std::move(error_kind)),
       server_id_(std::move(server_id)),
       request_id_(std::move(request_id)) {}
 
@@ -2209,6 +2240,12 @@ HttpSessionLostError::HttpSessionLostError(std::string message, std::string erro
                                            std::string server_id, std::string request_id,
                                            int http_status)
     : RpcRemoteError("SessionLostError", std::move(message), std::move(error_kind),
+                     std::move(server_id), std::move(request_id), http_status) {}
+
+HttpSessionLostError::HttpSessionLostError(std::string message, RemoteStatus status,
+                                           std::string server_id, std::string request_id,
+                                           int http_status)
+    : RpcRemoteError("SessionLostError", std::move(message), std::move(status),
                      std::move(server_id), std::move(request_id), http_status) {}
 
 class HttpClientBuilder::Impl {

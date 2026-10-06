@@ -46,8 +46,7 @@ namespace {
 
 constexpr const char* kProtocol = "RefProbe";
 constexpr const char* kUrl = "https://objects.example/published/catalog.arrow";
-const std::string kDigest =
-    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+const std::string kDigest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
 std::shared_ptr<arrow::Schema> result_schema() {
     return arrow::schema({arrow::field("result", arrow::utf8(), /*nullable=*/false)});
@@ -131,10 +130,9 @@ std::unique_ptr<Server> make_ref_server() {
     builder.add_unary("ref", empty_schema(), result_schema(), [](const Request&, CallContext&) {
         return Result::from_external_ref(ExternalRef(kUrl, kDigest));
     });
-    builder.add_unary("ref_no_digest", empty_schema(), result_schema(),
-                      [](const Request&, CallContext&) {
-                          return Result::from_external_ref(ExternalRef(kUrl));
-                      });
+    builder.add_unary(
+        "ref_no_digest", empty_schema(), result_schema(),
+        [](const Request&, CallContext&) { return Result::from_external_ref(ExternalRef(kUrl)); });
     builder.add_unary("value", empty_schema(), result_schema(), [](const Request&, CallContext&) {
         return Result::value(string_batch({"inline"}));
     });
@@ -228,8 +226,7 @@ TEST_CASE("ExternalRef validates its url and digest", "[external-ref]") {
     CHECK(with != without);
 }
 
-TEST_CASE("ExternalRef's pointer batch carries the digest only when it has one",
-          "[external-ref]") {
+TEST_CASE("ExternalRef's pointer batch carries the digest only when it has one", "[external-ref]") {
     check_pointer(ExternalRef(kUrl, kDigest).pointer_batch(result_schema()), kUrl, kDigest);
     check_pointer(ExternalRef(kUrl).pointer_batch(result_schema()), kUrl, std::nullopt);
 }
@@ -284,14 +281,12 @@ TEST_CASE("publish_external compresses with zstd and hashes the raw bytes", "[ex
     CHECK(ref.sha256() == sha256_hex(raw));
 }
 
-TEST_CASE("publish_external refuses anything but one row, and unknown codings",
-          "[external-ref]") {
+TEST_CASE("publish_external refuses anything but one row, and unknown codings", "[external-ref]") {
     RecordingStorage storage;
     CHECK_THROWS_AS(publish_external(string_batch({}), storage), std::invalid_argument);
     CHECK_THROWS_AS(publish_external(string_batch({"a", "b"}), storage), std::invalid_argument);
     CHECK_THROWS_AS(publish_external(nullptr, storage), std::invalid_argument);
-    CHECK_THROWS_AS(publish_external(string_batch({"a"}), storage, "gzip"),
-                    std::invalid_argument);
+    CHECK_THROWS_AS(publish_external(string_batch({"a"}), storage, "gzip"), std::invalid_argument);
     CHECK(storage.uploads.empty());
 }
 

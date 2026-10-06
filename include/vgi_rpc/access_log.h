@@ -50,6 +50,9 @@ struct AccessRecord {
     std::string status = "ok";  // "ok" | "error"
     std::string error_type;     // "" when status == "ok"
     std::string error_message;  // non-empty when status == "error"
+    // Canonical code name (WIRE_PROTOCOL.md §8) when status == "error"; empty
+    // lets the writer derive it from error_type.  Never emitted on success.
+    std::string error_code;
     double duration_ms = 0.0;
     std::string request_id;        // per-request correlation id
     std::string stream_id;         // 32 lowercase hex; set when is_stream

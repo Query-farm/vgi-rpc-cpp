@@ -7,7 +7,9 @@ Unix sockets, and trusted-network TCP.
 ```cpp
 #include <vgi_rpc/client.h>
 
-auto client = vgi_rpc::RpcClient::spawn({"python", "worker.py"});
+vgi_rpc::RpcClientOptions options;
+options.protocol = "MyService.v1";  // the routing key; required for application calls
+auto client = vgi_rpc::RpcClient::spawn({"python", "worker.py"}, options);
 auto service = client.describe();
 auto result = client.call_unary("add", params);
 
@@ -21,9 +23,11 @@ The client is dynamic and schema-first: callers build exact Arrow record
 batches and receive owned `AnnotatedBatch` values. `list_protocols()` and
 `describe()` speak `vgi_rpc.Reflection.v1`; `describe()` validates the reply
 rather than returning a partial model when the peer supplies malformed schemas
-or duplicate methods. Set `RpcClientOptions::protocol` to the routing key the
-peer hosts its methods under -- a server hosting more than one protocol needs
-it to resolve `(protocol, method)`.
+or duplicate methods. `RpcClientOptions::protocol` is the routing key the
+peer hosts its methods under. Every application request carries it
+(WIRE_PROTOCOL §3.1); an application call on a client without one throws
+`std::invalid_argument` before anything is sent. Reflection and reserved
+`__name__` methods need none.
 
 ## Transports
 

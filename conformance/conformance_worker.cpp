@@ -1601,6 +1601,80 @@ static std::shared_ptr<arrow::Schema> params(std::vector<std::shared_ptr<arrow::
 // language ports get a deterministic authenticated caller without each
 // standing up an identity provider.  It is a test fixture and must never be
 // deployed.
+// =========================================================================
+// conformance.Secondary.v1 -- the second application protocol every
+// conformance worker hosts (MULTI_PROTOCOL_HOSTING.md §2).
+//
+// Hosted through ServerBuilder::add_protocol, after ConformanceService, so
+// reflection lists it second.  `echo_string` repeats the primary's name and
+// signature and prefixes its reply, so a server that resolved on the bare
+// method name answers with a wrong value rather than a coincidentally right
+// one.  No protocol_version: a server gating every call against the
+// primary's 2.0.0 would refuse these.
+// =========================================================================
+namespace secondary_fixture {
+
+constexpr const char* kName = "conformance.Secondary.v1";
+constexpr const char* kEchoPrefix = "secondary:";
+constexpr const char* kProbeType = "conformance.Secondary.v1.Probe";
+constexpr size_t kOversizedPadding = 5000;
+
+nlohmann::json fail_details(double retry_delay_seconds) {
+    auto details = nlohmann::json::array();
+    details.push_back(ErrorInfo{{{"fixture", kName}}}.to_json());
+    if (retry_delay_seconds > 0) details.push_back(RetryInfo{retry_delay_seconds}.to_json());
+    // A legitimately protocol-defined type no client knows: clients keep the
+    // error and skip the detail.
+    details.push_back(nlohmann::json{{"@type", kProbeType},
+                                     {"note", "clients ignore detail types they do not know"}});
+    return details;
+}
+
+ProtocolBuilder protocol() {
+    ProtocolBuilder secondary(kName);
+    secondary.add_unary(
+        "echo_string", params({arrow::field("value", arrow::utf8())}), str_result_schema(),
+        [](const Request& req, CallContext&) -> Result {
+            arrow::StringBuilder builder;
+            VGI_RPC_THROW_NOT_OK(builder.Append(kEchoPrefix + req.get<std::string>("value")));
+            return Result::value(str_result_schema(), {unwrap(builder.Finish())});
+        },
+        "Echo with the prefix that makes a mis-route visible.");
+    secondary.add_void(
+        "fail",
+        params({arrow::field("code", arrow::utf8()), arrow::field("kind", arrow::utf8()),
+                arrow::field("retry_delay_seconds", arrow::float64())}),
+        [](const Request& req, CallContext&) {
+            const auto code_text = req.get<std::string>("code");
+            const auto kind = req.get<std::string>("kind");
+            const auto delay = req.get<double>("retry_delay_seconds");
+            const auto code = code_from_name(code_text);
+            if (!code) {
+                throw StatusError("'" + code_text + "' is not a canonical error code",
+                                  Code::INVALID_ARGUMENT, "invalid_code",
+                                  {BadRequest{{{"code", "must be a canonical code name"}}}});
+            }
+            std::string message = std::string(kName) + " fail: " + code_text;
+            if (!kind.empty()) message += " " + kind;
+            throw StatusError(message, *code, kind, fail_details(delay));
+        },
+        "Raise an error with the requested code, kind and the fixed details.");
+    secondary.add_void(
+        "fail_oversized", params({}),
+        [](const Request&, CallContext&) {
+            // RetryInfo first and small: a server that drops only the element
+            // that does not fit keeps it, and the error then reads retryable.
+            throw StatusError(
+                std::string(kName) + " fail_oversized: details exceed 4 KiB",
+                Code::RESOURCE_EXHAUSTED, "details_oversized",
+                {RetryInfo{1.0}, ErrorInfo{{{"padding", std::string(kOversizedPadding, 'x')}}}});
+        },
+        "Raise an error whose details exceed the 4 KiB cap.");
+    return secondary;
+}
+
+}  // namespace secondary_fixture
+
 namespace identity_fixture {
 
 constexpr const char* kIntrospectorPrincipal = "conformance-introspector";
@@ -1612,6 +1686,12 @@ constexpr int64_t kSubjectTtl = 300;
 
 constexpr const char* kTokenUnknown = "conformance-unknown-token";
 constexpr const char* kTokenUnavailable = "conformance-unavailable-token";
+constexpr int kUnavailableRetryAfter = 5;
+// Answered with this port's *transport-auth* unavailable error, which the
+// framework must translate to identity_unavailable keeping the hint.  7 is
+// nobody's default, so a port that substitutes its own is caught.
+constexpr const char* kTokenAuthUnavailable = "conformance-auth-unavailable-token";
+constexpr int kAuthUnavailableRetryAfter = 7;
 constexpr const char* kTokenZeroTtl = "conformance-zero-ttl-token";
 constexpr const char* kTokenMinimal = "conformance-minimal-token";
 constexpr const char* kTokenPaddedProbe = "  conformance-padded-probe  ";
@@ -1623,6 +1703,7 @@ constexpr double kGrantExpiresAt = 1893456000.0;  // 2030-01-01T00:00:00Z
 constexpr const char* kGrantId = "conformance-grant-id";
 constexpr const char* kRefusedPurpose = "conformance-refused";
 constexpr const char* kMinimalPurpose = "conformance-minimal";
+constexpr const char* kAuthUnavailablePurpose = "conformance-auth-unavailable";
 
 /// Resolve a credential under the fixed conformance policy.
 ///
@@ -1635,7 +1716,14 @@ std::optional<TokenIdentity> resolve_token(const std::string& token) {
     if (token == kTokenUnavailable) {
         // Transient, and distinct from a definitive rejection: a caller that
         // negative-caches "unknown" must not cache an outage.
-        throw IdentityUnavailableError("conformance: mapping store unreachable");
+        throw IdentityUnavailableError("conformance: mapping store unreachable",
+                                       kUnavailableRetryAfter);
+    }
+    if (token == kTokenAuthUnavailable) {
+        // The translation belongs in the framework, never here: throwing the
+        // identity error directly would pass while the rule stays unbuilt.
+        throw AuthUnavailableError("conformance: authority unreachable",
+                                   kAuthUnavailableRetryAfter);
     }
     if (token == kTokenUnknown) return std::nullopt;
     if (token == kTokenZeroTtl) {
@@ -1667,6 +1755,10 @@ std::optional<TokenIdentity> resolve_token(const std::string& token) {
 IssuedGrant mint_grant(const std::string& principal, const std::string& purpose,
                        const std::vector<std::string>& scopes, int64_t ttl_seconds) {
     (void)ttl_seconds;  // A request, not an instruction; `expires_at` is authoritative.
+    if (purpose == kAuthUnavailablePurpose) {
+        throw AuthUnavailableError("conformance: grant store unreachable",
+                                   kAuthUnavailableRetryAfter);
+    }
     if (purpose == kRefusedPurpose) {
         throw GrantRefusedError("conformance: this purpose is refused");
     }
@@ -2329,6 +2421,9 @@ int main(int argc, char** argv) {
         builder.protocol_version("2.0.0");
     }
     builder.protocol("ConformanceService");
+    // Through the public hosting API, not special-cased: the secondary is what
+    // makes multi-protocol hosting and the error model observable.
+    builder.add_protocol(secondary_fixture::protocol());
     // We implement SHM, so we must answer the handshake: a worker that stays
     // silent is treated as "no SHM" and clients never negotiate it.
     builder.enable_transport_options();

@@ -13,6 +13,7 @@
 #include "vgi_rpc/output_collector.h"
 #include "vgi_rpc/shm.h"
 #include "request_contract.h"
+#include "traceback_scope.h"
 
 #include <arrow/array.h>
 #include <arrow/compute/cast.h>
@@ -48,11 +49,18 @@ namespace {
 // Write an error batch to a mid-stream IPC writer
 void write_stream_error(const std::shared_ptr<arrow::ipc::RecordBatchWriter>& writer,
                         const std::shared_ptr<arrow::Schema>& schema,
-                        const std::string& exception_type, const std::string& message,
-                        const std::string& server_id, const std::string& request_id) {
+                        const std::string& exception_type, const std::exception& e,
+                        const std::string& server_id, const std::string& request_id,
+                        const std::string& traceback) {
     auto error_batch = make_empty_batch(schema);
-    auto md = make_error_metadata(exception_type, message, server_id, request_id);
+    auto md = make_error_metadata(exception_type, e.what(), server_id, request_id, error_kind_of(e),
+                                  error_extras_of(e, traceback));
     VGI_RPC_THROW_NOT_OK(writer->WriteRecordBatch(*error_batch, md));
+}
+
+// "Protocol/method", for a traceback's "in" line.
+std::string call_site(const ProtocolIdentity& owner, const std::string& method) {
+    return owner.name.empty() ? method : owner.name + "/" + method;
 }
 
 // Reconcile an inbound exchange batch to the declared input schema.  Strict on
@@ -129,7 +137,8 @@ void Server::log_framework_call(const ProtocolIdentity& owner, const std::string
                                 const std::string& request_id,
                                 const std::shared_ptr<arrow::RecordBatch>& request_batch,
                                 std::chrono::steady_clock::time_point started,
-                                const std::string& error_type, const std::string& error_message) {
+                                const std::string& error_type, const std::string& error_message,
+                                const std::string& error_code) {
     if (!access_log_ || !access_log_->enabled()) return;
     // `owner`, not this server's primary.  Reflection and identity are
     // protocols in their own right; filing their calls under the application's
@@ -143,6 +152,10 @@ void Server::log_framework_call(const ProtocolIdentity& owner, const std::string
     rec.status = error_type.empty() ? "ok" : "error";
     rec.error_type = error_type;
     rec.error_message = error_message;
+    if (!error_type.empty()) {
+        rec.error_code =
+            error_code.empty() ? code_name(default_error_code(error_type, "")) : error_code;
+    }
     rec.duration_ms = elapsed_ms_since(started);
     // A malformed request can be refused before a batch was ever decoded, and
     // a record with no payload beats no record at all.
@@ -214,9 +227,15 @@ bool Server::serve_reflection(const std::shared_ptr<arrow::io::OutputStream>& ou
 
     arrow::Result<std::string> payload = arrow::Status::Invalid("unreachable");
     if (method_name == "list_protocols") {
-        std::vector<ProtocolSummary> summaries{
-            ProtocolSummary{protocol_name_, protocol_version_, application_binding_.hash},
-            ProtocolSummary{kReflectionProtocolName, "", reflection_binding_.hash}};
+        // Application protocols in registration order, the primary first --
+        // the order is contract: a client's "describe this server" takes the
+        // first protocol outside the reserved prefix.
+        std::vector<ProtocolSummary> summaries;
+        for (const auto& protocol : protocols_) {
+            summaries.push_back(
+                ProtocolSummary{protocol.name, protocol.version, protocol.binding.hash});
+        }
+        summaries.push_back(ProtocolSummary{kReflectionProtocolName, "", reflection_binding_.hash});
         // Identity comes after reflection, so it appears in reflection's output
         // -- which is the whole reason a client can discover that this worker
         // resolves credentials, or mints grants, or does neither, without
@@ -235,9 +254,15 @@ bool Server::serve_reflection(const std::shared_ptr<arrow::io::OutputStream>& ou
                 }
             }
         }
-        if (requested == protocol_name_) {
-            payload = BuildServiceDescription(protocol_name_, protocol_version_,
-                                              application_binding_.hash, methods_);
+        const HostedProtocol* hosted_protocol =
+            requested.empty() ? nullptr : find_protocol(requested);
+        if (hosted_protocol == nullptr && requested == protocols_.front().name) {
+            hosted_protocol = &protocols_.front();
+        }
+        if (hosted_protocol != nullptr) {
+            payload =
+                BuildServiceDescription(hosted_protocol->name, hosted_protocol->version,
+                                        hosted_protocol->binding.hash, hosted_protocol->methods);
         } else if (requested == kReflectionProtocolName) {
             // Self-description is not special-cased: reflection reports the two
             // methods it answers, so a client that found it through
@@ -251,7 +276,9 @@ bool Server::serve_reflection(const std::shared_ptr<arrow::io::OutputStream>& ou
         } else {
             // Named, not silently empty: an empty description reads as "this
             // protocol has no methods".
-            std::string hosted = protocol_name_ + ", " + kReflectionProtocolName;
+            std::string hosted;
+            for (const auto& protocol : protocols_) hosted += protocol.name + ", ";
+            hosted += kReflectionProtocolName;
             if (hosts_identity) hosted += std::string(", ") + kIdentityProtocolName;
             return fail("RuntimeError", "This server does not host protocol '" + requested +
                                             "'. Hosted: [" + hosted + "]");
@@ -304,6 +331,7 @@ bool Server::serve_one_with_state(const std::shared_ptr<arrow::io::InputStream>&
                                   const AuthContext& auth, const PeerEvidenceSet& peer_evidence,
                                   std::function<void()> first_frame_complete) {
     notify_serve_start(transport_kind);
+    detail::ScopedTracebackPolicy traceback_policy(include_tracebacks_);
     // 1. Read request IPC stream
     auto contents_opt = read_ipc_stream(input);
     if (contents_opt && first_frame_complete) first_frame_complete();
@@ -320,6 +348,8 @@ bool Server::serve_one_with_state(const std::shared_ptr<arrow::io::InputStream>&
 
     // 2. Extract method name
     auto method_name = get_metadata_value(custom_metadata, keys::METHOD);
+    // The traceback names the binding only once dispatch has resolved it: a
+    // request-supplied protocol name must never reach an error message.
     if (method_name.empty()) {
         auto error_result = Result::error(
             empty_schema(), "ProtocolError",
@@ -356,6 +386,7 @@ bool Server::serve_one_with_state(const std::shared_ptr<arrow::io::InputStream>&
     // version-mismatched client calls to learn what mismatched, and gating it
     // would deny the client the diagnosis it came for.
     if (get_metadata_value(custom_metadata, keys::PROTOCOL) == kReflectionProtocolName) {
+        traceback_policy.set_where(std::string(kReflectionProtocolName) + "/" + method_name);
         return serve_reflection(output, method_name, batch, request_id);
     }
 
@@ -365,6 +396,7 @@ bool Server::serve_one_with_state(const std::shared_ptr<arrow::io::InputStream>&
     // this is a separate protocol that declares none, so gating it would refuse
     // identity calls over a version disagreement that says nothing about them.
     if (get_metadata_value(custom_metadata, keys::PROTOCOL) == kIdentityProtocolName) {
+        traceback_policy.set_where(std::string(kIdentityProtocolName) + "/" + method_name);
         return serve_identity(output, method_name, batch, request_id, auth);
     }
 
@@ -389,14 +421,18 @@ bool Server::serve_one_with_state(const std::shared_ptr<arrow::io::InputStream>&
     // server that declared no protocol name -- it has no key to match, and
     // exactly one namespace with no name for it.  `ServerBuilder::protocol()`
     // declares one and turns the check on.
-    if (IsApplicationMethod(method_name) && !protocol_name_.empty()) {
+    const HostedProtocol* target = &protocols_.front();
+    if (IsApplicationMethod(method_name) && !protocols_.front().name.empty()) {
         const std::string wire_protocol = get_metadata_value(custom_metadata, keys::PROTOCOL);
         if (wire_protocol.empty()) {
+            std::string hosted;
+            for (const auto& protocol : protocols_) hosted += "'" + protocol.name + "', ";
+            hosted += std::string("'") + kReflectionProtocolName + "'";
             auto error_result = Result::error(
                 empty_schema(), "ProtocolNotSpecifiedError",
                 "Request carries no 'vgi_rpc.protocol' routing key. Every request must name "
-                "the protocol it addresses. This server hosts: ['" +
-                    protocol_name_ + "', '" + kReflectionProtocolName + "']" +
+                "the protocol it addresses. This server hosts: [" +
+                    hosted + "]" +
                     (identity_ != nullptr ? std::string(" and '") + kIdentityProtocolName + "'"
                                           : std::string()) +
                     ".",
@@ -405,12 +441,21 @@ bool Server::serve_one_with_state(const std::shared_ptr<arrow::io::InputStream>&
             VGI_RPC_THROW_NOT_OK(output->Flush());
             return true;
         }
-        if (wire_protocol != protocol_name_) {
+        // Dispatch resolves the pair (protocol, method): the binding first,
+        // and the method only within it.  A name two protocols share reaches
+        // whichever one the request named.
+        target = find_protocol(wire_protocol);
+        if (target == nullptr) {
             // The request-supplied name is deliberately not echoed: a routing
             // failure must not be a way to get a chosen string into a log.
+            std::string hosted;
+            for (const auto& protocol : protocols_) {
+                if (!hosted.empty()) hosted += ", ";
+                hosted += "'" + protocol.name + "'";
+            }
             auto error_result = Result::error(
                 empty_schema(), "ProtocolNotSupportedError",
-                "This server does not host the named protocol. It hosts: '" + protocol_name_ + "'.",
+                "This server does not host the named protocol. It hosts: " + hosted + ".",
                 server_id_, request_id, ERROR_KIND_PROTOCOL_NOT_SUPPORTED);
             write_ipc_stream(output, empty_schema(), {error_result.annotated_batch()});
             VGI_RPC_THROW_NOT_OK(output->Flush());
@@ -418,14 +463,20 @@ bool Server::serve_one_with_state(const std::shared_ptr<arrow::io::InputStream>&
         }
     }
 
-    // 4. Application protocol version gate.
+    traceback_policy.set_where(target->name.empty() ? method_name
+                                                    : target->name + "/" + method_name);
+
+    // 4. Application protocol version gate, against the binding the request
+    // resolved to -- never the primary's version for every call.
     // The synthetic `__`-prefixed methods are exempt: they are framework
     // surface rather than the application's, so a disagreement about the
     // application's version says nothing about them.
     if (method_name.rfind("__", 0) != 0) {
-        if (auto reason = protocol_version_error(custom_metadata); !reason.empty()) {
-            auto error_result = Result::error(empty_schema(), "ProtocolVersionError", reason,
-                                              server_id_, request_id);
+        if (auto reason = protocol_version_error(*target, custom_metadata); !reason.empty()) {
+            auto error_result =
+                Result::error(empty_schema(), "ProtocolVersionError", reason, server_id_,
+                              request_id, ERROR_KIND_PROTOCOL_VERSION_MISMATCH,
+                              protocol_version_extras(*target, custom_metadata));
             write_ipc_stream(output, empty_schema(), {error_result.annotated_batch()});
             VGI_RPC_THROW_NOT_OK(output->Flush());
             return true;
@@ -433,8 +484,9 @@ bool Server::serve_one_with_state(const std::shared_ptr<arrow::io::InputStream>&
     }
 
     // 5. Look up handler
-    auto it = methods_.find(method_name);
-    if (it == methods_.end() && method_name == RETIRED_DESCRIBE_METHOD) {
+    const auto& methods = target->methods;
+    auto it = methods.find(method_name);
+    if (it == methods.end() && method_name == RETIRED_DESCRIBE_METHOD) {
         // Named explicitly because `__describe__` is *retired* rather than
         // merely absent, and from the caller's side those look identical while
         // needing opposite fixes -- update the client, or reconfigure the
@@ -450,9 +502,9 @@ bool Server::serve_one_with_state(const std::shared_ptr<arrow::io::InputStream>&
         VGI_RPC_THROW_NOT_OK(output->Flush());
         return true;
     }
-    if (it == methods_.end()) {
+    if (it == methods.end()) {
         std::vector<std::string> names;
-        for (const auto& [name, _] : methods_) {
+        for (const auto& [name, _] : methods) {
             names.push_back(name);
         }
         std::sort(names.begin(), names.end());
@@ -461,10 +513,13 @@ bool Server::serve_one_with_state(const std::shared_ptr<arrow::io::InputStream>&
             if (i > 0) available += ", ";
             available += "'" + names[i] + "'";
         }
+        // `method_not_implemented`: the protocol is hosted and lacks the
+        // method -- the capability-probe answer, distinct from an unhosted
+        // protocol.
         auto error_result = Result::error(
-            empty_schema(), "AttributeError",
+            empty_schema(), "MethodNotImplementedError",
             "Unknown method: '" + method_name + "'. Available methods: [" + available + "]",
-            server_id_, request_id);
+            server_id_, request_id, ERROR_KIND_METHOD_NOT_IMPLEMENTED);
         write_ipc_stream(output, empty_schema(), {error_result.annotated_batch()});
         VGI_RPC_THROW_NOT_OK(output->Flush());
         return true;
@@ -520,11 +575,11 @@ bool Server::serve_one_with_state(const std::shared_ptr<arrow::io::InputStream>&
     Request request(batch, custom_metadata);
 
     if (method_info.method_type == MethodType::UNARY) {
-        serve_unary(method_info, request, request_id, output, transport_kind, connection.call_shm,
-                    auth, peer_evidence);
+        serve_unary(method_info, target->binding, request, request_id, output, transport_kind,
+                    connection.call_shm, auth, peer_evidence);
     } else {
-        serve_stream(method_info, request, request_id, input, output, transport_kind, connection,
-                     auth, peer_evidence);
+        serve_stream(method_info, target->binding, request, request_id, input, output,
+                     transport_kind, connection, auth, peer_evidence);
     }
 
     // The region is dead once the handler has read its columns out.
@@ -551,29 +606,30 @@ void Server::refresh_shm(ConnectionState& connection,
     connection.shm_name = connection.shm ? name : std::string();
 }
 
-bool Server::serve_unary_http(const MethodInfo& method_info, const Request& request,
-                              const std::string& request_id,
+bool Server::serve_unary_http(const MethodInfo& method_info, const ProtocolIdentity& owner,
+                              const Request& request, const std::string& request_id,
                               const std::shared_ptr<arrow::io::OutputStream>& output,
                               CallContext& ctx) {
-    return serve_unary_impl(method_info, request, request_id, output, ctx, nullptr);
+    return serve_unary_impl(method_info, owner, request, request_id, output, ctx, nullptr);
 }
 
-bool Server::serve_unary_http(const MethodInfo& method_info, const Request& request,
-                              const std::string& request_id,
+bool Server::serve_unary_http(const MethodInfo& method_info, const ProtocolIdentity& owner,
+                              const Request& request, const std::string& request_id,
                               const std::shared_ptr<arrow::io::OutputStream>& output,
                               CallContext& ctx, bool* external_ref) {
-    return serve_unary_impl(method_info, request, request_id, output, ctx, nullptr, external_ref);
+    return serve_unary_impl(method_info, owner, request, request_id, output, ctx, nullptr,
+                            external_ref);
 }
 
-bool Server::serve_unary_impl(const MethodInfo& method_info, const Request& request,
-                              const std::string& request_id,
+bool Server::serve_unary_impl(const MethodInfo& method_info, const ProtocolIdentity& owner,
+                              const Request& request, const std::string& request_id,
                               const std::shared_ptr<arrow::io::OutputStream>& output,
                               CallContext& ctx, const std::shared_ptr<ShmSegment>& call_shm,
                               bool* external_ref) {
     auto t0 = std::chrono::steady_clock::now();
     auto log_sink = ctx.log_sink();
 
-    std::string status = "ok", error_type, error_message;
+    std::string status = "ok", error_type, error_message, error_code;
     Result result = Result::void_result();
     try {
         result = method_info.handler(request, ctx);
@@ -584,8 +640,12 @@ bool Server::serve_unary_impl(const MethodInfo& method_info, const Request& requ
         status = "error";
         error_type = exception_type_of(e);
         error_message = e.what();
-        result = Result::error(method_info.result_schema, error_type, e.what(), server_id_,
-                               request_id, error_kind_of(e));
+        error_code = code_name(error_code_of(e));
+        const std::string traceback =
+            include_tracebacks_
+                ? cpp_traceback(error_type, error_message, call_site(owner, method_info.name))
+                : std::string();
+        result = Result::error(method_info.result_schema, e, server_id_, request_id, traceback);
     }
 
     auto log_batches = log_sink->flush(method_info.result_schema);
@@ -618,13 +678,14 @@ bool Server::serve_unary_impl(const MethodInfo& method_info, const Request& requ
         // exception is `__transport_options__`, a framework endpoint owned by no
         // protocol -- which the spec says logs the server's primary, so it is
         // right here by prescription rather than by omission.
-        AccessRecord rec(application_binding_.name, application_binding_.hash);
+        AccessRecord rec(owner.name, owner.hash);
         rec.method = method_info.name;
         rec.request_id = request_id;
         rec.is_stream = false;
         rec.status = status;
         rec.error_type = error_type;
         rec.error_message = error_message;
+        rec.error_code = error_code;
         rec.duration_ms = elapsed_ms_since(t0);
         fill_request_data(*access_log_, rec, request.batch());
         access_log_->emit(rec);
@@ -632,19 +693,19 @@ bool Server::serve_unary_impl(const MethodInfo& method_info, const Request& requ
     return status == "error";
 }
 
-void Server::serve_unary(const MethodInfo& method_info, const Request& request,
-                         const std::string& request_id,
+void Server::serve_unary(const MethodInfo& method_info, const ProtocolIdentity& owner,
+                         const Request& request, const std::string& request_id,
                          const std::shared_ptr<arrow::io::OutputStream>& output,
                          TransportKind transport_kind, const std::shared_ptr<ShmSegment>& call_shm,
                          const AuthContext& auth, const PeerEvidenceSet& peer_evidence) {
     auto log_sink = std::make_shared<LogSink>(server_id_, request_id);
     CallContext ctx(log_sink, server_id_, request_id, transport_kind);
     ctx.set_identity(auth, peer_evidence);
-    serve_unary_impl(method_info, request, request_id, output, ctx, call_shm);
+    serve_unary_impl(method_info, owner, request, request_id, output, ctx, call_shm);
 }
 
-void Server::serve_stream(const MethodInfo& method_info, const Request& request,
-                          const std::string& request_id,
+void Server::serve_stream(const MethodInfo& method_info, const ProtocolIdentity& owner,
+                          const Request& request, const std::string& request_id,
                           const std::shared_ptr<arrow::io::InputStream>& input,
                           const std::shared_ptr<arrow::io::OutputStream>& output,
                           TransportKind transport_kind, ConnectionState& connection,
@@ -656,15 +717,30 @@ void Server::serve_stream(const MethodInfo& method_info, const Request& request,
 
     // Access-log state for the (single) record emitted at the normal end of the
     // stream.  Factory-init failures return early and are not logged.
-    std::string status = "ok", error_type, error_message;
+    std::string status = "ok", error_type, error_message, error_code;
     bool cancelled_flag = false;
+    const bool with_traceback = include_tracebacks_;
+    auto traceback_for = [&](const std::string& type, const std::string& message) {
+        return with_traceback ? cpp_traceback(type, message, call_site(owner, method_info.name))
+                              : std::string();
+    };
     std::string stream_id = random_hex(32);
 
     // Call the stream factory
     Stream stream_result = Stream{};
 
-    auto handle_factory_error = [&](const std::string& error_type, const char* msg) {
-        auto error_result = Result::error(empty_schema(), error_type, msg, server_id_, request_id);
+    auto handle_factory_error = [&](const std::string& error_type, const char* msg,
+                                    const std::exception* cause = nullptr) {
+        ErrorExtras extras = cause != nullptr ? error_extras_of(*cause) : ErrorExtras{};
+        if (cause == nullptr) {
+            // The factory broke the framework's own contract (a null schema or
+            // state): a fault in the machinery, not in the method's answer.
+            extras.code = code_name(Code::INTERNAL);
+        }
+        extras.traceback = traceback_for(error_type, msg);
+        auto error_result =
+            Result::error(empty_schema(), error_type, msg, server_id_, request_id,
+                          cause != nullptr ? error_kind_of(*cause) : std::string(), extras);
         write_ipc_stream(output, empty_schema(), {error_result.annotated_batch()});
         VGI_RPC_THROW_NOT_OK(output->Flush());
 
@@ -683,17 +759,11 @@ void Server::serve_stream(const MethodInfo& method_info, const Request& request,
 
     try {
         stream_result = method_info.stream_factory(request, ctx);
-    } catch (const std::invalid_argument& e) {
-        handle_factory_error("ValueError", e.what());
-        return;
-    } catch (const std::out_of_range& e) {
-        handle_factory_error("IndexError", e.what());
-        return;
-    } catch (const std::logic_error& e) {
-        handle_factory_error("TypeError", e.what());
-        return;
     } catch (const std::exception& e) {
-        handle_factory_error("RuntimeError", e.what());
+        // exception_type_of maps the C++ class exactly as the old per-class
+        // catch ladder did, and lets a KindedError name itself and carry its
+        // code and details.
+        handle_factory_error(exception_type_of(e), e.what(), &e);
         return;
     }
 
@@ -846,30 +916,13 @@ void Server::serve_stream(const MethodInfo& method_info, const Request& request,
 
             if (out.is_finished()) break;
         }
-    } catch (const std::invalid_argument& e) {
-        status = "error";
-        error_type = "ValueError";
-        error_message = e.what();
-        write_stream_error(output_writer, output_schema, "ValueError", e.what(), server_id_,
-                           request_id);
-    } catch (const std::out_of_range& e) {
-        status = "error";
-        error_type = "IndexError";
-        error_message = e.what();
-        write_stream_error(output_writer, output_schema, "IndexError", e.what(), server_id_,
-                           request_id);
-    } catch (const std::logic_error& e) {
-        status = "error";
-        error_type = "TypeError";
-        error_message = e.what();
-        write_stream_error(output_writer, output_schema, "TypeError", e.what(), server_id_,
-                           request_id);
     } catch (const std::exception& e) {
         status = "error";
-        error_type = "RuntimeError";
+        error_type = exception_type_of(e);
         error_message = e.what();
-        write_stream_error(output_writer, output_schema, "RuntimeError", e.what(), server_id_,
-                           request_id);
+        error_code = code_name(error_code_of(e));
+        write_stream_error(output_writer, output_schema, error_type, e, server_id_, request_id,
+                           traceback_for(error_type, error_message));
     }
 
     // Close output writer (writes EOS) — suppress errors if pipe is broken
@@ -887,13 +940,14 @@ void Server::serve_stream(const MethodInfo& method_info, const Request& request,
     if (access_log_ && access_log_->enabled()) {
         // Streams are application surface only: neither framework protocol
         // hosts one.
-        AccessRecord rec(application_binding_.name, application_binding_.hash);
+        AccessRecord rec(owner.name, owner.hash);
         rec.method = method_info.name;
         rec.request_id = request_id;
         rec.is_stream = true;
         rec.status = status;
         rec.error_type = error_type;
         rec.error_message = error_message;
+        rec.error_code = error_code;
         rec.duration_ms = elapsed_ms_since(t0);
         rec.stream_id = stream_id;
         rec.cancelled = cancelled_flag;

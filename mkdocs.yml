@@ -90,6 +90,7 @@ nav:
       - Server: api/server.md
       - Request: api/request.md
       - Result: api/result.md
+      - Errors: api/errors.md
       - Streaming: api/stream.md
       - CallContext: api/call-context.md
       - Raw Client: api/raw-client.md

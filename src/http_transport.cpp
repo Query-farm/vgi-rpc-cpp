@@ -18,6 +18,7 @@
 // stream/session remains lock-step without serializing unrelated RPCs.
 
 #include "vgi_rpc/server.h"
+#include "traceback_scope.h"
 #include "vgi_rpc/arrow_utils.h"
 #include "vgi_rpc/crypto.h"
 #include "vgi_rpc/errors.h"
@@ -164,10 +165,12 @@ public:
 
     AccessRecord& record() noexcept { return rec_; }
 
-    void failed(const std::string& type, const std::string& message) {
+    // `code` empty: classified from `type`, as the wire batch was.
+    void failed(const std::string& type, const std::string& message, const std::string& code = "") {
         rec_.status = "error";
         rec_.error_type = type;
         rec_.error_message = message;
+        rec_.error_code = code;
         // A refused turn handed back no usable continuation, whatever the
         // handler had produced before the refusal.
         rec_.has_response_state = false;
@@ -277,11 +280,10 @@ std::vector<std::string> split_path(const std::string& path) {
 
 /// Resolve one already-prefix-stripped path into a routing decision.
 ///
-/// `hosted_protocol` is this server's application protocol name, empty when it
-/// declared none -- such a server has no routing key to namespace its methods
-/// under, so it keeps serving them at the flat `{prefix}/{method}` shape.
-RoutedRequest route_path(const std::string& path, const std::string& hosted_protocol,
-                         bool hosts_identity) {
+/// `server` says which application protocols are hosted.  A server whose
+/// primary declared no name has no routing key to namespace its methods under,
+/// so it keeps serving them at the flat `{prefix}/{method}` shape.
+RoutedRequest route_path(const std::string& path, const Server& server, bool hosts_identity) {
     RoutedRequest routed;
     auto not_found = [&]() {
         routed.error = RouteError::NOT_FOUND;
@@ -339,7 +341,9 @@ RoutedRequest route_path(const std::string& path, const std::string& hosted_prot
         routed.target = RouteTarget::REFLECTION;
     } else if (protocol == kIdentityProtocolName && hosts_identity) {
         routed.target = RouteTarget::IDENTITY;
-    } else if (!hosted_protocol.empty() && protocol == hosted_protocol) {
+    } else if (server.find_protocol(protocol) != nullptr) {
+        // Any hosted application protocol, primary or added: dispatch
+        // resolves the pair (protocol, method) against that binding.
         routed.target = RouteTarget::APPLICATION;
     } else {
         routed.error = RouteError::PROTOCOL_NOT_SUPPORTED;
@@ -532,6 +536,7 @@ struct TurnFailure {
     bool failed = false;
     std::string type;
     std::string message;
+    std::string code;
 };
 
 bool run_producer_turns(const std::shared_ptr<arrow::ipc::RecordBatchWriter>& writer,
@@ -540,19 +545,25 @@ bool run_producer_turns(const std::shared_ptr<arrow::ipc::RecordBatchWriter>& wr
                         const std::string& server_id, const std::string& request_id,
                         TurnFailure* failure, const CycleExternalizer& externalize,
                         const AnnotatedBatch& input, std::optional<int64_t> response_limit_bytes,
-                        std::optional<int64_t> preferred_response_bytes) {
+                        std::optional<int64_t> preferred_response_bytes,
+                        const std::string& traceback_where) {
     OutputCollector oc(schema, /*producer=*/true, server_id, request_id, response_limit_bytes,
                        preferred_response_bytes);
     try {
         state->process(input, oc, ctx);
     } catch (const std::exception& e) {
-        auto md = make_error_metadata(exception_type_of(e), e.what(), server_id, request_id,
-                                      error_kind_of(e));
+        // `traceback_where` is empty when the operator turned tracebacks off.
+        auto md = make_exception_metadata(
+            e, server_id, request_id,
+            traceback_where.empty()
+                ? std::string()
+                : cpp_traceback(exception_type_of(e), e.what(), traceback_where));
         VGI_RPC_THROW_NOT_OK(writer->WriteRecordBatch(*make_empty_batch(schema), md));
         if (failure) {
             failure->failed = true;
             failure->type = exception_type_of(e);
             failure->message = e.what();
+            failure->code = code_name(error_code_of(e));
         }
         return true;
     }
@@ -1271,9 +1282,9 @@ void HttpServer::handle_session_delete(const httplib::Request& req, httplib::Res
     ResolvedHttpIdentity resolved;
     try {
         resolved = resolve_http_identity(req);
-    } catch (const PeerIdentityUnavailable&) {
+    } catch (const AuthUnavailableError& e) {
         res.status = 503;
-        res.set_header("Retry-After", "5");
+        res.set_header("Retry-After", std::to_string(std::max(0, e.retry_after())));
         return;
     } catch (const std::exception&) {
         write_unauthorized(req, res, AuthReason::INVALID_CREDENTIAL);
@@ -1294,6 +1305,9 @@ void HttpServer::handle_session_delete(const httplib::Request& req, httplib::Res
 
 void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
                             const std::string& request_body) {
+    // Every EXCEPTION batch this request writes carries a traceback unless the
+    // operator turned them off (WIRE_PROTOCOL.md §8).
+    detail::ScopedTracebackPolicy traceback_policy(rpc_.include_tracebacks());
     std::string request_id = req.get_header_value(REQUEST_ID_HEADER);
     if (request_id.empty()) request_id = random_hex(16);
     stamp_common(req, res, request_id);
@@ -1305,9 +1319,9 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
     ResolvedHttpIdentity resolved;
     try {
         resolved = resolve_http_identity(req);
-    } catch (const PeerIdentityUnavailable&) {
+    } catch (const AuthUnavailableError& e) {
         res.status = 503;
-        res.set_header("Retry-After", "5");
+        res.set_header("Retry-After", std::to_string(std::max(0, e.retry_after())));
         return;
     } catch (const std::exception&) {
         write_unauthorized(req, res, AuthReason::INVALID_CREDENTIAL);
@@ -1328,10 +1342,21 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
     // On the *raw* target, never `req.path` — see raw_target_path().
     std::string path = strip_prefix(raw_target_path(req));
     if (!path.empty() && path[0] == '/') path.erase(0, 1);
-    const RoutedRequest routed = route_path(path, rpc_.protocol_name(), rpc_.identity() != nullptr);
+    const RoutedRequest routed = route_path(path, rpc_, rpc_.identity() != nullptr);
+    // The application binding the route names, when it names one.  Reserved
+    // `__name__` methods are server-level and live beside the primary.
+    const HostedProtocol* routed_protocol = routed.target == RouteTarget::APPLICATION
+                                                ? rpc_.find_protocol(routed.protocol)
+                                                : &rpc_.application_protocols().front();
     const bool is_init = routed.is_init;
     const bool is_exchange_ep = routed.is_exchange;
     const std::string& method_name = routed.method;
+    // Only a route that resolved: a request-supplied protocol name must never
+    // reach an error message, the synthesized traceback included.
+    if (routed.error == RouteError::NONE) {
+        traceback_policy.set_where(routed.protocol.empty() ? method_name
+                                                           : routed.protocol + "/" + method_name);
+    }
 
     auto fail = [&](int status, const char* type, const std::string& msg, const char* kind = "") {
         res.status = status;
@@ -1469,8 +1494,20 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
         // refuse identity calls over a disagreement that says nothing about
         // them.
         if (routed.target == RouteTarget::APPLICATION) {
-            if (auto reason = rpc_.protocol_version_error(custom_metadata); !reason.empty()) {
-                fail(400, "ProtocolVersionError", reason);
+            // Against the binding the route resolved to: a protocol that
+            // declared no version enforces nothing, whatever the primary says.
+            if (auto reason = rpc_.protocol_version_error(*routed_protocol, custom_metadata);
+                !reason.empty()) {
+                res.status = 400;
+                res.set_header(RPC_ERROR_HEADER, "true");
+                set_arrow_content(
+                    req, res, build_body([&](const std::shared_ptr<arrow::io::OutputStream>& out) {
+                        auto err = Result::error(
+                            empty_schema(), "ProtocolVersionError", reason, rpc_.server_id(),
+                            request_id, ERROR_KIND_PROTOCOL_VERSION_MISMATCH,
+                            rpc_.protocol_version_extras(*routed_protocol, custom_metadata));
+                        write_ipc_stream(out, empty_schema(), {err.annotated_batch()});
+                    }));
                 return;
             }
         }
@@ -1530,7 +1567,17 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
     // endpoint owned by no protocol, which docs/access-log-spec.md §3 says logs
     // the server's primary -- prescribed, not a default fallen back on.  The
     // two framework protocols returned above, and they file under their own.
-    const ProtocolIdentity& owner = rpc_.application_binding();
+    const ProtocolIdentity& owner = routed_protocol->binding;
+    // Tracebacks ride every transport unless the operator turned them off.
+    const std::string traceback_where =
+        rpc_.include_tracebacks()
+            ? (owner.name.empty() ? method_name : owner.name + "/" + method_name)
+            : std::string();
+    auto traceback_of = [&](const std::exception& e) {
+        return traceback_where.empty()
+                   ? std::string()
+                   : cpp_traceback(exception_type_of(e), e.what(), traceback_where);
+    };
 
     // Synthetic method: vends upload/download URL pairs so a client can
     // externalize an outgoing batch the server would otherwise refuse at 413.
@@ -1604,9 +1651,10 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
     // One method, one address.  A reserved `__name__` resolves only on the flat
     // server-level route and an application method only under its protocol, so
     // neither is reachable by the other's shape.
-    auto it = rpc_.methods().find(method_name);
+    const auto& routed_methods = routed_protocol->methods;
+    auto it = routed_methods.find(method_name);
     const bool addressable =
-        it != rpc_.methods().end() &&
+        it != routed_methods.end() &&
         IsApplicationMethod(method_name) == (routed.target == RouteTarget::APPLICATION);
     if (!addressable) {
         // `__describe__` is *retired* rather than merely absent, and from the
@@ -1695,8 +1743,8 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
     if (!is_init && !is_exchange_ep) {
         auto buf_out = unwrap(arrow::io::BufferOutputStream::Create());
         bool external_ref = false;
-        const bool errored =
-            rpc_.serve_unary_http(method_info, request, request_id, buf_out, ctx, &external_ref);
+        const bool errored = rpc_.serve_unary_http(method_info, owner, request, request_id, buf_out,
+                                                   ctx, &external_ref);
         auto rbuf = unwrap(buf_out->Finish());
         apply_sticky();
 
@@ -1785,13 +1833,16 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
         try {
             stream = method_info.stream_factory(request, ctx);
         } catch (const std::exception& e) {
-            turn.failed(exception_type_of(e), e.what());
+            turn.failed(exception_type_of(e), e.what(), code_name(error_code_of(e)));
             res.status = 200;
             res.set_header(RPC_ERROR_HEADER, "true");
             apply_sticky();
             set_arrow_content(req, res,
-                              error_body(empty_schema(), exception_type_of(e), e.what(),
-                                         rpc_.server_id(), request_id, error_kind_of(e)));
+                              build_body([&](const std::shared_ptr<arrow::io::OutputStream>& out) {
+                                  auto err = Result::error(empty_schema(), e, rpc_.server_id(),
+                                                           request_id, traceback_of(e));
+                                  write_ipc_stream(out, empty_schema(), {err.annotated_batch()});
+                              }));
             return;
         }
 
@@ -1877,7 +1928,7 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
                     &failure, externalize,
                     AnnotatedBatch::with_metadata(make_empty_batch(empty_schema()),
                                                   turn_input_metadata(custom_metadata, nullptr)),
-                    response_limit, preferred_response);
+                    response_limit, preferred_response, traceback_where);
                 if (!finished) {
                     VGI_RPC_THROW_NOT_OK(writer->WriteRecordBatch(
                         *make_empty_batch(output_schema), init_metadata(cursor, call_token)));
@@ -1946,7 +1997,7 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
         }
         res.status = 200;
         if (failure.failed) {
-            turn.failed(failure.type, failure.message);
+            turn.failed(failure.type, failure.message, failure.code);
             res.set_header(RPC_ERROR_HEADER, "true");
         }
         apply_sticky();
@@ -2081,13 +2132,16 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
             auto sit = streams_.find(cursor);
             if (sit != streams_.end() && sit->second == sess) streams_.erase(sit);
         }
-        turn.failed(exception_type_of(e), e.what());
+        turn.failed(exception_type_of(e), e.what(), code_name(error_code_of(e)));
         res.status = 200;
         res.set_header(RPC_ERROR_HEADER, "true");
         apply_sticky();
-        set_arrow_content(req, res,
-                          error_body(output_schema, exception_type_of(e), e.what(),
-                                     rpc_.server_id(), request_id, error_kind_of(e)));
+        set_arrow_content(
+            req, res, build_body([&](const std::shared_ptr<arrow::io::OutputStream>& out) {
+                auto err =
+                    Result::error(output_schema, e, rpc_.server_id(), request_id, traceback_of(e));
+                write_ipc_stream(out, output_schema, {err.annotated_batch()});
+            }));
     };
 
     int64_t externalized = 0;
@@ -2182,7 +2236,7 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
                     externalize,
                     AnnotatedBatch::with_metadata(
                         batch, turn_input_metadata(custom_metadata, input_provenance)),
-                    response_limit, preferred_response);
+                    response_limit, preferred_response, traceback_where);
                 if (!finished) {
                     VGI_RPC_THROW_NOT_OK(writer->WriteRecordBatch(*make_empty_batch(output_schema),
                                                                   cursor_metadata(cursor)));
@@ -2218,7 +2272,7 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
             }
             res.status = 200;
             if (failure.failed) {
-                turn.failed(failure.type, failure.message);
+                turn.failed(failure.type, failure.message, failure.code);
                 res.set_header(RPC_ERROR_HEADER, "true");
             }
             apply_sticky();
@@ -2307,9 +2361,9 @@ void HttpServer::run() {
             if (refuse_if_unauthorized(req, res, random_hex(16))) return;
             try {
                 (void)resolve_http_identity(req);
-            } catch (const PeerIdentityUnavailable&) {
+            } catch (const AuthUnavailableError& e) {
                 res.status = 503;
-                res.set_header("Retry-After", "5");
+                res.set_header("Retry-After", std::to_string(std::max(0, e.retry_after())));
                 return;
             } catch (const std::exception&) {
                 write_unauthorized(req, res, AuthReason::INVALID_CREDENTIAL);

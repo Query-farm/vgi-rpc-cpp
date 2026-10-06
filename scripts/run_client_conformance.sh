@@ -46,6 +46,9 @@ fi
 legs=("$@")
 [[ ${#legs[@]} -eq 0 ]] && legs=(python cpp)
 
+LOG_DIR="$(mktemp -d "${TMPDIR:-/tmp}/vgiclXXXX")"
+trap 'rm -rf "$LOG_DIR"' EXIT
+
 rc=0
 for leg in "${legs[@]}"; do
   case "$leg" in
@@ -58,7 +61,15 @@ for leg in "${legs[@]}"; do
   VGI_CONFORMANCE_SERVER="$leg" \
   VGI_CLIENT_DRIVER="$DRIVER" \
   VGI_RPC_CPP_WORKER="$WORKER" \
-    $PYTEST_CMD "$ROOT/tests/conformance/test_suite.py" -q -p no:randomly || rc=1
+    $PYTEST_CMD "$ROOT/tests/conformance/test_suite.py" -q -p no:randomly -rs 2>&1 \
+      | tee "$LOG_DIR/client-$leg.log"
+  [[ "${PIPESTATUS[0]}" -eq 0 ]] || rc=1
+  # A skip is a client deliverable not exercised (e.g. the error-model groups
+  # without a protocol connector), so it fails the leg like a failure would.
+  if grep -q '^SKIPPED' "$LOG_DIR/client-$leg.log"; then
+    echo "ERROR: client role vs $leg skipped tests (see SKIPPED lines above)" >&2
+    rc=1
+  fi
   echo "::endgroup::"
 done
 

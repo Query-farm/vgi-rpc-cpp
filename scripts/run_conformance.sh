@@ -166,13 +166,39 @@ run_pytest_suite() {
   if ! python3 -c "import pytest, vgi_rpc.conformance._pytest_suite" 2>/dev/null; then
     echo "WARNING: pytest or the shared suite is unavailable; skipping" >&2
   else
+    # Zero skips, enforced. Several shared groups skip *loudly* when the
+    # runner lacks a fixture (the secondary-protocol and error-model groups
+    # without `conformance_protocol_connector`, the identity groups without an
+    # identity worker), and a skip there is an unimplemented deliverable that
+    # a pass/fail exit code would report as green.
+    local log="$TMPDIR_RUN/pytest_suite.log"
     VGI_RPC_CPP_WORKER="$WORKER" \
       python3 -m pytest \
         "$REPO_ROOT/tests/conformance/test_suite.py" \
         "$REPO_ROOT/tests/conformance/test_polymorphic_stream.py" \
         "$REPO_ROOT/tests/conformance/test_http_concurrency.py" \
         "$REPO_ROOT/tests/conformance/test_socket_concurrency.py" \
-        -q -p no:randomly || rc=1
+        -q -p no:randomly -rs 2>&1 | tee "$log"
+    [[ "${PIPESTATUS[0]}" -eq 0 ]] || rc=1
+    if grep -q '^SKIPPED' "$log"; then
+      echo "ERROR: the mandatory shared suite skipped tests (see SKIPPED lines above)" >&2
+      rc=1
+    fi
+    # The multi-protocol / error-model groups must have run, not merely been
+    # collected out of existence by a narrowed import.
+    for group in TestSecondaryIsHosted TestErrorModelRoundTrip TestErrorModelOnTheWire \
+                 TestTracebackPolicy TestUnavailableCarriesARetryHint; do
+      # Captured, not piped into `grep -q`: under pipefail, grep exiting at
+      # the first match SIGPIPEs pytest and fails the pipeline.
+      local collected
+      collected="$(VGI_RPC_CPP_WORKER="$WORKER" python3 -m pytest \
+             "$REPO_ROOT/tests/conformance/test_suite.py" -q -p no:randomly \
+             --collect-only -k "$group" 2>/dev/null || true)"
+      if ! grep -q "$group" <<<"$collected"; then
+        echo "ERROR: shared group $group is not collected by tests/conformance/test_suite.py" >&2
+        rc=1
+      fi
+    done
   fi
   echo "::endgroup::"
 }

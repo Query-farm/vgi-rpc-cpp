@@ -143,7 +143,7 @@ TEST_CASE("serve_one: wrong version -> VersionError", "[server]") {
     REQUIRE(get_error_type(contents) == "VersionError");
 }
 
-TEST_CASE("serve_one: unknown method -> AttributeError", "[server]") {
+TEST_CASE("serve_one: unknown method -> method_not_implemented / UNIMPLEMENTED", "[server]") {
     auto server = make_echo_server();
     auto schema = empty_schema();
     auto batch = make_empty_batch(schema);
@@ -151,7 +151,10 @@ TEST_CASE("serve_one: unknown method -> AttributeError", "[server]") {
 
     auto response_buf = run_request(*server, request_buf);
     auto contents = read_response(response_buf);
-    REQUIRE(get_error_type(contents) == "AttributeError");
+    REQUIRE(get_error_type(contents) == "MethodNotImplementedError");
+    const auto& md = contents.batches.back().custom_metadata;
+    REQUIRE(get_metadata_value(md, keys::ERROR_KIND) == ERROR_KIND_METHOD_NOT_IMPLEMENTED);
+    REQUIRE(get_metadata_value(md, keys::ERROR_CODE) == "UNIMPLEMENTED");
 }
 
 // ── Exception Mapping Tests ──────────────────────────────────────────
