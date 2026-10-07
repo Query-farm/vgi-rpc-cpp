@@ -141,14 +141,6 @@ void AccessLogWriter::emit(const AccessRecord& rec) {
         j["request_fields"] = std::move(fields);
         j["request_rows"] = rec.request_rows;
     }
-    if (!rec.is_stream) {
-        // Transitional: vgi-rpc 0.50.0's schema requires `request_data` on a
-        // unary record unless it is marked truncated, and the current schema
-        // accepts "payload_omitted" as legacy -- so this marker passes both.
-        // Nothing is lost: payloads are never logged.  Remove once CI
-        // validates against vgi-rpc >= 0.50.1.
-        j["truncated"] = "payload_omitted";
-    }
     if (rec.request_state_bytes >= 0) j["request_state_bytes"] = rec.request_state_bytes;
     if (rec.response_state_bytes >= 0) j["response_state_bytes"] = rec.response_state_bytes;
 

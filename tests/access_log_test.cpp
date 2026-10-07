@@ -746,6 +746,9 @@ void require_value_shape(const nlohmann::json& record) {
     CHECK(fields[0].value("name", "") == "value");
     CHECK(fields[0].value("type", "") == "string");
     CHECK(record.value("request_rows", -1) == 1);
+    // Nothing is omitted, so no truncation marker: the reference stopped
+    // emitting "payload_omitted" in vgi-rpc 0.50.1.
+    CHECK_FALSE(record.contains("truncated"));
 }
 
 }  // namespace
