@@ -33,7 +33,7 @@ Define RPC methods with typed C++20 handlers using Arrow schemas. The framework 
 - **Introspection** via the co-hosted `vgi_rpc.Reflection.v1` protocol, which every client asks over the connection it already holds (`list_protocols()`, `describe_protocol()`)
 - **Error handling** — exceptions automatically converted to protocol error responses
 - **Builder pattern** — fluent `ServerBuilder` API for registering methods
-- **Access log** — JSONL records per call, with the spec's field-shedding size cap
+- **Access log** — JSONL records per call, with the spec's size cap. Records describe a request by its shape (`request_fields`: parameter names and Arrow types; `request_rows`) and stream state tokens by size (`request_state_bytes` / `response_state_bytes`); no request, response or state value is ever logged, at any level
 
 ## Transports
 

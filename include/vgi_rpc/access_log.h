@@ -11,6 +11,7 @@
 #include <fstream>
 #include <mutex>
 #include <string>
+#include <vector>
 
 #include "vgi_rpc/export.h"
 #include "vgi_rpc/identity.h"
@@ -65,30 +66,33 @@ struct AccessRecord {
         auth_domain = auth.domain;
         authenticated = auth.authenticated;
     }
-    std::string request_id;        // per-request correlation id
-    std::string stream_id;         // 32 lowercase hex; set when is_stream
-    bool cancelled = false;        // client cancelled a stream
-    std::string request_data_b64;  // base64 IPC of the request batch
-    bool has_request_data = false;
-    // Base64 of the *decrypted* stream state, in this server's own encoding,
-    // per docs/access-log-spec.md §4.4: `request_state` on a continuation,
-    // `response_state` on an init and on any continuation that handed a
-    // further token back -- absent on the terminal one, which is what makes
-    // "this stream is over" readable from the record alone.
-    std::string request_state_b64;
-    bool has_request_state = false;
-    std::string response_state_b64;
-    bool has_response_state = false;
-    // Set instead of request_data_b64 when the payload was too large to carry.
-    // Reports the character length of the base64 string that was dropped.
-    int64_t original_request_bytes = -1;
+    std::string request_id;  // per-request correlation id
+    std::string stream_id;   // 32 lowercase hex; set when is_stream
+    bool cancelled = false;  // client cancelled a stream
+    // The request's *shape*, never its values (docs/access-log-spec.md §4.3):
+    // one {name, type} per parameter, in schema order, and the row count.
+    // The framework cannot know which parameters are secret -- a VGI
+    // `catalog_attach` carries API keys and passwords in its options -- so no
+    // payload value reaches the log, in any form, and nothing re-enables it.
+    // Set on unary records and stream init records only: its absence is what
+    // marks a continuation.  `request_rows < 0` means "not described".
+    struct RequestField {
+        std::string name;
+        std::string type;
+    };
+    std::vector<RequestField> request_fields;
+    int64_t request_rows = -1;
+    // Sizes of the stream state tokens (§4.4), never the tokens: a token is
+    // replayable, and serialized state can hold anything the call was given.
+    // `request_state_bytes` on a continuation; `response_state_bytes` on any
+    // turn that handed a further token back -- absent on the terminal one,
+    // which is what makes "this stream is over" readable from the record.
+    int64_t request_state_bytes = -1;
+    int64_t response_state_bytes = -1;
 };
 
 // base64-encode bytes (RFC 4648, padding required).
 VGI_RPC_EXPORT std::string base64_encode(const uint8_t* data, size_t len);
-
-// Character length of the base64 encoding of `len` bytes, without encoding it.
-VGI_RPC_EXPORT int64_t base64_encoded_length(int64_t len);
 
 // Writes one JSON line per call to the configured path.  Concurrent emitters
 // are serialized so threaded HTTP dispatch cannot interleave JSON records.
@@ -102,12 +106,6 @@ public:
 
     bool enabled() const noexcept { return enabled_; }
     int64_t max_record_bytes() const noexcept { return max_record_bytes_; }
-
-    // True when a base64 payload of `b64_len` characters could plausibly fit
-    // under the cap.  Callers use this to skip materializing a payload they
-    // would only have to throw away — the difference between a few hundred
-    // bytes of accounting and several gigabytes of string.
-    bool payload_fits(int64_t b64_len) const noexcept;
 
     void emit(const AccessRecord& rec);
 

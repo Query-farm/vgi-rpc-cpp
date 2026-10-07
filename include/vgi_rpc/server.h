@@ -68,11 +68,11 @@ struct VGI_RPC_EXPORT ProtocolIdentity {
     std::string hash;
 };
 
-// Populate `rec`'s request_data — or, when the payload would blow the writer's
-// per-record cap, its `original_request_bytes` accounting instead.  Measures
-// before serializing, so an over-cap payload is never materialized.
-VGI_RPC_EXPORT void fill_request_data(const AccessLogWriter& log, AccessRecord& rec,
-                                      const std::shared_ptr<arrow::RecordBatch>& batch);
+// Describe `batch` on `rec` as request_fields / request_rows: parameter names,
+// Arrow types and the row count -- never a value (docs/access-log-spec.md
+// §4.3).  Reads only the schema, so it costs the same for any payload size.
+VGI_RPC_EXPORT void fill_request_shape(AccessRecord& rec,
+                                       const std::shared_ptr<arrow::RecordBatch>& batch);
 
 /// One application protocol's method table, before it is hosted.
 ///

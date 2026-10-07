@@ -67,23 +67,14 @@ run_pipe() {
 }
 
 run_pipe_access_log() {
-  # Two passes.  The first validates every record the full suite produces; the
-  # second additionally requires `request_data` to be present, which the
-  # large_payload tests legitimately shed under the per-record size cap (the
-  # Python reference sheds it there too), so they are excluded from that pass
-  # rather than the rule being weakened.
+  # Validated with the access log at DEBUG, its most verbose, which is where a
+  # payload leak would show.  No `--require-request-data`: request payloads
+  # are never logged at any level (docs/access-log-spec.md §4.3), and the
+  # reference now rejects that flag.
   echo "::group::conformance: pipe + access-log"
   local log="$TMPDIR_RUN/access.jsonl"
   vgi-rpc-test --cmd "$WORKER --access-log $log --access-log-debug" \
                --access-log "$log" --format table || rc=1
-  echo "::endgroup::"
-
-  echo "::group::conformance: pipe + access-log (--require-request-data)"
-  local log2="$TMPDIR_RUN/access-payload.jsonl"
-  vgi-rpc-test --cmd "$WORKER --access-log $log2 --access-log-debug" \
-               --access-log "$log2" --require-request-data \
-               --filter '!large_payload.echo_binary_over_int32_max,!large_payload.echo_binary_4mib' \
-               --format table || rc=1
   echo "::endgroup::"
 }
 

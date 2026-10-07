@@ -101,26 +101,17 @@ std::shared_ptr<arrow::RecordBatch> coerce_input_batch(
 
 }  // anonymous namespace
 
-// Populate `rec`'s request_data (or its truncation accounting) for `batch`.
-//
-// The size is measured before anything is serialized, because the alternative
-// is not merely wasteful: a 2 GiB request would otherwise be copied into an
-// IPC buffer and then expanded ~4/3 again into base64, for a record the cap
-// throws away regardless.  That is how the >INT_MAX conformance payload ran
-// the worker out of memory.
-void fill_request_data(const AccessLogWriter& log, AccessRecord& rec,
-                       const std::shared_ptr<arrow::RecordBatch>& batch) {
-    const int64_t b64_len = base64_encoded_length(ipc_stream_byte_size(batch));
-    if (!log.payload_fits(b64_len)) {
-        rec.has_request_data = false;
-        rec.original_request_bytes = b64_len;
-        return;
+// Describe `batch` on `rec`: names, Arrow types and row count, never a value.
+// See docs/access-log-spec.md §4.3 -- the framework cannot tell a secret
+// parameter from any other, so the record says only what the request looked
+// like.  No digest either: a hash of a request whose other fields are known is
+// a brute-force oracle for a short secret.
+void fill_request_shape(AccessRecord& rec, const std::shared_ptr<arrow::RecordBatch>& batch) {
+    rec.request_fields.clear();
+    for (const auto& field : batch->schema()->fields()) {
+        rec.request_fields.push_back({field->name(), field->type()->ToString()});
     }
-    auto out = unwrap(arrow::io::BufferOutputStream::Create());
-    write_ipc_stream(out, batch->schema(), {AnnotatedBatch::data(batch)});
-    auto buf = unwrap(out->Finish());
-    rec.request_data_b64 = base64_encode(buf->data(), static_cast<size_t>(buf->size()));
-    rec.has_request_data = true;
+    rec.request_rows = batch->num_rows();
 }
 
 namespace {
@@ -160,7 +151,7 @@ void Server::log_framework_call(const ProtocolIdentity& owner, const std::string
     rec.duration_ms = elapsed_ms_since(started);
     // A malformed request can be refused before a batch was ever decoded, and
     // a record with no payload beats no record at all.
-    if (request_batch != nullptr) fill_request_data(*access_log_, rec, request_batch);
+    if (request_batch != nullptr) fill_request_shape(rec, request_batch);
     access_log_->emit(rec);
 }
 
@@ -695,7 +686,7 @@ bool Server::serve_unary_impl(const MethodInfo& method_info, const ProtocolIdent
         rec.error_message = error_message;
         rec.error_code = error_code;
         rec.duration_ms = elapsed_ms_since(t0);
-        fill_request_data(*access_log_, rec, request.batch());
+        fill_request_shape(rec, request.batch());
         access_log_->emit(rec);
     }
     return status == "error";
@@ -960,7 +951,7 @@ void Server::serve_stream(const MethodInfo& method_info, const ProtocolIdentity&
         rec.duration_ms = elapsed_ms_since(t0);
         rec.stream_id = stream_id;
         rec.cancelled = cancelled_flag;
-        fill_request_data(*access_log_, rec, request.batch());
+        fill_request_shape(rec, request.batch());
         access_log_->emit(rec);
     }
 }

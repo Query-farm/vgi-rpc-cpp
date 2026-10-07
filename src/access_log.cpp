@@ -44,11 +44,6 @@ std::string base64_encode(const uint8_t* data, size_t len) {
     return out;
 }
 
-int64_t base64_encoded_length(int64_t len) {
-    if (len <= 0) return 0;
-    return ((len + 2) / 3) * 4;
-}
-
 namespace {
 
 // Envelope keys that survive every rung of the truncation ladder: the four
@@ -89,10 +84,6 @@ AccessLogWriter::AccessLogWriter(const std::string& path, std::string server_id,
     if (path.empty()) return;
     out_.open(path, std::ios::out | std::ios::app);
     enabled_ = out_.is_open();
-}
-
-bool AccessLogWriter::payload_fits(int64_t b64_len) const noexcept {
-    return b64_len < max_record_bytes_;
 }
 
 void AccessLogWriter::emit(const AccessRecord& rec) {
@@ -137,29 +128,34 @@ void AccessLogWriter::emit(const AccessRecord& rec) {
         j["stream_id"] = rec.stream_id;
         if (rec.cancelled) j["cancelled"] = true;
     }
-    // Plaintext, never the sealed token: a log reader must be able to decode
-    // the state without holding the server's token_key.
-    if (rec.has_request_state) j["request_state"] = rec.request_state_b64;
-    if (rec.has_response_state) j["response_state"] = rec.response_state_b64;
-    if (rec.has_request_data) {
-        j["request_data"] = rec.request_data_b64;
-    } else if (rec.original_request_bytes >= 0) {
-        // The caller already declined to materialize an over-cap payload;
-        // report what was dropped, per rung 1 of the §5b ladder.
-        j["original_request_bytes"] = rec.original_request_bytes;
-        j["truncated"] = true;
+    // The request's shape and the state tokens' sizes -- never a payload
+    // value, at any level (docs/access-log-spec.md §4.3, §4.4).
+    if (rec.request_rows >= 0) {
+        nlohmann::json fields = nlohmann::json::array();
+        for (const auto& field : rec.request_fields) {
+            nlohmann::json entry = nlohmann::json::object();
+            entry["name"] = field.name;
+            entry["type"] = field.type;
+            fields.push_back(std::move(entry));
+        }
+        j["request_fields"] = std::move(fields);
+        j["request_rows"] = rec.request_rows;
     }
+    if (!rec.is_stream) {
+        // Transitional: vgi-rpc 0.50.0's schema requires `request_data` on a
+        // unary record unless it is marked truncated, and the current schema
+        // accepts "payload_omitted" as legacy -- so this marker passes both.
+        // Nothing is lost: payloads are never logged.  Remove once CI
+        // validates against vgi-rpc >= 0.50.1.
+        j["truncated"] = "payload_omitted";
+    }
+    if (rec.request_state_bytes >= 0) j["request_state_bytes"] = rec.request_state_bytes;
+    if (rec.response_state_bytes >= 0) j["response_state_bytes"] = rec.response_state_bytes;
 
-    // §5b truncation ladder.  Rung 1 (drop request_data) is applied here for
-    // payloads the caller did materialize; rung 2 (claims) has no C++ analogue
-    // yet since this emitter carries no claims; rung 3 is the sentinel form.
+    // §5b truncation ladder.  There is no payload to shed; rung 1 (claims) has
+    // no C++ analogue yet since this emitter carries no claims, so an over-cap
+    // record goes straight to the sentinel form.
     std::string line = j.dump();
-    if (static_cast<int64_t>(line.size()) > max_record_bytes_ && j.contains("request_data")) {
-        j["original_request_bytes"] = static_cast<int64_t>(rec.request_data_b64.size());
-        j.erase("request_data");
-        j["truncated"] = true;
-        line = j.dump();
-    }
     if (static_cast<int64_t>(line.size()) > max_record_bytes_) {
         // Sentinel form: envelope fields plus error_message, which is never
         // truncated — an operator debugging a failure needs it whole.

@@ -63,19 +63,20 @@ std::shared_ptr<arrow::Schema> value_schema() {
     return arrow::schema({arrow::field("value", arrow::utf8())});
 }
 
-/// A one-row `{value: "hi"}` batch, or a zero-column one for a no-arg method.
-std::shared_ptr<arrow::RecordBatch> probe_batch(bool empty) {
+/// A one-row `{value: <value>}` batch, or a zero-column one for a no-arg method.
+std::shared_ptr<arrow::RecordBatch> probe_batch(bool empty, const std::string& value = "hi") {
     if (empty) return make_empty_batch(empty_schema());
     arrow::StringBuilder builder;
-    REQUIRE(builder.Append("hi").ok());
+    REQUIRE(builder.Append(value).ok());
     std::shared_ptr<arrow::Array> column;
     REQUIRE(builder.Finish(&column).ok());
     return arrow::RecordBatch::Make(value_schema(), 1, {column});
 }
 
 std::shared_ptr<arrow::Buffer> request_buffer(const std::string& method,
-                                              const std::string& protocol, bool empty_params) {
-    auto batch = probe_batch(empty_params);
+                                              const std::string& protocol, bool empty_params,
+                                              const std::string& value = "hi") {
+    auto batch = probe_batch(empty_params, value);
     auto metadata = std::make_shared<arrow::KeyValueMetadata>();
     metadata->Append(keys::METHOD, method);
     metadata->Append(keys::REQUEST_VERSION, REQUEST_VERSION_VALUE);
@@ -89,10 +90,10 @@ std::shared_ptr<arrow::Buffer> request_buffer(const std::string& method,
     return sink->Finish().ValueUnsafe();
 }
 
-void run(Server& server, const std::string& method, const std::string& protocol,
-         bool empty_params) {
-    auto input =
-        std::make_shared<arrow::io::BufferReader>(request_buffer(method, protocol, empty_params));
+void run(Server& server, const std::string& method, const std::string& protocol, bool empty_params,
+         const std::string& value = "hi") {
+    auto input = std::make_shared<arrow::io::BufferReader>(
+        request_buffer(method, protocol, empty_params, value));
     auto output = arrow::io::BufferOutputStream::Create().ValueUnsafe();
     server.serve_one(input, output);
 }
@@ -310,6 +311,30 @@ private:
     int64_t remaining_;
 };
 
+/// Holds the value its call was given and emits it for `turns` turns: a
+/// stream whose state carries whatever the caller passed, secrets included.
+class HoldingState : public ProducerState {
+public:
+    HoldingState(std::string value, int64_t turns) : value_(std::move(value)), remaining_(turns) {}
+
+    void produce(OutputCollector& out, CallContext&) override {
+        if (remaining_ <= 0) {
+            out.finish();
+            return;
+        }
+        arrow::StringBuilder builder;
+        if (!builder.Append(value_).ok()) throw std::runtime_error("append failed");
+        std::shared_ptr<arrow::Array> column;
+        if (!builder.Finish(&column).ok()) throw std::runtime_error("finish failed");
+        out.emit_batch(arrow::RecordBatch::Make(value_schema(), 1, {column}));
+        if (--remaining_ == 0) out.finish();
+    }
+
+private:
+    std::string value_;
+    int64_t remaining_;
+};
+
 /// Throws something `run_producer_turns`' `catch (const std::exception&)`
 /// does not convert into an error batch, so the throw leaves `handle_rpc`
 /// entirely -- the shape a failed IPC write inside `build_body` has.
@@ -339,6 +364,14 @@ public:
                                  return Stream{value_schema(), empty_schema(),
                                                std::make_shared<CountdownState>(kCountdownTurns),
                                                nullptr};
+                             });
+        builder.add_producer("holding", value_schema(), value_schema(),
+                             [](const Request& request, CallContext&) -> Stream {
+                                 return Stream{
+                                     value_schema(), empty_schema(),
+                                     std::make_shared<HoldingState>(
+                                         request.get<std::string>("value"), kCountdownTurns),
+                                     nullptr};
                              });
         builder.add_producer("throwing", empty_schema(), value_schema(),
                              [](const Request&, CallContext&) -> Stream {
@@ -419,13 +452,13 @@ std::string response_metadata(const std::string& body, const std::string& key) {
     return "";
 }
 
-/// Drive `countdown` to exhaustion over HTTP, returning the number of turns.
-int drive_countdown(int port) {
+/// Drive the producer `method` to exhaustion over HTTP from the init `body`,
+/// returning the number of turns.
+int drive_stream(int port, const std::string& method, const std::string& body) {
     httplib::Client client("127.0.0.1", port);
     client.set_read_timeout(10, 0);
 
-    auto response = client.Post("/vgi/AccessLogProbe/countdown/init", init_body("countdown"),
-                                kArrowContentType);
+    auto response = client.Post("/vgi/AccessLogProbe/" + method + "/init", body, kArrowContentType);
     REQUIRE(response);
     REQUIRE(response->status == 200);
 
@@ -433,7 +466,7 @@ int drive_countdown(int port) {
     std::string cursor = response_metadata(response->body, keys::STATE_B64);
     const std::string call_token = response_metadata(response->body, keys::CALL_STATE_B64);
     while (!cursor.empty()) {
-        response = client.Post("/vgi/AccessLogProbe/countdown/exchange",
+        response = client.Post("/vgi/AccessLogProbe/" + method + "/exchange",
                                continuation_body(cursor, call_token), kArrowContentType);
         REQUIRE(response);
         REQUIRE(response->status == 200);
@@ -441,6 +474,11 @@ int drive_countdown(int port) {
         cursor = response_metadata(response->body, keys::STATE_B64);
     }
     return turns;
+}
+
+/// Drive `countdown` to exhaustion over HTTP, returning the number of turns.
+int drive_countdown(int port) {
+    return drive_stream(port, "countdown", init_body("countdown"));
 }
 
 /// Every access record for `method`, in the order they were written.
@@ -485,9 +523,9 @@ TEST_CASE("a stream's records share one stream_id", "[access-log]") {
     }
 }
 
-TEST_CASE("request_data rides the init record and only the init record", "[access-log]") {
+TEST_CASE("the request shape rides the init record and only the init record", "[access-log]") {
     // §5's rules key off the record's shape rather than a method name, and
-    // "is this the init" is readable only from request_data's presence. A port
+    // "is this the init" is readable only from request_fields' presence. A port
     // that repeated it on every continuation would make a stream's turns
     // indistinguishable from n separate calls.
     TempLog log;
@@ -496,17 +534,20 @@ TEST_CASE("request_data rides the init record and only the init record", "[acces
 
     auto records = records_for(log, "countdown");
     REQUIRE(records.size() >= 2);
-    CHECK(records.front().contains("request_data"));
+    CHECK(records.front().contains("request_fields"));
+    CHECK(records.front().value("request_rows", -1) == 0);
     for (size_t i = 1; i < records.size(); ++i) {
-        CHECK_FALSE(records[i].contains("request_data"));
+        CHECK_FALSE(records[i].contains("request_fields"));
+        CHECK_FALSE(records[i].contains("request_rows"));
     }
 }
 
-TEST_CASE("response_state is absent exactly on the turn that ends the stream", "[access-log]") {
+TEST_CASE("response_state_bytes is absent exactly on the turn that ends the stream",
+          "[access-log]") {
     // The one thing the state fields make readable from the log alone: which
-    // turn handed a continuation back and which one closed the stream. C++
-    // keeps stream state in-process, so what travels is the registry cursor --
-    // in plaintext, which is what §4.4 asks to be logged.
+    // turn handed a continuation back and which one closed the stream. Only
+    // the token's size is logged (§4.4): the token is a replayable
+    // continuation, so it never reaches the log itself.
     TempLog log;
     HttpLogServer server(log);
     drive_countdown(server.port());
@@ -515,17 +556,17 @@ TEST_CASE("response_state is absent exactly on the turn that ends the stream", "
     REQUIRE(records.size() >= 2);
     for (size_t i = 0; i + 1 < records.size(); ++i) {
         INFO("turn " << i);
-        CHECK(records[i].contains("response_state"));
+        CHECK(records[i].value("response_state_bytes", int64_t{0}) > 0);
     }
-    CHECK_FALSE(records.back().contains("response_state"));
+    CHECK_FALSE(records.back().contains("response_state_bytes"));
 
-    // request_state is the mirror image: absent on the init, present on every
+    // request_state_bytes is the mirror image: absent on the init, present on every
     // continuation including the terminal one, because a turn that resumed a
     // stream resumed it from somewhere.
-    CHECK_FALSE(records.front().contains("request_state"));
+    CHECK_FALSE(records.front().contains("request_state_bytes"));
     for (size_t i = 1; i < records.size(); ++i) {
         INFO("turn " << i);
-        CHECK(records[i].contains("request_state"));
+        CHECK(records[i].value("request_state_bytes", int64_t{0}) > 0);
     }
 }
 
@@ -620,7 +661,8 @@ TEST_CASE("__upload_url__ files a record under the server's primary", "[access-l
     auto expected = BindingHash(kProtocol, server.rpc().methods());
     REQUIRE(expected.ok());
     CHECK(record->value("protocol_hash", "") == *expected);
-    CHECK(record->contains("request_data"));
+    CHECK(record->contains("request_fields"));
+    CHECK(record->contains("request_rows"));
 }
 
 TEST_CASE("a turn that leaves by exception does not file an 'ok' record", "[access-log]") {
@@ -643,5 +685,112 @@ TEST_CASE("a turn that leaves by exception does not file an 'ok' record", "[acce
     REQUIRE(record.has_value());
     CHECK(record->value("status", "") == "error");
     CHECK_FALSE(record->value("error_message", "").empty());
-    CHECK_FALSE(record->contains("response_state"));
+    CHECK_FALSE(record->contains("response_state_bytes"));
+}
+
+// ── No payload value reaches the log ─────────────────────────────────
+//
+// docs/access-log-spec.md §4.3: a record carries the request's shape, never a
+// value, at any level -- the framework cannot know which parameters are
+// secret, and a VGI `catalog_attach` carries API keys and passwords in its
+// options. This port used to write the whole request as base64 IPC on every
+// unary and init record, and the stream state token on every HTTP turn,
+// unconditionally. There is no verbosity setting above what runs here: the
+// access log is either on, and writes everything it ever writes, or off.
+
+namespace {
+
+constexpr const char* kSentinel = "vgi-sentinel-S3CRET-7f3a9c41d2";
+
+/// Every way the sentinel could appear: verbatim, or inside a base64 encoding
+/// at any of the three byte alignments.  The first and last 4 characters of
+/// each encoding depend on the neighbouring bytes, so only the stable middle
+/// is searched for.
+std::vector<std::string> sentinel_forms() {
+    std::vector<std::string> forms{kSentinel};
+    for (size_t offset = 0; offset < 3; ++offset) {
+        const std::string padded = std::string(offset, 'x') + kSentinel;
+        const std::string b64 =
+            base64_encode(reinterpret_cast<const uint8_t*>(padded.data()), padded.size());
+        REQUIRE(b64.size() > 8);
+        forms.push_back(b64.substr(4, b64.size() - 8));
+    }
+    return forms;
+}
+
+std::string file_text(const TempLog& log) {
+    std::ifstream in(log.str());
+    return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+}
+
+void require_no_sentinel(const TempLog& log) {
+    const std::string text = file_text(log);
+    REQUIRE_FALSE(text.empty());
+    for (const auto& form : sentinel_forms()) {
+        INFO("searching the log for " << form);
+        CHECK(text.find(form) == std::string::npos);
+    }
+    for (const auto& record : log.records()) {
+        CHECK_FALSE(record.contains("request_data"));
+        CHECK_FALSE(record.contains("request_state"));
+        CHECK_FALSE(record.contains("response_state"));
+    }
+}
+
+void require_value_shape(const nlohmann::json& record) {
+    REQUIRE(record.contains("request_fields"));
+    const auto& fields = record["request_fields"];
+    REQUIRE(fields.is_array());
+    REQUIRE(fields.size() == 1);
+    CHECK(fields[0].size() == 2);  // name and type, and nothing else
+    CHECK(fields[0].value("name", "") == "value");
+    CHECK(fields[0].value("type", "") == "string");
+    CHECK(record.value("request_rows", -1) == 1);
+}
+
+}  // namespace
+
+TEST_CASE("a secret request argument never reaches the pipe access log", "[access-log][secret]") {
+    TempLog log;
+    auto server = make_server(log);
+    run(*server, "echo", kProtocol, /*empty_params=*/false, kSentinel);
+
+    auto record = record_for(log, "echo");
+    REQUIRE(record.has_value());
+    CHECK(record->value("status", "") == "ok");
+    require_no_sentinel(log);
+    require_value_shape(*record);
+}
+
+TEST_CASE("a secret in an HTTP call or its stream state never reaches the access log",
+          "[access-log][secret]") {
+    TempLog log;
+    HttpLogServer server(log);
+
+    // Unary: the argument.
+    httplib::Client client("127.0.0.1", server.port());
+    client.set_read_timeout(10, 0);
+    auto response = client.Post(
+        "/vgi/AccessLogProbe/echo",
+        buffer_string(request_buffer("echo", kProtocol, /*empty_params=*/false, kSentinel)),
+        kArrowContentType);
+    REQUIRE(response);
+    REQUIRE(response->status == 200);
+    // The secret did make the round trip, so its absence from the log below
+    // is not an artefact of a call that never carried it.
+    CHECK(response->body.find(kSentinel) != std::string::npos);
+
+    // Stream: the argument, held in the stream's state across every turn.
+    const int turns = drive_stream(
+        server.port(), "holding",
+        buffer_string(request_buffer("holding", kProtocol, /*empty_params=*/false, kSentinel)));
+    CHECK(turns == kCountdownTurns);
+
+    require_no_sentinel(log);
+    auto echo = record_for(log, "echo");
+    REQUIRE(echo.has_value());
+    require_value_shape(*echo);
+    auto stream = records_for(log, "holding");
+    REQUIRE(stream.size() == static_cast<size_t>(turns));
+    require_value_shape(stream.front());
 }

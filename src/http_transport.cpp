@@ -164,7 +164,7 @@ public:
             rec_.status = "error";
             rec_.error_type = "RpcError";
             rec_.error_message = "unhandled exception during dispatch";
-            rec_.has_response_state = false;
+            rec_.response_state_bytes = -1;
         }
         rec_.duration_ms =
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started_)
@@ -187,7 +187,7 @@ public:
         rec_.error_code = code;
         // A refused turn handed back no usable continuation, whatever the
         // handler had produced before the refusal.
-        rec_.has_response_state = false;
+        rec_.response_state_bytes = -1;
     }
 
 private:
@@ -204,10 +204,6 @@ private:
 // plaintext, with no AEAD layer for §4.4's "decrypted" to strip.  Logging it
 // is what distinguishes a turn that handed back a continuation from the
 // terminal one that did not.
-std::string state_b64(const std::string& token) {
-    return base64_encode(reinterpret_cast<const uint8_t*>(token.data()), token.size());
-}
-
 // ---------------------------------------------------------------------------
 // Protocol routing
 //
@@ -1725,7 +1721,7 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
         rec.set_auth(resolved.auth);
         AccessLogWriter* upload_log = rpc_.access_log();
         if (upload_log != nullptr && upload_log->enabled()) {
-            fill_request_data(*upload_log, rec, batch);
+            fill_request_shape(rec, batch);
         }
         TurnRecord turn(upload_log, std::move(rec));
 
@@ -1950,11 +1946,11 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
         rec.set_auth(resolved.auth);
         rec.stream_id = stream_id;
         AccessLogWriter* stream_log = rpc_.access_log();
-        // request_data rides the init record and only the init record: it is
-        // what distinguishes an init from a continuation without keying off a
-        // method name.
+        // The request shape rides the init record and only the init record: it
+        // is what distinguishes an init from a continuation without keying off
+        // a method name.
         if (stream_log != nullptr && stream_log->enabled()) {
-            fill_request_data(*stream_log, rec, request.batch());
+            fill_request_shape(rec, request.batch());
         }
         TurnRecord turn(stream_log, std::move(rec));
 
@@ -2033,8 +2029,7 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
                 session->preferred_response_bytes = preferred_response;
                 session->stream_id = stream_id;
                 // A token went out, so this turn is not the terminal one.
-                turn.record().response_state_b64 = state_b64(cursor);
-                turn.record().has_response_state = true;
+                turn.record().response_state_bytes = static_cast<int64_t>(cursor.size());
                 std::lock_guard<std::mutex> registry_lock(streams_mutex_);
                 streams_[cursor] = std::move(session);
             } else {
@@ -2073,9 +2068,8 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
                     session->stream_id = stream_id;
                     // Same here: a producer that ran to exhaustion inside
                     // /init registers nothing and hands back no token, and the
-                    // absent response_state is what says so.
-                    turn.record().response_state_b64 = state_b64(cursor);
-                    turn.record().has_response_state = true;
+                    // absent response_state_bytes is what says so.
+                    turn.record().response_state_bytes = static_cast<int64_t>(cursor.size());
                     std::lock_guard<std::mutex> registry_lock(streams_mutex_);
                     streams_[cursor] = std::move(session);
                 }
@@ -2101,7 +2095,7 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
                 method_name + "'";
             // The registry entry the body advertised has just been erased, so
             // the token it carried resumes nothing: `failed` withdraws the
-            // response_state with it.
+            // response_state_bytes with it.
             turn.failed("RpcError", msg);
             set_arrow_content(
                 req, res, error_body(output_schema, "RpcError", msg, rpc_.server_id(), request_id));
@@ -2218,11 +2212,11 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
     // The init's id, not this turn's cursor: reassembling a call's turns is
     // the whole reason the field exists.
     rec.stream_id = sess->stream_id;
-    // request_data is the init record's alone -- carrying it again on every
-    // continuation is how a stream's records stop being distinguishable.  The
-    // state this turn resumed from goes in its place.
-    rec.request_state_b64 = state_b64(cursor);
-    rec.has_request_state = true;
+    // The request shape is the init record's alone -- carrying it again on
+    // every continuation is how a stream's records stop being
+    // distinguishable.  The size of the token this turn resumed from goes in
+    // its place; the token itself is replayable and is never logged.
+    rec.request_state_bytes = static_cast<int64_t>(cursor.size());
     TurnRecord turn(rpc_.access_log(), std::move(rec));
 
     if (custom_metadata && custom_metadata->FindKey(keys::CANCEL) >= 0) {
@@ -2333,8 +2327,7 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
             });
             // An exchange turn always hands the cursor back: the stream ends
             // when the client stops asking, not when the server says so.
-            turn.record().response_state_b64 = state_b64(cursor);
-            turn.record().has_response_state = true;
+            turn.record().response_state_bytes = static_cast<int64_t>(cursor.size());
             if (response_limit && static_cast<int64_t>(body.size()) > *response_limit) {
                 {
                     std::lock_guard<std::mutex> registry_lock(streams_mutex_);
@@ -2371,8 +2364,7 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
                     VGI_RPC_THROW_NOT_OK(writer->WriteRecordBatch(*make_empty_batch(output_schema),
                                                                   cursor_metadata(cursor)));
                     // Non-terminal: a further token went out with this turn.
-                    turn.record().response_state_b64 = state_b64(cursor);
-                    turn.record().has_response_state = true;
+                    turn.record().response_state_bytes = static_cast<int64_t>(cursor.size());
                 }
                 VGI_RPC_THROW_NOT_OK(writer->Close());
             });
