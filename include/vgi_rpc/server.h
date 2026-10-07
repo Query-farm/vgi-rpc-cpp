@@ -284,6 +284,26 @@ private:
     int64_t access_log_max_record_bytes_ = kDefaultMaxRecordBytes;
 };
 
+// Options for `Server::serve_unix`: the server half of the launcher worker
+// contract (vgi_rpc.launcher in the reference), where a launcher spawns
+// `<worker> --unix PATH --idle-timeout SEC` and relies on the worker to exit
+// once nobody has used it for SEC seconds.
+struct VGI_RPC_EXPORT UnixServerOptions {
+    // Self-terminate after this long with zero connected clients; zero (the
+    // default) serves until the process is killed.  The clock is armed at
+    // bind for `startup_grace`, cancelled by every accepted connection, and
+    // re-armed for `idle_timeout` whenever the last connection closes.  When
+    // it expires `serve_unix` stops accepting, unlinks the socket and returns
+    // normally, so a worker whose main returns after it exits 0.
+    std::chrono::milliseconds idle_timeout{0};
+
+    // How long a worker may wait for its *first* client.  Unset means
+    // max(idle_timeout, 60s), the reference's rule: a launcher spawns the
+    // worker before it connects, and a short idle timeout must not race that
+    // first connect.  Only tests have a reason to set it.
+    std::optional<std::chrono::milliseconds> startup_grace;
+};
+
 // Pipe operation dispatches one request at a time. HTTP and the Unix/TCP
 // listeners may invoke unrelated handlers concurrently; implementations that
 // share mutable state between calls must provide their own synchronization.
@@ -304,7 +324,13 @@ public:
     void serve_http(const std::string& host, int port, int64_t max_response_bytes = -1);
 
     // Serve over a Unix domain socket, printing "UNIX:<path>" once bound.
+    // Serves until the process is killed.
     void serve_unix(const std::string& path);
+
+    // The same, returning once `options.idle_timeout` (when set) expires with
+    // no client connected.  Throws std::invalid_argument for a negative
+    // timeout or grace, before binding.
+    void serve_unix(const std::string& path, const UnixServerOptions& options);
 
     // Serve over TCP with the same raw Arrow-IPC framing as the Unix socket
     // (no HTTP envelope), printing "TCP:<host>:<port>" once bound.  Carries no

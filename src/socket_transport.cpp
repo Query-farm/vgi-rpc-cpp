@@ -266,12 +266,50 @@ void widen_socket_buffers(int fd) {
     ::setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &size, sizeof(size));
 }
 
+// Wait for `listen_fd` to have a connection to accept, or for the idle clock
+// to run out.  Returns false once it has: no connection admitted and the
+// deadline (startup grace before the first client, `idle_timeout` after the
+// last one left) passed.
+//
+// A poll bounded by the deadline rather than a timer thread closing the
+// listener: Linux does not wake a blocked accept() when another thread closes
+// its socket.  While a connection is admitted there is no deadline, but its
+// closing re-arms one from a worker thread, so the wait is capped to notice.
+bool wait_for_connection_or_idle(int listen_fd, socket_detail::SocketConnectionPool& connections,
+                                 std::chrono::steady_clock::time_point started,
+                                 std::chrono::milliseconds idle_timeout,
+                                 std::chrono::milliseconds startup_grace) {
+    constexpr auto kBusyRecheck = std::chrono::milliseconds(100);
+    while (true) {
+        const auto deadline = socket_detail::idle_deadline(connections.idle_snapshot(), started,
+                                                           idle_timeout, startup_grace);
+        auto wait = kBusyRecheck;
+        if (deadline) {
+            const auto now = std::chrono::steady_clock::now();
+            if (now >= *deadline) return false;
+            // Round up: a poll that wakes a millisecond early just spins once.
+            wait = std::chrono::ceil<std::chrono::milliseconds>(*deadline - now);
+        }
+        pollfd descriptor{listen_fd, POLLIN, 0};
+        const int ready = ::poll(
+            &descriptor, 1,
+            static_cast<int>(std::min<int64_t>(wait.count(), std::numeric_limits<int>::max())));
+        if (ready > 0) return true;
+        if (ready < 0 && errno != EINTR) return true;  // let accept() report it
+    }
+}
+
 // `is_tcp` picks the per-socket tuning: Nagle off for TCP, wider buffers for a
-// Unix socket.  Neither setting means anything on the other family.
+// Unix socket.  Neither setting means anything on the other family.  A zero
+// `idle_timeout` serves until the process ends; otherwise the loop returns
+// once the listener has been idle that long (see wait_for_connection_or_idle).
 void accept_loop(int listen_fd, TransportKind transport_kind, size_t maximum_active_connections,
                  size_t maximum_pending_connections,
-                 std::function<void(int, const AcceptedPeer&)> serve) {
+                 std::function<void(int, const AcceptedPeer&)> serve,
+                 std::chrono::milliseconds idle_timeout = std::chrono::milliseconds::zero(),
+                 std::chrono::milliseconds startup_grace = std::chrono::milliseconds::zero()) {
     const bool is_tcp = transport_kind == TransportKind::TCP;
+    const auto started = std::chrono::steady_clock::now();
     socket_detail::SocketConnectionPool connections(
         maximum_active_connections, maximum_pending_connections, std::move(serve),
         [](socket_detail::ConnectionFailure) {
@@ -280,6 +318,10 @@ void accept_loop(int listen_fd, TransportKind transport_kind, size_t maximum_act
             std::fprintf(stderr, "vgi_rpc: connection rejected\n");
         });
     while (true) {
+        if (idle_timeout > std::chrono::milliseconds::zero() &&
+            !wait_for_connection_or_idle(listen_fd, connections, started, idle_timeout,
+                                         startup_grace))
+            break;
         sockaddr_storage peer_storage{};
         socklen_t peer_size = sizeof(peer_storage);
         int fd = ::accept(listen_fd, reinterpret_cast<sockaddr*>(&peer_storage), &peer_size);
@@ -326,6 +368,17 @@ TcpServerOptions::ResolvedIdentity socket_detail::resolve_tcp_identity(
 }
 
 void Server::serve_unix(const std::string& path) {
+    serve_unix(path, UnixServerOptions{});
+}
+
+void Server::serve_unix(const std::string& path, const UnixServerOptions& options) {
+    if (options.idle_timeout < std::chrono::milliseconds::zero())
+        throw std::invalid_argument("unix idle timeout must not be negative");
+    if (options.startup_grace && *options.startup_grace < std::chrono::milliseconds::zero())
+        throw std::invalid_argument("unix startup grace must not be negative");
+    const auto startup_grace =
+        options.startup_grace.value_or(socket_detail::default_startup_grace(options.idle_timeout));
+
     // A leftover socket file from an unclean exit would make bind fail with
     // EADDRINUSE even though nothing is listening.
     ::unlink(path.c_str());
@@ -363,8 +416,10 @@ void Server::serve_unix(const std::string& path) {
     // Discovery line, then flush: a launcher blocks on this to learn the
     // socket is ready, so buffering it would look like a hung worker.
     std::cout << "UNIX:" << path << std::endl;
-    accept_loop(listen_fd, TransportKind::UNIX, 32, 128,
-                [this](int fd, const AcceptedPeer&) { serve_socket_fd(fd, TransportKind::UNIX); });
+    accept_loop(
+        listen_fd, TransportKind::UNIX, 32, 128,
+        [this](int fd, const AcceptedPeer&) { serve_socket_fd(fd, TransportKind::UNIX); },
+        options.idle_timeout, startup_grace);
     ::unlink(path.c_str());
 }
 
@@ -461,6 +516,10 @@ void Server::serve_tcp(const std::string& host, int port, const TcpServerOptions
 #else  // _WIN32
 
 void Server::serve_unix(const std::string&) {
+    throw std::runtime_error("unix socket transport is not available on Windows");
+}
+
+void Server::serve_unix(const std::string&, const UnixServerOptions&) {
     throw std::runtime_error("unix socket transport is not available on Windows");
 }
 

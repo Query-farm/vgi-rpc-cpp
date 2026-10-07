@@ -219,6 +219,29 @@ bool serve_one(
 
 Process a single request. Returns `true` if a request was served, `false` on EOF (clean shutdown). Useful for testing with custom I/O streams.
 
+#### `serve_unix`
+
+```cpp
+void serve_unix(const std::string& path);
+void serve_unix(const std::string& path, const UnixServerOptions& options);
+```
+
+Serve raw Arrow-IPC connections on a Unix domain socket, printing
+`UNIX:<path>` once it listens. This is the server half of the launcher worker
+contract (`vgi_rpc.launcher` in the reference): a launcher spawns
+`<worker> --unix PATH --idle-timeout SEC` and relies on the worker to exit
+once it has been idle that long.
+
+`UnixServerOptions::idle_timeout` (zero, the default, serves forever) gives
+the reference's rule. The clock starts at bind with a startup grace of
+`max(idle_timeout, 60s)`, so the launcher's first connect cannot lose a race
+with a short timeout. Every accepted connection stops it, and it restarts for
+`idle_timeout` when the last connection closes. When it runs out,
+`serve_unix` stops accepting, unlinks the socket and returns normally. A
+worker whose `main` then returns exits 0. `startup_grace` overrides the grace,
+which only tests need. A negative duration throws `std::invalid_argument`
+before binding.
+
 #### `serve_tcp`
 
 ```cpp

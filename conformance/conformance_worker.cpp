@@ -22,6 +22,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
@@ -1867,6 +1868,7 @@ int main(int argc, char** argv) {
     bool http = false;
     bool unix_mode = false;
     std::string unix_path;
+    vgi_rpc::UnixServerOptions unix_options;
     bool tcp_mode = false;
     bool fail_serve_start_once = false;
     bool transport_kind_probe = false;
@@ -2044,6 +2046,17 @@ int main(int argc, char** argv) {
             http_cfg.proof_skew_seconds = std::stoi(take_value(i));
         } else if (arg == "--proof-no-replay-cache") {
             http_cfg.proof_replay_cache = false;
+        } else if (arg == "--idle-timeout") {
+            // Seconds, as the launcher writes them ("300", "0.25"); 0 disables,
+            // as in the reference.  Only the Unix listener honours it.
+            const std::string value = take_value(i);
+            char* end = nullptr;
+            const double seconds = std::strtod(value.c_str(), &end);
+            if (value.empty() || *end != '\0' || !std::isfinite(seconds) || seconds < 0) {
+                std::cerr << "vgi_rpc: --idle-timeout needs a non-negative number of seconds\n";
+                return 2;
+            }
+            unix_options.idle_timeout = std::chrono::milliseconds(std::llround(seconds * 1000.0));
         } else if (arg == "--access-log-max-record-bytes" && i + 1 < argc) {
             access_log_max_record_bytes = std::stoll(take_value(i));
         } else if ((arg == "--access-log-max-bytes" || arg == "--access-log-when" ||
@@ -2506,7 +2519,7 @@ int main(int argc, char** argv) {
         if (http) {
             server->serve_http(http_cfg);
         } else if (unix_mode) {
-            server->serve_unix(unix_path);
+            server->serve_unix(unix_path, unix_options);
         } else if (tcp_mode) {
             server->serve_tcp(http_cfg.host, http_cfg.port);
         } else {

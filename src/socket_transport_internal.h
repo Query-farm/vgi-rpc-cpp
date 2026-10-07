@@ -22,6 +22,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <poll.h>
 #include <span>
 #include <stdexcept>
@@ -220,6 +221,33 @@ private:
 
 enum class ConnectionFailure { REJECTED, CLOSED_AFTER_ERROR };
 
+// The reference's startup grace for an idle-terminating listener: a launcher
+// spawns the worker before it connects, so the first client gets at least a
+// minute however short the idle timeout is.
+inline std::chrono::milliseconds default_startup_grace(std::chrono::milliseconds idle_timeout) {
+    return std::max<std::chrono::milliseconds>(idle_timeout, std::chrono::seconds(60));
+}
+
+// What the idle clock needs from the connection pool, read under its lock.
+struct IdleSnapshot {
+    size_t admitted = 0;
+    bool ever_admitted = false;
+    // When `admitted` last fell to zero; meaningful once `ever_admitted`.
+    std::chrono::steady_clock::time_point drained_at{};
+};
+
+// When an idle listener should stop, or nullopt while a connection is
+// admitted (which pauses the clock).  Before the first connection the clock
+// runs from `started` for `startup_grace`; after it, from the moment the last
+// connection drained for `idle_timeout`.
+inline std::optional<std::chrono::steady_clock::time_point> idle_deadline(
+    const IdleSnapshot& snapshot, std::chrono::steady_clock::time_point started,
+    std::chrono::milliseconds idle_timeout, std::chrono::milliseconds startup_grace) noexcept {
+    if (snapshot.admitted != 0) return std::nullopt;
+    if (!snapshot.ever_admitted) return deadline_after(started, startup_grace);
+    return deadline_after(snapshot.drained_at, idle_timeout);
+}
+
 // A bounded executor for persistent accepted sockets. submit() never waits:
 // at saturation ownership stays with the caller, which can close immediately
 // and keep accept() responsive.  The admitted count includes active work and
@@ -250,9 +278,15 @@ public:
         std::lock_guard lock(mutex_);
         if (stopping_ || admitted_ == maximum_admitted_) return false;
         ++admitted_;
+        ever_admitted_ = true;
         pending_.push_back({fd, std::move(peer)});
         work_available_.notify_one();
         return true;
+    }
+
+    IdleSnapshot idle_snapshot() {
+        std::lock_guard lock(mutex_);
+        return {admitted_, ever_admitted_, drained_at_};
     }
 
     void stop() noexcept {
@@ -303,7 +337,7 @@ private:
                 std::lock_guard lock(mutex_);
                 active_.erase(connection.fd);
                 ::close(connection.fd);
-                --admitted_;
+                if (--admitted_ == 0) drained_at_ = std::chrono::steady_clock::now();
             }
         }
     }
@@ -312,6 +346,8 @@ private:
     LogFailure log_failure_;
     size_t maximum_admitted_;
     size_t admitted_ = 0;
+    bool ever_admitted_ = false;
+    std::chrono::steady_clock::time_point drained_at_{};
     std::mutex mutex_;
     std::condition_variable work_available_;
     std::deque<Connection> pending_;

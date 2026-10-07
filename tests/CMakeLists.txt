@@ -26,6 +26,7 @@ target_compile_definitions(identity_providers_test PRIVATE
 )
 vgi_rpc_add_test(proxy_protocol_v2_test)
 vgi_rpc_add_test(socket_admission_test)
+vgi_rpc_add_test(unix_idle_test)
 vgi_rpc_add_test(metadata_test)
 vgi_rpc_add_test(wire_test)
 vgi_rpc_add_test(request_test)

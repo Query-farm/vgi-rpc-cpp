@@ -40,7 +40,7 @@ Define RPC methods with typed C++20 handlers using Arrow schemas. The framework 
 | Transport | Entry point | Discovery line |
 |---|---|---|
 | Pipe (stdin/stdout) | `Server::run()` | — |
-| Unix domain socket | `Server::serve_unix(path)` | `UNIX:<path>` |
+| Unix domain socket | `Server::serve_unix(path[, UnixServerOptions])` (idle self-termination for launched workers) | `UNIX:<path>` |
 | TCP (trusted networks; no auth or TLS) | `Server::serve_tcp(host, port)` | `TCP:<host>:<port>` |
 | TCP behind a trusted L4 proxy | `Server::serve_tcp(host, port, TcpServerOptions)` | Required PROXY v2 + connection identity snapshot |
 | HTTP | `Server::serve_http(HttpConfig)` | `PORT:<port>` |
