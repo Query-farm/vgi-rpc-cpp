@@ -1152,9 +1152,11 @@ HttpServer::ResolvedHttpIdentity HttpServer::resolve_http_identity(
     const std::string header = req.get_header_value("Authorization");
     if (header.empty()) {
         // A deployment bearer authenticator is the server's only door, so no
-        // credential is a refusal; without one, nothing changes for a request
-        // that carries none.
-        if (cfg_.bearer_authenticate) throw BearerRejected(AuthReason::INVALID_CREDENTIAL);
+        // credential is a refusal -- unless the deployment made it optional.
+        // Without one, nothing changes for a request that carries none.
+        if (cfg_.bearer_authenticate && !cfg_.bearer_optional) {
+            throw BearerRejected(AuthReason::INVALID_CREDENTIAL);
+        }
         return resolved;
     }
     constexpr std::string_view kBearer = "Bearer ";

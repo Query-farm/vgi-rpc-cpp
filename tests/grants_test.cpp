@@ -600,6 +600,78 @@ TEST_CASE("the deployment's bearer authenticator runs first", "[grants][http]") 
     CHECK(server.whoami(std::nullopt).status == 401);
 }
 
+namespace {
+
+// A static-token authenticator: `static-token` is static-user, anything else
+// is not this authenticator's credential.
+HttpConfig static_bearer_config(bool optional) {
+    HttpConfig cfg;
+    cfg.bearer_optional = optional;
+    cfg.bearer_authenticate = [](const std::string& token) -> std::optional<AuthContext> {
+        if (token != "static-token") return std::nullopt;
+        AuthContext auth;
+        auth.domain = "bearer";
+        auth.authenticated = true;
+        auth.principal = "static-user";
+        return auth;
+    };
+    return cfg;
+}
+
+}  // namespace
+
+TEST_CASE("an optional bearer authenticator leaves a header-less request anonymous",
+          "[grants][http]") {
+    ChainServer optional(static_bearer_config(true));
+    const auto anonymous = optional.whoami(std::nullopt);
+    REQUIRE(anonymous.status == 200);
+    CHECK((*anonymous.who)["authenticated"] == false);
+    CHECK((*anonymous.who)["principal"] == "");
+
+    const auto as_static = optional.whoami(std::string("Bearer static-token"));
+    REQUIRE(as_static.status == 200);
+    CHECK((*as_static.who)["domain"] == "bearer");
+    CHECK((*as_static.who)["principal"] == "static-user");
+    // The identity bearers still follow the deployment's authenticator.
+    const auto as_grant = optional.whoami("Bearer " + grant_for("alice"));
+    REQUIRE(as_grant.status == 200);
+    CHECK((*as_grant.who)["domain"] == "grant");
+}
+
+TEST_CASE("optional changes only the absent header: a bad credential is refused as before",
+          "[grants][http]") {
+    ChainServer optional(static_bearer_config(true));
+    ChainServer required(static_bearer_config(false));
+    // A bearer nothing accepts, another scheme, and a forged grant are refused
+    // the same way; an identity outage is the same 503.
+    for (const auto& [header, status] : std::vector<std::pair<std::string, int>>{
+             {"Bearer unknown", 401},
+             {"Basic c3RhdGljOnRva2Vu", 401},
+             {"Bearer vgig1.forged", 401},
+             {"Bearer outage", 503},
+         }) {
+        INFO(header);
+        const auto a = optional.whoami(header);
+        const auto b = required.whoami(header);
+        CHECK(a.status == status);
+        CHECK(a.status == b.status);
+        CHECK(a.reason == b.reason);
+        CHECK(a.retry_after == b.retry_after);
+    }
+    // Without the flag, no credential is still a refusal.
+    CHECK(required.whoami(std::nullopt).status == 401);
+}
+
+TEST_CASE("bearer_optional without a bearer authenticator changes nothing", "[grants][http]") {
+    HttpConfig cfg;
+    cfg.bearer_optional = true;
+    ChainServer server(cfg);
+    const auto anonymous = server.whoami(std::nullopt);
+    REQUIRE(anonymous.status == 200);
+    CHECK((*anonymous.who)["authenticated"] == false);
+    CHECK(server.whoami(std::string("Bearer unknown")).status == 401);
+}
+
 TEST_CASE("bearer alternatives are not OR-ed beside a peer policy", "[grants][http]") {
     ServerBuilder builder;
     builder.add_void("noop", empty_schema(), [](const Request&, CallContext&) {});

@@ -172,7 +172,13 @@ The HTTP authentication order is: the deployment's own authenticators
   the hook's `Retry-After`. JWS-shaped, blank and over-4096-byte tokens are
   never passed to it.
 - With no deployment bearer authenticator, a request with no `Authorization`
-  header stays anonymous.
+  header stays anonymous. With one, it is a 401, unless
+  `HttpConfig::bearer_optional` is set: then a header-less request stays
+  anonymous too, so one server can serve anonymous and bearer-identified
+  callers. The flag changes only the absent header. A present credential runs
+  the chain exactly as before (a non-`Bearer` scheme, or a bearer nothing
+  accepts, is still a 401), so an authenticator that wants unknown tokens to be
+  anonymous returns `AuthContext::anonymous()` for them itself.
 
 A `peer_authentication_policy` is transport- or proxy-injected evidence — a
 gate. Bearer alternatives OR-ed beside it would bypass it, so `serve_http`

@@ -214,6 +214,18 @@ struct HttpConfig {
     // bypass it, so that combination refuses to start; compose explicitly and
     // set this to `false`.
     bool identity_bearer = true;
+
+    // Make `bearer_authenticate` optional: a request with no `Authorization`
+    // header stays anonymous instead of being refused 401, so one server can
+    // serve anonymous callers and bearer-identified ones side by side.  Only
+    // the absent header changes: a present credential runs the chain exactly
+    // as without this flag (a non-`Bearer` scheme, or a bearer nothing
+    // accepts, is still 401), so an authenticator that wants unknown tokens to
+    // be anonymous returns `AuthContext::anonymous()` for them itself (as the
+    // vgi-python / vgi-rust fixtures' `VGI_OPTIONAL_BEARER_TOKENS` do).  Without
+    // `bearer_authenticate` the flag has no effect: a header-less request is already anonymous.
+    // Appended for positional aggregate source compatibility.
+    bool bearer_optional = false;
 };
 
 }  // namespace vgi_rpc
