@@ -229,9 +229,13 @@ enum class Server { CPP, PYTHON };
 enum class Transport { PIPE, SHM_PIPE, UNIX, TCP, HTTP, HTTP_SESSION };
 
 /// Where each conformance server mounts its HTTP routes.
-std::string http_prefix(Server server) { return server == Server::CPP ? "/vgi" : ""; }
+std::string http_prefix(Server server) {
+    return server == Server::CPP ? "/vgi" : "";
+}
 
-const char* server_name(Server server) { return server == Server::CPP ? "cpp" : "python"; }
+const char* server_name(Server server) {
+    return server == Server::CPP ? "cpp" : "python";
+}
 
 const char* transport_name(Transport transport) {
     switch (transport) {
@@ -257,9 +261,7 @@ std::vector<std::string> server_argv(Server server, Transport transport,
             case Transport::UNIX: argv.insert(argv.end(), {"--unix", unix_path}); break;
             case Transport::TCP: argv.insert(argv.end(), {"--tcp", "127.0.0.1:0"}); break;
             case Transport::HTTP:
-            case Transport::HTTP_SESSION:
-                argv.insert(argv.end(), {"--http", "--port", "0"});
-                break;
+            case Transport::HTTP_SESSION: argv.insert(argv.end(), {"--http", "--port", "0"}); break;
         }
         return argv;
     }
@@ -281,15 +283,17 @@ std::vector<std::string> server_argv(Server server, Transport transport,
 std::shared_ptr<arrow::RecordBatch> string_params(const std::string& value) {
     arrow::StringBuilder builder;
     VGI_RPC_THROW_NOT_OK(builder.Append(value));
-    return arrow::RecordBatch::Make(arrow::schema({arrow::field("value", arrow::utf8(), /*nullable=*/false)}), 1,
-                                    {unwrap(builder.Finish())});
+    return arrow::RecordBatch::Make(
+        arrow::schema({arrow::field("value", arrow::utf8(), /*nullable=*/false)}), 1,
+        {unwrap(builder.Finish())});
 }
 
 std::shared_ptr<arrow::RecordBatch> count_params(int64_t count) {
     arrow::Int64Builder builder;
     VGI_RPC_THROW_NOT_OK(builder.Append(count));
-    return arrow::RecordBatch::Make(arrow::schema({arrow::field("count", arrow::int64(), /*nullable=*/false)}), 1,
-                                    {unwrap(builder.Finish())});
+    return arrow::RecordBatch::Make(
+        arrow::schema({arrow::field("count", arrow::int64(), /*nullable=*/false)}), 1,
+        {unwrap(builder.Finish())});
 }
 
 std::string string_result(const AnnotatedBatch& value) {
@@ -350,7 +354,8 @@ public:
         return target().describe_protocol(name);
     }
     std::string echo(const std::string& value) override {
-        return string_result(target().call("echo_string", AnnotatedBatch::data(string_params(value))));
+        return string_result(
+            target().call("echo_string", AnnotatedBatch::data(string_params(value))));
     }
     int produce(int64_t count) override {
         auto stream =
@@ -416,7 +421,7 @@ struct Fixture {
 };
 
 std::unique_ptr<Fixture> connect_to(Server server, Transport transport, bool describe = true,
-                              const std::string& protocol = kPrimary) {
+                                    const std::string& protocol = kPrimary) {
     auto fixture = std::make_unique<Fixture>();
     if (transport == Transport::UNIX) fixture->unix_path = temp_socket_path();
     const auto argv = server_argv(server, transport, fixture->unix_path, describe);
@@ -502,11 +507,11 @@ bool is_hex64(const std::string& value) {
     return std::regex_match(value, pattern);
 }
 
-#define SKIP_UNLESS_AVAILABLE(server)                                                  \
-    do {                                                                               \
-        if ((server) == Server::PYTHON && !python_reference_available()) {            \
-            SKIP("reference vgi_rpc not importable by " << python_executable());       \
-        }                                                                              \
+#define SKIP_UNLESS_AVAILABLE(server)                                            \
+    do {                                                                         \
+        if ((server) == Server::PYTHON && !python_reference_available()) {       \
+            SKIP("reference vgi_rpc not importable by " << python_executable()); \
+        }                                                                        \
     } while (0)
 
 }  // namespace
@@ -699,7 +704,8 @@ TEST_CASE("RpcClient reflection rides the streams the caller handed it",
     SKIP_UNLESS_AVAILABLE(server);
     int to_child = -1;
     int from_child = -1;
-    const pid_t pid = spawn_process(server_argv(server, Transport::PIPE, ""), &to_child, &from_child);
+    const pid_t pid =
+        spawn_process(server_argv(server, Transport::PIPE, ""), &to_child, &from_child);
     std::atomic<int64_t> written{0};
     std::atomic<int64_t> read{0};
     {
@@ -753,8 +759,8 @@ TEST_CASE("HttpClient reflection rides the client's own state", "[reflection][co
     std::lock_guard<std::mutex> lock(mutex);
     CHECK(std::count(paths.begin(), paths.end(),
                      http_prefix(server) + "/" + kReflection + "/list_protocols") == 2);
-    CHECK(std::count(paths.begin(), paths.end(), http_prefix(server) + "/" + kReflection + "/describe") ==
-          1);
+    CHECK(std::count(paths.begin(), paths.end(),
+                     http_prefix(server) + "/" + kReflection + "/describe") == 1);
 }
 
 // --- a server without reflection --------------------------------------------------
@@ -820,8 +826,9 @@ TEST_CASE("an HTTP server older than protocol routes (bare 404) is ReflectionNot
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     {
-        auto client =
-            HttpClient::builder("http://127.0.0.1:" + std::to_string(port)).protocol(kPrimary).build();
+        auto client = HttpClient::builder("http://127.0.0.1:" + std::to_string(port))
+                          .protocol(kPrimary)
+                          .build();
         try {
             (void)client.list_protocols();
             FAIL("a bare 404 produced a listing");
