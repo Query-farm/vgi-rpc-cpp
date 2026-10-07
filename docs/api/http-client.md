@@ -33,11 +33,15 @@ identity-key, and timeout settings. See [Native Iroh client](../native-iroh-clie
 HTTP-over-Iroh changes only the carrier; all behavior documented below remains
 the same.
 
-`describe()` goes through `vgi_rpc.Reflection.v1` -- `list_protocols()` to
-find the application protocol, then `describe(protocol)` -- and returns a
-validated `ServiceDescription`. Pass the protocol name to skip the first hop;
-`server_id` and `request_version` are then empty, being properties only
-`list_protocols()` reports. Malformed schemas and duplicate method names fail
+`list_protocols()`, `describe_protocol(name)` and `describe()` go through
+`vgi_rpc.Reflection.v1` on this client's own connection pool, prefix,
+credentials, retry policy and sticky session (see
+[Discovering protocols](reflection.md)). `describe_protocol(name)` lists first,
+then describes, and returns a validated `ServiceDescription`; `describe()` does
+the same for the first application protocol. A server without reflection --
+including a bare 404 from one older than protocol-scoped routes -- throws
+`ReflectionNotSupportedError`, an `RpcException`, and the client stays usable.
+Malformed schemas and duplicate method names fail
 closed rather than producing a partial model, but unknown columns are ignored
 and defaulted ones default: a version-mismatched client calls reflection to
 learn *what* mismatched, so the decoder must survive minor skew.

@@ -330,19 +330,24 @@ public:
     // capabilities.  Ordinary RPC responses refine the same cache.
     HttpServerCapabilities capabilities(const CallOptions& options = {}) const;
 
-    // Every protocol this server hosts, with versions and hashes.  The cheap
-    // half of discovery: the hash answers "has it changed" without
-    // transferring a single schema.
-    ProtocolListing list_protocols(const CallOptions& options = {}) const;
+    // Every protocol this server hosts, in the server's order, via
+    // vgi_rpc.Reflection.v1 -- see RpcClient::list_protocols.  The call rides
+    // this client's own connection pool, prefix, auth, retry, sticky-session
+    // and response-budget settings; nothing is opened beside them and nothing
+    // is closed.  Throws ReflectionNotSupportedError when the server does not
+    // host reflection (including a bare 404 from a server older than
+    // protocol-scoped routes); the client remains usable.
+    std::vector<HostedProtocol> list_protocols(const CallOptions& options = {}) const;
 
-    // Fetch and validate one protocol's description via vgi_rpc.Reflection.v1.
-    // Costs up to two round trips, because a server may host several protocols
-    // and there is no longer a single "the" protocol to describe without
-    // asking.  Name the protocol to skip the first hop; server_id and
-    // request_version are then empty, being properties only list_protocols
-    // reports.
+    // One hosted protocol's description: list_protocols, then describe(name).
+    // An unhosted name is an RpcRemoteError with error_kind()
+    // "protocol_not_supported"; no reflection is ReflectionNotSupportedError.
+    ServiceDescription describe_protocol(const std::string& name,
+                                         const CallOptions& options = {}) const;
+
+    // The application protocol's description: describe_protocol on the first
+    // listed protocol outside the reserved vgi_rpc. prefix.
     ServiceDescription describe(const CallOptions& options = {}) const;
-    ServiceDescription describe(const std::string& protocol, const CallOptions& options = {}) const;
 
     // Request one or more method-bound external upload/download URL pairs.
     std::vector<HttpUploadUrl> request_upload_urls(int64_t count,
@@ -398,6 +403,9 @@ private:
     AnnotatedBatch call_reflection(const std::string& method, const AnnotatedBatch& request,
                                    const CallOptions& options) const;
 
+    // list_protocols with the server identity, classifying "not hosted".
+    ProtocolListing protocol_listing(const CallOptions& options) const;
+
     std::shared_ptr<HttpClientState> state_;
     std::shared_ptr<HttpStickySessionState> sticky_session_;
 };
@@ -414,9 +422,10 @@ public:
                         std::shared_ptr<arrow::Schema> expected_output_schema = nullptr,
                         const CallOptions& options = {}) const;
     HttpServerCapabilities capabilities(const CallOptions& options = {}) const;
-    ProtocolListing list_protocols(const CallOptions& options = {}) const;
+    std::vector<HostedProtocol> list_protocols(const CallOptions& options = {}) const;
+    ServiceDescription describe_protocol(const std::string& name,
+                                         const CallOptions& options = {}) const;
     ServiceDescription describe(const CallOptions& options = {}) const;
-    ServiceDescription describe(const std::string& protocol, const CallOptions& options = {}) const;
     std::vector<HttpUploadUrl> request_upload_urls(int64_t count,
                                                    const CallOptions& options = {}) const;
     HttpExchangeSession open_exchange(const std::string& method, const AnnotatedBatch& request,

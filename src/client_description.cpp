@@ -181,12 +181,12 @@ std::shared_ptr<arrow::Schema> schema_from_ipc(const std::string& bytes) {
                        static_cast<int32_t>(bytes.size()));
 }
 
-ReflectedProtocol decode_summary(const arrow::StructArray& values, int64_t row, const char* what) {
-    ReflectedProtocol summary;
-    summary.protocol = take_string(field_of(values, "protocol"), row, what, "protocol", nullptr);
-    summary.protocol_version =
+HostedProtocol decode_summary(const arrow::StructArray& values, int64_t row, const char* what) {
+    HostedProtocol summary;
+    summary.name = take_string(field_of(values, "protocol"), row, what, "protocol", nullptr);
+    summary.version =
         take_string(field_of(values, "protocol_version"), row, what, "protocol_version", nullptr);
-    summary.protocol_hash =
+    summary.hash =
         take_string(field_of(values, "protocol_hash"), row, what, "protocol_hash", nullptr);
     summary.deprecated =
         take_bool(field_of(values, "deprecated"), row, what, "deprecated", nullptr);
@@ -198,9 +198,9 @@ ReflectedProtocol decode_summary(const arrow::StructArray& values, int64_t row, 
 
 }  // namespace
 
-const ReflectedProtocol* ProtocolListing::application() const noexcept {
+const HostedProtocol* ProtocolListing::application() const noexcept {
     for (const auto& summary : protocols) {
-        if (summary.protocol.rfind("vgi_rpc.", 0) != 0) return &summary;
+        if (summary.name.rfind("vgi_rpc.", 0) != 0) return &summary;
     }
     return nullptr;
 }

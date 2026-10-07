@@ -95,5 +95,6 @@ nav:
       - CallContext: api/call-context.md
       - Raw Client: api/raw-client.md
       - HTTP Client: api/http-client.md
+      - Discovering Protocols: api/reflection.md
       - Wire Protocol: api/wire.md
       - Utilities: api/utilities.md

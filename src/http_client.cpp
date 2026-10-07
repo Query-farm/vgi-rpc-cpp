@@ -9,6 +9,7 @@
 #include "vgi_rpc/wire.h"
 
 #include "http_socks5h.h"
+#include "reflection_client_internal.h"
 
 #include <arrow/buffer.h>
 #include <arrow/array.h>
@@ -2493,25 +2494,49 @@ AnnotatedBatch HttpClient::call_reflection(const std::string& method, const Anno
     return std::move(decoded.data[0]);
 }
 
-ProtocolListing HttpClient::list_protocols(const CallOptions& options) const {
+ProtocolListing HttpClient::protocol_listing(const CallOptions& options) const {
     const AnnotatedBatch request = AnnotatedBatch::data(make_empty_batch(empty_schema()));
-    return decode_protocol_list(call_reflection("list_protocols", request, options));
+    try {
+        return decode_protocol_list(call_reflection("list_protocols", request, options));
+    } catch (const RpcRemoteError& error) {
+        if (!detail::reflection_not_hosted(error.error_kind(), error.error_code(),
+                                           error.exception_type())) {
+            throw;
+        }
+        throw ReflectionNotSupportedError(
+            error.exception_type(), error.what(), static_cast<const RemoteStatus&>(error),
+            error.server_id(), error.request_id(), error.http_status());
+    } catch (const HttpClientError& error) {
+        // A server older than protocol-scoped routes has no route for
+        // reflection at all: a bare (non-Arrow) 404.
+        if (error.kind() != HttpClientErrorKind::HTTP_STATUS || error.http_status() != 404) {
+            throw;
+        }
+        throw ReflectionNotSupportedError("HttpError", error.what(), RemoteStatus{}, std::string(),
+                                          error.request_id(), error.http_status());
+    }
 }
 
-ServiceDescription HttpClient::describe(const std::string& protocol,
-                                        const CallOptions& options) const {
+std::vector<HostedProtocol> HttpClient::list_protocols(const CallOptions& options) const {
+    return protocol_listing(options).protocols;
+}
+
+ServiceDescription HttpClient::describe_protocol(const std::string& name,
+                                                 const CallOptions& options) const {
+    const auto listing = protocol_listing(options);
     return decode_service_description(
-        call_reflection("describe", AnnotatedBatch::data(describe_params(protocol)), options));
+        call_reflection("describe", AnnotatedBatch::data(describe_params(name)), options),
+        &listing);
 }
 
 ServiceDescription HttpClient::describe(const CallOptions& options) const {
-    const auto listing = list_protocols(options);
+    const auto listing = protocol_listing(options);
     const auto* application = listing.application();
     if (application == nullptr) {
         throw HttpClientError("server " + listing.server_id + " hosts no application protocol");
     }
     return decode_service_description(
-        call_reflection("describe", AnnotatedBatch::data(describe_params(application->protocol)),
+        call_reflection("describe", AnnotatedBatch::data(describe_params(application->name)),
                         options),
         &listing);
 }
@@ -2582,20 +2607,20 @@ HttpServerCapabilities HttpSessionView::capabilities(const CallOptions& options)
     return impl_->client.capabilities(options);
 }
 
-ProtocolListing HttpSessionView::list_protocols(const CallOptions& options) const {
+std::vector<HostedProtocol> HttpSessionView::list_protocols(const CallOptions& options) const {
     if (!impl_) throw HttpClientError("HTTP sticky-session view is moved from");
     return impl_->client.list_protocols(options);
+}
+
+ServiceDescription HttpSessionView::describe_protocol(const std::string& name,
+                                                      const CallOptions& options) const {
+    if (!impl_) throw HttpClientError("HTTP sticky-session view is moved from");
+    return impl_->client.describe_protocol(name, options);
 }
 
 ServiceDescription HttpSessionView::describe(const CallOptions& options) const {
     if (!impl_) throw HttpClientError("HTTP sticky-session view is moved from");
     return impl_->client.describe(options);
-}
-
-ServiceDescription HttpSessionView::describe(const std::string& protocol,
-                                             const CallOptions& options) const {
-    if (!impl_) throw HttpClientError("HTTP sticky-session view is moved from");
-    return impl_->client.describe(protocol, options);
 }
 
 std::vector<HttpUploadUrl> HttpSessionView::request_upload_urls(int64_t count,

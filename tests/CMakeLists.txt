@@ -92,6 +92,24 @@ if(Python3_FOUND)
     )
 endif()
 
+# Reflection over a held connection, on every transport, against this port's
+# conformance worker and the Python reference conformance server.
+if(NOT WIN32)
+    add_executable(reflection_client_integration reflection_client_integration.cpp)
+    target_link_libraries(reflection_client_integration PRIVATE vgi_rpc Catch2::Catch2WithMain)
+    target_compile_definitions(reflection_client_integration PRIVATE
+        VGI_RPC_CONFORMANCE_WORKER="$<TARGET_FILE:conformance_worker>"
+    )
+    add_dependencies(reflection_client_integration conformance_worker)
+    add_test(NAME reflection_client_integration COMMAND reflection_client_integration)
+    set_tests_properties(reflection_client_integration PROPERTIES TIMEOUT 300)
+    if(Python3_FOUND)
+        set_tests_properties(reflection_client_integration PROPERTIES
+            ENVIRONMENT "VGI_RPC_PYTHON=${Python3_EXECUTABLE}"
+        )
+    endif()
+endif()
+
 add_executable(http_client_fault_test http_client_fault_test.cpp)
 target_link_libraries(http_client_fault_test PRIVATE vgi_rpc zstd::libzstd)
 add_test(NAME http_client_fault_test COMMAND http_client_fault_test)

@@ -251,6 +251,35 @@ private:
     std::string request_id_;
 };
 
+/// The server does not host `vgi_rpc.Reflection.v1`.
+///
+/// Thrown by `list_protocols()`, `describe_protocol()` and `describe()` on
+/// every client (`RpcClient`, `HttpClient`, `HttpSessionView`) when the server
+/// answers the reflection call with "not hosted" rather than with a listing:
+/// `error_kind` `protocol_not_supported` or `method_not_implemented`, code
+/// `UNIMPLEMENTED`, or -- over HTTP, from a server older than protocol-scoped
+/// routes -- a bare 404. Such a server still serves its own protocols, so this
+/// is a statement about discovery, not about the connection: the connection
+/// remains usable. No listing is ever inferred, because only the caller knows
+/// which protocol it expected the server to speak.
+///
+/// An `RpcException`, carrying the server's original fields (`exception_type`,
+/// message, `error_code`, `error_kind`, `error_details`, traceback,
+/// `server_id`, `request_id`), on every transport, HTTP included. Catch this
+/// type to branch on "cannot discover" specifically. `http_status()` is the
+/// HTTP status that carried the answer, or 0 on a byte-stream transport.
+class VGI_RPC_EXPORT ReflectionNotSupportedError : public RpcException {
+public:
+    ReflectionNotSupportedError(std::string exception_type, std::string message,
+                                RemoteStatus status, std::string server_id, std::string request_id,
+                                int http_status = 0);
+
+    int http_status() const noexcept { return http_status_; }
+
+private:
+    int http_status_;
+};
+
 using ClientLogHandler = std::function<void(const Message&)>;
 
 struct RpcClientOptions {
@@ -380,20 +409,35 @@ public:
                                bool has_header = false,
                                std::shared_ptr<arrow::KeyValueMetadata> metadata = nullptr);
 
-    /// Every protocol this server hosts, with versions and hashes.
+    /// Every protocol this server hosts, in the server's order.
     ///
-    /// The cheap half of discovery, and the only one a warm client needs: the
-    /// hash answers "has it changed" without transferring a single schema.
-    ProtocolListing list_protocols();
+    /// One round trip -- `vgi_rpc.Reflection.v1.list_protocols` -- on this
+    /// client's own connection: nothing is opened and nothing is closed. The
+    /// server routes each request by its `vgi_rpc.protocol` key, so it does not
+    /// matter which protocol `RpcClientOptions::protocol` names. Not while a
+    /// stream is open: the connection is single-call-at-a-time.
+    ///
+    /// The cheap half of discovery: `HostedProtocol::hash` answers "has it
+    /// changed" without transferring a single schema.
+    ///
+    /// Throws `ReflectionNotSupportedError` when the server does not host
+    /// reflection (the connection remains usable), `RpcException` for any
+    /// other answer.
+    std::vector<HostedProtocol> list_protocols();
 
-    /// One protocol's full description.
+    /// One hosted protocol's full description, by wire name.
     ///
-    /// Costs up to two round trips, because a server may host several
-    /// protocols and there is no longer a single "the" protocol to describe
-    /// without asking. Name *protocol* to skip the first hop; the returned
-    /// `server_id` and `request_version` are then empty, since those are
-    /// properties of the server that only `list_protocols` reports.
-    ServiceDescription describe(const std::string& protocol = "");
+    /// Two round trips on this client's connection: `list_protocols` -- for the
+    /// server identity the description carries, and to tell "no reflection"
+    /// apart from "no such protocol" -- then `describe(name)`. A name the
+    /// server does not host is an `RpcException` with `error_kind()`
+    /// `"protocol_not_supported"`; a server without reflection is a
+    /// `ReflectionNotSupportedError`.
+    ServiceDescription describe_protocol(const std::string& name);
+
+    /// The application protocol's description: `describe_protocol()` on the
+    /// first listed protocol outside the reserved `vgi_rpc.` prefix.
+    ServiceDescription describe();
 
     ClientTransportOptions transport_options();
     bool enable_shared_memory(size_t bytes);
@@ -413,6 +457,9 @@ private:
     /// One unary call routed to the co-hosted reflection protocol.
     AnnotatedBatch call_reflection(const std::string& method,
                                    const std::shared_ptr<arrow::RecordBatch>& params);
+
+    /// `list_protocols` with the server identity, classifying "not hosted".
+    ProtocolListing protocol_listing();
 
     std::shared_ptr<Impl> impl_;
 

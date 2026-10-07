@@ -3,6 +3,8 @@
 
 #include "vgi_rpc/client.h"
 
+#include "reflection_client_internal.h"
+
 #include "vgi_rpc/arrow_utils.h"
 #include "vgi_rpc/client_external.h"
 #include "vgi_rpc/metadata.h"
@@ -519,6 +521,14 @@ RpcException::RpcException(std::string exception_type, std::string message, Remo
       server_id_(std::move(server_id)),
       request_id_(std::move(request_id)) {}
 
+ReflectionNotSupportedError::ReflectionNotSupportedError(std::string exception_type,
+                                                         std::string message, RemoteStatus status,
+                                                         std::string server_id,
+                                                         std::string request_id, int http_status)
+    : RpcException(std::move(exception_type), std::move(message), std::move(status),
+                   std::move(server_id), std::move(request_id)),
+      http_status_(http_status) {}
+
 ClientStream::ClientStream(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
 ClientStream::~ClientStream() = default;
 ClientStream::ClientStream(ClientStream&&) noexcept = default;
@@ -770,22 +780,42 @@ AnnotatedBatch RpcClient::call_reflection(const std::string& method,
     }
 }
 
-ProtocolListing RpcClient::list_protocols() {
-    return decode_protocol_list(
-        call_reflection("list_protocols", make_empty_batch(empty_schema())));
+ProtocolListing RpcClient::protocol_listing() {
+    try {
+        return decode_protocol_list(
+            call_reflection("list_protocols", make_empty_batch(empty_schema())));
+    } catch (const ReflectionNotSupportedError&) {
+        throw;
+    } catch (const RpcException& error) {
+        // An EXCEPTION answer leaves the connection where it was: the stream
+        // was drained, so the caller's next call works.
+        if (!detail::reflection_not_hosted(error.error_kind(), error.error_code(),
+                                           error.exception_type())) {
+            throw;
+        }
+        throw ReflectionNotSupportedError(error.exception_type(), error.what(),
+                                          static_cast<const RemoteStatus&>(error),
+                                          error.server_id(), error.request_id());
+    }
 }
 
-ServiceDescription RpcClient::describe(const std::string& protocol) {
-    if (!protocol.empty()) {
-        return decode_service_description(call_reflection("describe", describe_params(protocol)));
-    }
-    const auto listing = list_protocols();
+std::vector<HostedProtocol> RpcClient::list_protocols() {
+    return protocol_listing().protocols;
+}
+
+ServiceDescription RpcClient::describe_protocol(const std::string& name) {
+    const auto listing = protocol_listing();
+    return decode_service_description(call_reflection("describe", describe_params(name)), &listing);
+}
+
+ServiceDescription RpcClient::describe() {
+    const auto listing = protocol_listing();
     const auto* application = listing.application();
     if (application == nullptr) {
         throw std::runtime_error("server " + listing.server_id + " hosts no application protocol");
     }
     return decode_service_description(
-        call_reflection("describe", describe_params(application->protocol)), &listing);
+        call_reflection("describe", describe_params(application->name)), &listing);
 }
 
 ClientTransportOptions RpcClient::transport_options() {

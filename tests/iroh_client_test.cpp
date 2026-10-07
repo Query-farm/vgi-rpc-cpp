@@ -251,6 +251,11 @@ TEST_CASE("native C ABI connects to a live Iroh Arrow-mux worker", "[iroh][integ
     const auto description = client.describe();
     REQUIRE(!description.protocol_name.empty());
     REQUIRE(!description.methods.empty());
+    // Reflection over the same held Iroh stream, which stays usable.
+    const auto hosted = client.list_protocols();
+    REQUIRE(!hosted.empty());
+    REQUIRE(client.describe_protocol(hosted.front().name).protocol_hash == hosted.front().hash);
+    REQUIRE(client.list_protocols() == hosted);
     client.close();
 }
 
@@ -279,4 +284,7 @@ TEST_CASE("native C ABI connects to a live HTTP-over-Iroh worker", "[iroh][integ
     const auto description = client.describe();
     REQUIRE(!description.protocol_name.empty());
     REQUIRE(!description.methods.empty());
+    const auto hosted = client.list_protocols();
+    REQUIRE(!hosted.empty());
+    REQUIRE(client.describe_protocol(hosted.front().name).protocol_hash == hosted.front().hash);
 }

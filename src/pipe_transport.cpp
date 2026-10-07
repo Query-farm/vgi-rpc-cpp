@@ -210,9 +210,10 @@ bool Server::serve_reflection(const std::shared_ptr<arrow::io::OutputStream>& ou
                               const std::string& request_id, bool* errored) {
     const auto t0 = std::chrono::steady_clock::now();
     if (errored != nullptr) *errored = false;
-    auto fail = [&](const std::string& type, const std::string& message) {
+    auto fail = [&](const std::string& type, const std::string& message,
+                    const std::string& error_kind = "") {
         if (errored != nullptr) *errored = true;
-        auto err = Result::error(empty_schema(), type, message, server_id_, request_id);
+        auto err = Result::error(empty_schema(), type, message, server_id_, request_id, error_kind);
         write_ipc_stream(output, empty_schema(), {err.annotated_batch()});
         VGI_RPC_THROW_NOT_OK(output->Flush());
         log_framework_call(reflection_binding_, method_name, request_id, request_batch, t0, type,
@@ -255,7 +256,7 @@ bool Server::serve_reflection(const std::shared_ptr<arrow::io::OutputStream>& ou
                 }
             }
         }
-        const HostedProtocol* hosted_protocol =
+        const ServedProtocol* hosted_protocol =
             requested.empty() ? nullptr : find_protocol(requested);
         if (hosted_protocol == nullptr && requested == protocols_.front().name) {
             hosted_protocol = &protocols_.front();
@@ -281,8 +282,13 @@ bool Server::serve_reflection(const std::shared_ptr<arrow::io::OutputStream>& ou
             for (const auto& protocol : protocols_) hosted += protocol.name + ", ";
             hosted += kReflectionProtocolName;
             if (hosts_identity) hosted += std::string(", ") + kIdentityProtocolName;
-            return fail("RuntimeError", "This server does not host protocol '" + requested +
-                                            "'. Hosted: [" + hosted + "]");
+            // `protocol_not_supported`, as the reference answers: a client
+            // asking about an optional protocol must be able to tell "not
+            // here" from a server fault without parsing the message.
+            return fail(
+                "ProtocolNotSupportedError",
+                "This server does not host protocol '" + requested + "'. Hosted: [" + hosted + "]",
+                ERROR_KIND_PROTOCOL_NOT_SUPPORTED);
         }
     } else {
         return fail("AttributeError", std::string("Protocol '") + kReflectionProtocolName +
@@ -422,7 +428,7 @@ bool Server::serve_one_with_state(const std::shared_ptr<arrow::io::InputStream>&
     // server that declared no protocol name -- it has no key to match, and
     // exactly one namespace with no name for it.  `ServerBuilder::protocol()`
     // declares one and turns the check on.
-    const HostedProtocol* target = &protocols_.front();
+    const ServedProtocol* target = &protocols_.front();
     if (IsApplicationMethod(method_name) && !protocols_.front().name.empty()) {
         const std::string wire_protocol = get_metadata_value(custom_metadata, keys::PROTOCOL);
         if (wire_protocol.empty()) {

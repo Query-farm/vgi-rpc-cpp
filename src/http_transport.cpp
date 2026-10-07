@@ -1472,7 +1472,7 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
     const RoutedRequest routed = route_path(path, rpc_, rpc_.identity() != nullptr);
     // The application binding the route names, when it names one.  Reserved
     // `__name__` methods are server-level and live beside the primary.
-    const HostedProtocol* routed_protocol = routed.target == RouteTarget::APPLICATION
+    const ServedProtocol* routed_protocol = routed.target == RouteTarget::APPLICATION
                                                 ? rpc_.find_protocol(routed.protocol)
                                                 : &rpc_.application_protocols().front();
     const bool is_init = routed.is_init;

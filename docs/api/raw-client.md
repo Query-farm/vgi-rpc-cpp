@@ -20,10 +20,13 @@ while (auto batch = producer.tick()) {
 ```
 
 The client is dynamic and schema-first: callers build exact Arrow record
-batches and receive owned `AnnotatedBatch` values. `list_protocols()` and
-`describe()` speak `vgi_rpc.Reflection.v1`; `describe()` validates the reply
-rather than returning a partial model when the peer supplies malformed schemas
-or duplicate methods. `RpcClientOptions::protocol` is the routing key the
+batches and receive owned `AnnotatedBatch` values. `list_protocols()`,
+`describe_protocol(name)` and `describe()` ask `vgi_rpc.Reflection.v1` over the
+client's own connection, which they never close; a server without reflection
+throws `ReflectionNotSupportedError` (see
+[Discovering protocols](reflection.md)). Descriptions are validated rather than
+returned as a partial model when the peer supplies malformed schemas or
+duplicate methods. `RpcClientOptions::protocol` is the routing key the
 peer hosts its methods under. Every application request carries it
 (WIRE_PROTOCOL §3.1); an application call on a client without one throws
 `std::invalid_argument` before anything is sent. Reflection and reserved

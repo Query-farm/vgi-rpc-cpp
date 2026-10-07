@@ -207,24 +207,24 @@ TEST_CASE("list_protocols advertises the digest describe returns", "[reflection]
     auto listing = decode_protocol_list(
         call_reflection(*server, "list_protocols", make_empty_batch(empty_schema())));
 
-    const ReflectedProtocol* reflection = nullptr;
+    const HostedProtocol* reflection = nullptr;
     for (const auto& protocol : listing.protocols) {
-        if (protocol.protocol == kReflectionProtocolName) reflection = &protocol;
+        if (protocol.name == kReflectionProtocolName) reflection = &protocol;
     }
     REQUIRE(reflection != nullptr);
-    CHECK(reflection->protocol_hash == kReflectionHash);
+    CHECK(reflection->hash == kReflectionHash);
 
     auto described = decode_service_description(
         call_reflection(*server, "describe", describe_params(kReflectionProtocolName)));
-    CHECK(described.protocol_hash == reflection->protocol_hash);
+    CHECK(described.protocol_hash == reflection->hash);
 
     // And the application protocol is still its own binding: reflection gaining
     // a method table must not have moved anything else's digest.
     const auto* application = listing.application();
     REQUIRE(application != nullptr);
-    CHECK(application->protocol == kApplicationProtocol);
+    CHECK(application->name == kApplicationProtocol);
     auto expected = BindingHash(kApplicationProtocol, server->methods());
     REQUIRE(expected.ok());
-    CHECK(application->protocol_hash == *expected);
-    CHECK(application->protocol_hash != std::string(kReflectionHash));
+    CHECK(application->hash == *expected);
+    CHECK(application->hash != std::string(kReflectionHash));
 }

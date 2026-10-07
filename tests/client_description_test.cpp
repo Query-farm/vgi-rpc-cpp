@@ -206,6 +206,6 @@ TEST_CASE("reflection list_protocols separates framework surface from the applic
     REQUIRE(listing.protocols.size() == 2);
     const auto* application = listing.application();
     REQUIRE(application != nullptr);
-    REQUIRE(application->protocol == "example");
+    REQUIRE(application->name == "example");
     REQUIRE(application->features == std::vector<std::string>{"resumable"});
 }

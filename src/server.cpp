@@ -298,8 +298,8 @@ std::unique_ptr<Server> ServerBuilder::build() {
         check_name(extra.name_, "ServerBuilder::add_protocol");
     }
 
-    std::vector<HostedProtocol> protocols;
-    HostedProtocol primary;
+    std::vector<ServedProtocol> protocols;
+    ServedProtocol primary;
     primary.name = primary_.name_;
     primary.version = primary_.version_;
     primary.methods = method_map(std::move(primary_.methods_));
@@ -310,7 +310,7 @@ std::unique_ptr<Server> ServerBuilder::build() {
     }
     protocols.push_back(std::move(primary));
     for (auto& extra : extra_protocols_) {
-        HostedProtocol hosted;
+        ServedProtocol hosted;
         hosted.name = std::move(extra.name_);
         hosted.version = std::move(extra.version_);
         hosted.methods = method_map(std::move(extra.methods_));
@@ -384,7 +384,7 @@ std::string Server::protocol_version_error(
 }
 
 std::string Server::protocol_version_error(
-    const HostedProtocol& protocol,
+    const ServedProtocol& protocol,
     const std::shared_ptr<arrow::KeyValueMetadata>& custom_metadata) const {
     // Gated against the binding the request resolved to, never the primary:
     // a protocol that declared no version enforces nothing, whatever the
@@ -431,7 +431,7 @@ std::string Server::protocol_version_error(
 }
 
 ErrorExtras Server::protocol_version_extras(
-    const HostedProtocol& protocol,
+    const ServedProtocol& protocol,
     const std::shared_ptr<arrow::KeyValueMetadata>& custom_metadata) const {
     std::string declared = "<none>";
     if (custom_metadata) {
@@ -451,7 +451,7 @@ ErrorExtras Server::protocol_version_extras(
     return extras;
 }
 
-const HostedProtocol* Server::find_protocol(const std::string& name) const noexcept {
+const ServedProtocol* Server::find_protocol(const std::string& name) const noexcept {
     for (const auto& protocol : protocols_) {
         if (!protocol.name.empty() && protocol.name == name) return &protocol;
     }
@@ -480,7 +480,7 @@ std::string binding_hash_or_throw(const std::string& name,
 
 }  // namespace
 
-Server::Server(std::vector<HostedProtocol> protocols, std::string server_id,
+Server::Server(std::vector<ServedProtocol> protocols, std::string server_id,
                const std::string& access_log_path, int64_t access_log_max_record_bytes,
                std::function<void(TransportKind)> on_serve_start,
                std::shared_ptr<IdentityImpl> identity, bool include_tracebacks)

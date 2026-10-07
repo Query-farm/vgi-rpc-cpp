@@ -57,17 +57,30 @@ struct ServiceDescription {
     const MethodDescription* method(const std::string& name) const noexcept;
 };
 
-/// One hosted protocol, as `vgi_rpc.Reflection.v1` reports it.
+/// One protocol a server hosts, as `vgi_rpc.Reflection.v1` lists it.
 ///
-/// Enough to decide whether to fetch the full description: a client that
-/// already knows a hash can skip the second round trip entirely.
-struct ReflectedProtocol {
-    std::string protocol;
-    std::string protocol_version;
-    std::string protocol_hash;
+/// A client-side view of the wire `ProtocolSummary`, returned by
+/// `list_protocols()` in the server's order: application protocols in
+/// registration order (the primary first), then the framework's own
+/// (`vgi_rpc.Reflection.v1`, and `vgi_rpc.Identity.v1` where hosted).
+///
+/// - `name`: the wire name -- the routing key, carrying its major version.
+/// - `version`: the declared semver, or `""` when it declares none.
+/// - `hash`: SHA-256 of the canonical description, 64 lowercase hex
+///   characters. Equal hashes mean an identical wire surface in any port, so a
+///   caller holding a description cached under this hash can skip
+///   `describe_protocol()`.
+/// - `deprecated` / `deprecation_message`: whether, and to what, to migrate.
+/// - `features`: capability tokens the protocol announces.
+struct HostedProtocol {
+    std::string name;
+    std::string version;
+    std::string hash;
     bool deprecated = false;
     std::string deprecation_message;
     std::vector<std::string> features;
+
+    bool operator==(const HostedProtocol&) const = default;
 };
 
 /// What one server hosts, as `list_protocols` reports it.
@@ -79,13 +92,13 @@ struct ProtocolListing {
     std::string server_id;
     std::string server_version;
     std::string request_version;
-    std::vector<ReflectedProtocol> protocols;
+    std::vector<HostedProtocol> protocols;
 
     /// The first hosted protocol that is not framework surface, or nullptr.
     ///
     /// Reflection and identity are co-hosted under the reserved `vgi_rpc.`
     /// prefix; what a caller means by "the" protocol is the application one.
-    const ReflectedProtocol* application() const noexcept;
+    const HostedProtocol* application() const noexcept;
 };
 
 /// Decode a `list_protocols` reply.

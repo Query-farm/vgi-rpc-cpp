@@ -133,8 +133,9 @@ private:
 };
 
 /// One protocol a built server hosts: its routing key, declared version,
-/// method table, and canonical digest.
-struct VGI_RPC_EXPORT HostedProtocol {
+/// method table, and canonical digest. The server-side record; a client sees
+/// a protocol through reflection as `HostedProtocol` (client_description.h).
+struct VGI_RPC_EXPORT ServedProtocol {
     std::string name;
     std::string version;
     std::unordered_map<std::string, MethodInfo> methods;
@@ -320,11 +321,11 @@ public:
 
     /// Every application protocol this server hosts, in registration order,
     /// the primary first.
-    const std::vector<HostedProtocol>& application_protocols() const noexcept { return protocols_; }
+    const std::vector<ServedProtocol>& application_protocols() const noexcept { return protocols_; }
 
     /// The hosted application protocol named `name`, or null.  Framework
     /// protocols (`vgi_rpc.*`) are never returned: they are dispatched apart.
-    const HostedProtocol* find_protocol(const std::string& name) const noexcept;
+    const ServedProtocol* find_protocol(const std::string& name) const noexcept;
 
     /// Whether error batches carry a (synthesized) traceback -- the
     /// `ServerBuilder::include_tracebacks` setting, true unless turned off.
@@ -398,13 +399,13 @@ public:
     // The same check against one hosted protocol's own declared version.  A
     // protocol that declared none enforces nothing, whatever the others say.
     std::string protocol_version_error(
-        const HostedProtocol& protocol,
+        const ServedProtocol& protocol,
         const std::shared_ptr<arrow::KeyValueMetadata>& custom_metadata) const;
 
     // The full error batch extras for a version mismatch on `protocol`: the
     // `PreconditionFailure` naming the protocol and both versions.
     ErrorExtras protocol_version_extras(
-        const HostedProtocol& protocol,
+        const ServedProtocol& protocol,
         const std::shared_ptr<arrow::KeyValueMetadata>& custom_metadata) const;
 
     // Returns false on EOF (clean shutdown), true when a request was served.
@@ -462,7 +463,7 @@ private:
     // digest of every binding it hosts, which is the same value reflection
     // reports.  Passing one in is what let the access log carry a digest the
     // wire never advertised.
-    Server(std::vector<HostedProtocol> protocols, std::string server_id,
+    Server(std::vector<ServedProtocol> protocols, std::string server_id,
            const std::string& access_log_path, int64_t access_log_max_record_bytes,
            std::function<void(TransportKind)> on_serve_start,
            std::shared_ptr<IdentityImpl> identity, bool include_tracebacks);
@@ -520,7 +521,7 @@ private:
 
     // Every application protocol, in registration order; [0] is the primary.
     // Never empty.
-    std::vector<HostedProtocol> protocols_;
+    std::vector<ServedProtocol> protocols_;
     std::string server_id_;
     bool include_tracebacks_ = true;
 
