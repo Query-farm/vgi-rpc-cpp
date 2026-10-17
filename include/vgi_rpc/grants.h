@@ -10,7 +10,7 @@
 /// the loop was open.  With grant keys configured the framework mints these
 /// itself (unless the worker supplies `mint_grant`) and the HTTP transport
 /// accepts them back as bearer credentials (WIRE_PROTOCOL.md §16, "Accepting
-/// identity credentials"; IDENTITY_V1_SPEC.md §9).  With no key configured,
+/// identity credentials"; IDENTITY_V2_SPEC.md §9).  With no key configured,
 /// nothing changes.
 ///
 /// Token: `"vgig1." + base64url_nopad(kid(8) || envelope)`.

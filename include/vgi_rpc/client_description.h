@@ -62,7 +62,7 @@ struct ServiceDescription {
 /// A client-side view of the wire `ProtocolSummary`, returned by
 /// `list_protocols()` in the server's order: application protocols in
 /// registration order (the primary first), then the framework's own
-/// (`vgi_rpc.Reflection.v1`, and `vgi_rpc.Identity.v1` where hosted).
+/// (`vgi_rpc.Reflection.v1`, and `vgi_rpc.Identity.v2` where hosted).
 ///
 /// - `name`: the wire name -- the routing key, carrying its major version.
 /// - `version`: the declared semver, or `""` when it declares none.

@@ -147,7 +147,7 @@ off regardless of the environment.
 With keys configured the framework mints `vgig1.` sealed grants through
 `issue_grant` (unless `IdentityOptions::mint_grant` is set) and the HTTP
 transport accepts them back as `Authorization: Bearer` credentials. With keys
-and no `identity()`, `vgi_rpc.Identity.v1` is hosted with `issue_grant` alone.
+and no `identity()`, `vgi_rpc.Identity.v2` is hosted with `issue_grant` alone.
 An `identity()` whose `IdentityOptions::grant_keys` is unset is refused, so the
 minter and the verifier always share one configuration.
 

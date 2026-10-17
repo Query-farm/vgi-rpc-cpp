@@ -285,7 +285,7 @@ public:
 /// Deliberately not a `std::invalid_argument` (which `exception_type_of`
 /// maps to `ValueError`, read by callers as "do not retry").
 ///
-/// Thrown from a `vgi_rpc.Identity.v1` hook (`resolve_token` / `mint_grant`)
+/// Thrown from a `vgi_rpc.Identity.v2` hook (`resolve_token` / `mint_grant`)
 /// it is translated to `identity_unavailable` with the **same** retry hint
 /// (WIRE_PROTOCOL.md §16), on every transport.  Thrown anywhere else it still
 /// reaches the wire as `UNAVAILABLE` with `RetryInfo`.

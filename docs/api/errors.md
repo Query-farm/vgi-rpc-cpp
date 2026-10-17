@@ -47,7 +47,7 @@ as in WIRE_PROTOCOL §16.
 `AuthUnavailableError(detail, retry_after)` is this port's "could not find
 out" error. The HTTP transport answers it with `503` and that
 `Retry-After` (`PeerIdentityUnavailable` derives from it). Thrown from a
-`vgi_rpc.Identity.v1` hook (`resolve_token` / `mint_grant`), it is
+`vgi_rpc.Identity.v2` hook (`resolve_token` / `mint_grant`), it is
 translated to `identity_unavailable` keeping the same retry hint as
 `RetryInfo`. A hook that calls the same store an authenticator calls should
 throw it. Do not throw `std::invalid_argument` for an outage: that is a

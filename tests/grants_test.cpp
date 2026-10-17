@@ -1,7 +1,7 @@
 // © Copyright 2025-2026, Query.Farm LLC - https://query.farm
 // SPDX-License-Identifier: Apache-2.0
 
-// Sealed grants (WIRE_PROTOCOL.md §16, IDENTITY_V1_SPEC.md §9).
+// Sealed grants (WIRE_PROTOCOL.md §16, IDENTITY_V2_SPEC.md §9).
 //
 // The format half is driven by the reference's published vectors
 // (`tests/data/grant_token_vectors.json`, a verbatim copy of
@@ -309,7 +309,7 @@ TEST_CASE("grant keys without a hook make the framework the minter", "[grants][i
     CHECK(claims.purpose == "nightly");
     CHECK(claims.grant_id == grant.grant_id);
     CHECK(claims.grant_id.size() == 32);
-    CHECK(grant.expires_at == static_cast<double>(claims.expires_at));
+    CHECK(grant.expires_at == UtcMicros(std::chrono::seconds(claims.expires_at)));
     CHECK_THROWS_AS(impl.issue_grant("p", {}, 0, fresh_caller("alice")), GrantRefusedError);
 }
 
@@ -317,8 +317,9 @@ TEST_CASE("a worker's own mint hook wins over sealed grants", "[grants][identity
     IdentityOptions options;
     options.grant_keys = fixture_keys();
     options.mint_grant = [](const std::string& principal, const std::string&,
-                            const std::vector<std::string>&,
-                            int64_t) { return IssuedGrant{"custom:" + principal, 1.0, "id"}; };
+                            const std::vector<std::string>&, int64_t) {
+        return IssuedGrant{"custom:" + principal, UtcMicros(std::chrono::seconds(1)), "id"};
+    };
     IdentityImpl impl(std::move(options));
     CHECK(impl.issue_grant("p", {}, 60, fresh_caller("alice")).token == "custom:alice");
 }

@@ -1565,7 +1565,7 @@ static std::shared_ptr<arrow::Schema> params(std::vector<std::shared_ptr<arrow::
 }
 
 // =========================================================================
-// vgi_rpc.Identity.v1 conformance fixture
+// vgi_rpc.Identity.v2 conformance fixture
 // =========================================================================
 //
 // The fixed deployment policy of IDENTITY_CONFORMANCE_FIXTURE.md, which every
@@ -1700,7 +1700,8 @@ constexpr const char* kTokenPaddedProbeName = "conformance-padded";
 
 constexpr const char* kGrantTokenPrefix = "conformance-grant-for:";
 constexpr const char* kScopeSeparator = "|";
-constexpr double kGrantExpiresAt = 1893456000.0;  // 2030-01-01T00:00:00Z
+constexpr UtcMicros kGrantExpiresAt{
+    std::chrono::microseconds(1893456000000000)};  // 2030-01-01T00:00:00Z
 constexpr const char* kGrantId = "conformance-grant-id";
 constexpr const char* kRefusedPurpose = "conformance-refused";
 constexpr const char* kMinimalPurpose = "conformance-minimal";
@@ -1874,7 +1875,7 @@ int main(int argc, char** argv) {
     bool transport_kind_probe = false;
     bool polymorphic_stream_probe = false;
     bool http_concurrency_probe = false;
-    // `vgi_rpc.Identity.v1` fixture mode: "off", "both" or "introspect-only".
+    // `vgi_rpc.Identity.v2` fixture mode: "off", "both" or "introspect-only".
     // Two conformance workers are the same binary with this flag different;
     // the narrowed one configures no mint hook, which is what makes the
     // method-level narrowing (and the shrunken protocol_hash) observable.

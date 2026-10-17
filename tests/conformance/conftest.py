@@ -1315,7 +1315,7 @@ def conformance_http_sticky_auth_port() -> Iterator[int]:
 
 @pytest.fixture(scope="session")
 def conformance_http_identity_port() -> Iterator[int]:
-    """A worker hosting ``vgi_rpc.Identity.v1`` with both hooks configured.
+    """A worker hosting ``vgi_rpc.Identity.v2`` with both hooks configured.
 
     The fixed deployment policy of ``IDENTITY_CONFORMANCE_FIXTURE.md``:
     the resolver of §3.3, the minter of §3.4, an introspector allowlist of

@@ -200,7 +200,7 @@ public:
     // wrong place.
     ServerBuilder& protocol(std::string protocol_name);
 
-    // Host vgi_rpc.Identity.v1.  Absent by default, and absent rather than
+    // Host vgi_rpc.Identity.v2.  Absent by default, and absent rather than
     // routed-and-refusing when omitted: that is what keeps a dependency
     // upgrade from growing a credential-to-identity oracle on every existing
     // worker.  Only the methods whose hooks the deployment configured are

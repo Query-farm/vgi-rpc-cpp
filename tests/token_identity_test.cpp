@@ -1,7 +1,7 @@
 // © Copyright 2025-2026, Query.Farm LLC - https://query.farm
 // SPDX-License-Identifier: Apache-2.0
 
-// `vgi_rpc.Identity.v1` -- ported from the Python reference's
+// `vgi_rpc.Identity.v2` -- ported from the Python reference's
 // tests/test_token_identity.py, which is the normative test set for this
 // protocol.
 //
@@ -44,6 +44,11 @@ double now_seconds() {
     return std::chrono::duration<double>(now).count();
 }
 
+UtcMicros utc_in(int64_t seconds) {
+    return std::chrono::floor<std::chrono::microseconds>(std::chrono::system_clock::now()) +
+           std::chrono::seconds(seconds);
+}
+
 AuthContext make_auth(std::optional<std::string> principal = std::string("alice"),
                       bool authenticated = true, std::optional<double> auth_time = std::nullopt) {
     AuthContext auth;
@@ -62,8 +67,7 @@ std::optional<TokenIdentity> resolver(const std::string& token) {
 
 IssuedGrant minter(const std::string& principal, const std::string&,
                    const std::vector<std::string>&, int64_t ttl_seconds) {
-    return IssuedGrant{"grant-for-" + principal, now_seconds() + static_cast<double>(ttl_seconds),
-                       "g1"};
+    return IssuedGrant{"grant-for-" + principal, utc_in(ttl_seconds), "g1"};
 }
 
 IdentityOptions introspect_only() {
@@ -98,17 +102,17 @@ std::string identity_hash(const std::set<std::string>& offered) {
 
 TEST_CASE("identity protocol hash matches the reference, both methods") {
     CHECK(identity_hash({"introspect_token", "issue_grant"}) ==
-          "8317f2ad8e2476bb99e8b94800ab79b19a8cf0c6bdd6d66c2d82bd62ffbe69d5");
+          "145267755ff90d5c3313d79c7ff771306f2530626380d01cb0e57a951d0f9ec3");
 }
 
 TEST_CASE("identity protocol hash matches the reference, introspect_token only") {
     CHECK(identity_hash({"introspect_token"}) ==
-          "27b75bef22e4c70baab92a5188a473506b89055d2cb2b58cc187f6fe7a436385");
+          "4039fbf6db3e64ae234e0be605b977477150ace892f10b6c691920eaf925e7ac");
 }
 
 TEST_CASE("identity protocol hash matches the reference, issue_grant only") {
     CHECK(identity_hash({"issue_grant"}) ==
-          "c71b12f453310139b6b6a445378064661c52711d03ae1e4fba29b8f7976ef4d8");
+          "4199df7403c9ca1a02c4c524b405a999eb1489614a1480873ffc23a0e5b0d312");
 }
 
 TEST_CASE("narrowing the method set narrows the protocol hash") {
@@ -177,7 +181,7 @@ TEST_CASE("the hosted method table carries only the offered methods") {
     CHECK(methods.size() == 1);
     CHECK(methods.count("issue_grant") == 1);
     CHECK(identity_hash(server->identity()->offered_methods()) ==
-          "c71b12f453310139b6b6a445378064661c52711d03ae1e4fba29b8f7976ef4d8");
+          "4199df7403c9ca1a02c4c524b405a999eb1489614a1480873ffc23a0e5b0d312");
 }
 
 TEST_CASE("identity claims the reserved prefix") {
@@ -327,7 +331,7 @@ TEST_CASE("padding does not smuggle a JWS past the guard") {
 }
 
 TEST_CASE("every codepoint in the spec's trim floor is trimmed") {
-    // `IDENTITY_V1_SPEC.md` enumerates the floor every port must trim:
+    // `IDENTITY_V2_SPEC.md` enumerates the floor every port must trim:
     //
     //     U+0009 U+000A U+000B U+000C U+000D U+0020 U+0085 U+00A0
     //
@@ -527,7 +531,7 @@ TEST_CASE("issuance mints for the caller") {
     auto grant =
         impl.issue_grant("reports", {"read"}, 3600, make_auth("alice", true, now_seconds()));
     CHECK(grant.token == "grant-for-alice");
-    CHECK(grant.expires_at > now_seconds());
+    CHECK(grant.expires_at > utc_in(0));
 }
 
 TEST_CASE("the subject is the caller and is not a parameter") {
@@ -771,7 +775,7 @@ TEST_CASE("an identity refusal carries its error_kind onto the wire") {
 TEST_CASE("an anonymous raw transport cannot mint over the wire") {
     // The third leg of the end-to-end dispatch check, and the one that is not
     // implied by the two above.  IDENTITY_CONFORMANCE_FIXTURE.md §7 records a
-    // framework bug in the reference that left `vgi_rpc.Identity.v1`
+    // framework bug in the reference that left `vgi_rpc.Identity.v2`
     // *completely uncallable on every transport* since it landed, invisible
     // because every identity test there constructed the implementation
     // directly and handed it a context it had built itself.  Nothing called
@@ -832,6 +836,11 @@ TEST_CASE("an anonymous raw transport cannot mint over the wire") {
     REQUIRE(decoded->batches.size() == 1);
     CHECK(std::static_pointer_cast<arrow::StringArray>(decoded->batches[0].batch->column(0))
               ->GetString(0) == "grant-for-alice");
+    // `expires_at` is a non-nullable UTC microsecond timestamp on the wire.
+    const auto expires_field = decoded->batches[0].batch->schema()->GetFieldByName("expires_at");
+    REQUIRE(expires_field != nullptr);
+    CHECK(expires_field->type()->Equals(arrow::timestamp(arrow::TimeUnit::MICRO, "UTC")));
+    CHECK_FALSE(expires_field->nullable());
 }
 
 TEST_CASE("an unhosted identity method is absent rather than refusing") {
@@ -933,7 +942,7 @@ IdentityOptions mints_for_anyone(std::vector<std::string>& seen) {
                                  const std::vector<std::string>&,
                                  int64_t ttl_seconds) -> IssuedGrant {
         seen.push_back(principal);
-        return IssuedGrant{"grant", now_seconds() + static_cast<double>(ttl_seconds), "g"};
+        return IssuedGrant{"grant", utc_in(ttl_seconds), "g"};
     };
     return options;
 }

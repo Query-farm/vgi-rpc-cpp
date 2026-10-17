@@ -3,7 +3,7 @@
 
 #pragma once
 
-/// `vgi_rpc.Identity.v1` -- resolving a credential, and minting a grant.
+/// `vgi_rpc.Identity.v2` -- resolving a credential, and minting a grant.
 ///
 /// Identity lives at the RPC layer rather than in any application protocol: a
 /// bearer token is not an application concept, the auth primitives it builds on
@@ -48,6 +48,7 @@
 /// transient failure locks out valid users; one that retries a definitive
 /// rejection hammers the worker.
 
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -71,7 +72,7 @@ namespace vgi_rpc {
 ///
 /// Framework-owned, under the reserved `vgi_rpc.` prefix, so an application
 /// cannot register a protocol that impersonates it.
-inline constexpr const char* kIdentityProtocolName = "vgi_rpc.Identity.v1";
+inline constexpr const char* kIdentityProtocolName = "vgi_rpc.Identity.v2";
 
 /// Cap on a credential we will even attempt to resolve, in **UTF-8 bytes**.
 ///
@@ -265,6 +266,10 @@ struct VGI_RPC_EXPORT TokenIdentity {
     std::string serialize_to_bytes() const;
 };
 
+/// A UTC instant at microsecond resolution: the in-language type of an Arrow
+/// `timestamp[us, tz="UTC"]` column.
+using UtcMicros = std::chrono::sys_time<std::chrono::microseconds>;
+
 /// A standing delegation credential.
 struct VGI_RPC_EXPORT IssuedGrant {
     /// The credential.  **Opaque to the framework** -- the worker owns the
@@ -272,11 +277,12 @@ struct VGI_RPC_EXPORT IssuedGrant {
     /// brokered from the IdP are all equally valid and equally invisible here).
     /// Never parsed, never logged.
     std::string token;
-    /// Unix timestamp after which the worker will stop honouring the grant.
+    /// The UTC instant after which the worker will stop honouring the grant,
+    /// carried on the wire as a non-nullable `timestamp[us, tz="UTC"]`.
     /// Required *because* the framework cannot enforce it: the real lifetime
     /// lives inside the opaque token, so this is a declaration rather than an
     /// enforcement.  A worker that must state a lifetime has thought about one.
-    double expires_at = 0.0;
+    UtcMicros expires_at{};
     /// Correlation handle for the audit trail.  Not a credential and not secret
     /// -- it is what ties a mint record to later use.
     std::string grant_id;
@@ -297,7 +303,7 @@ using MintGrantHook =
     std::function<IssuedGrant(const std::string& principal, const std::string& purpose,
                               const std::vector<std::string>& scopes, int64_t ttl_seconds)>;
 
-/// Deployment configuration for `vgi_rpc.Identity.v1`.
+/// Deployment configuration for `vgi_rpc.Identity.v2`.
 struct VGI_RPC_EXPORT IdentityOptions {
     ResolveTokenHook resolve_token;
     MintGrantHook mint_grant;

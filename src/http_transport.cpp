@@ -6,7 +6,7 @@
 // docs/WIRE_PROTOCOL.md §10, and carries the optional HTTP-only features:
 // capability discovery, CORS, standardized 401s, proxy proof, and sticky
 // sessions.  Token introspection is not among them: it is the
-// `vgi_rpc.Identity.v1` protocol, served on every transport, and the HTTP-only
+// `vgi_rpc.Identity.v2` protocol, served on every transport, and the HTTP-only
 // `__introspect_token__` route it replaced is retired.
 //
 // Stream state is held server-side in a token-keyed registry, which is what
@@ -221,7 +221,7 @@ enum class RouteTarget {
     RESERVED,     ///< A flat server-level `__name__`, owned by no protocol.
     APPLICATION,  ///< This server's application protocol.
     REFLECTION,   ///< vgi_rpc.Reflection.v1.
-    IDENTITY,     ///< vgi_rpc.Identity.v1.
+    IDENTITY,     ///< vgi_rpc.Identity.v2.
 };
 
 /// Why a path could not be routed.  Distinct because a client depends on the
@@ -1139,7 +1139,7 @@ AuthIdentity HttpServer::identify(const httplib::Request& req) const {
             id.authenticated = true;
             id.domain = "conformance";
             id.principal = principal;
-            // `vgi_rpc.Identity.v1`'s freshness guard reads this claim, and the
+            // `vgi_rpc.Identity.v2`'s freshness guard reads this claim, and the
             // identity conformance fixture is the only way six ports get a
             // deterministic `auth_time` without each standing up an IdP.
             // Absent header means no claim at all -- which is a different
@@ -2594,7 +2594,7 @@ void HttpServer::run() {
 
     // `POST {prefix}/__introspect_token__` is deliberately not routed.  It was
     // the HTTP-only JSON form of introspection, retired when introspection
-    // became the `vgi_rpc.Identity.v1` protocol; it now reaches the catch-all
+    // became the `vgi_rpc.Identity.v2` protocol; it now reaches the catch-all
     // below like any other unknown reserved name.
     //
     // cpp-httplib keeps ordinary POST handlers and ContentReader POST handlers

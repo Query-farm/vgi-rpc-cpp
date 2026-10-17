@@ -320,8 +320,8 @@ TEST_CASE("__describe__ is refused with the name of its replacement", "[http-rou
 }
 
 TEST_CASE("the retired __introspect_token__ route is not served", "[http-routing]") {
-    // Introspection is the `vgi_rpc.Identity.v1` protocol.  The pre-0.46 HTTP
-    // JSON route it replaced is retired (IDENTITY_V1_SPEC §8): a second surface
+    // Introspection is the `vgi_rpc.Identity.v2` protocol.  The pre-0.46 HTTP
+    // JSON route it replaced is retired (IDENTITY_V2_SPEC §8): a second surface
     // is a second set of guards to keep identical, and it had already drifted.
     // So the name gets no bespoke handler -- it is an unknown reserved method,
     // answered in Arrow like any other, and never the route's JSON.

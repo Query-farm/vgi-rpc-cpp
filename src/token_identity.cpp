@@ -1,7 +1,7 @@
 // © Copyright 2025-2026, Query.Farm LLC - https://query.farm
 // SPDX-License-Identifier: Apache-2.0
 
-// `vgi_rpc.Identity.v1` -- see include/vgi_rpc/token_identity.h for why the two
+// `vgi_rpc.Identity.v2` -- see include/vgi_rpc/token_identity.h for why the two
 // methods are guarded differently, and why the guard *order* in
 // `introspect_token` is not a matter of taste.
 
@@ -65,9 +65,10 @@ std::shared_ptr<arrow::Array> OneInt64(int64_t value) {
     return out;
 }
 
-std::shared_ptr<arrow::Array> OneFloat64(double value) {
-    arrow::DoubleBuilder builder;
-    VGI_RPC_THROW_NOT_OK(builder.Append(value));
+std::shared_ptr<arrow::Array> OneUtcTimestamp(UtcMicros value) {
+    arrow::TimestampBuilder builder(arrow::timestamp(arrow::TimeUnit::MICRO, "UTC"),
+                                    arrow::default_memory_pool());
+    VGI_RPC_THROW_NOT_OK(builder.Append(value.time_since_epoch().count()));
     std::shared_ptr<arrow::Array> out;
     VGI_RPC_THROW_NOT_OK(builder.Finish(&out));
     return out;
@@ -75,7 +76,7 @@ std::shared_ptr<arrow::Array> OneFloat64(double value) {
 
 /// The byte width of the whitespace codepoint beginning at `pos`, or 0.
 ///
-/// The floor `IDENTITY_V1_SPEC.md` requires every port to trim:
+/// The floor `IDENTITY_V2_SPEC.md` requires every port to trim:
 ///
 ///     U+0009 U+000A U+000B U+000C U+000D U+0020 U+0085 U+00A0
 ///
@@ -282,15 +283,17 @@ std::string TokenIdentity::serialize_to_bytes() const {
 }
 
 const std::shared_ptr<arrow::Schema>& IssuedGrant::arrow_schema() {
-    static const auto schema = arrow::schema(
-        {Utf8Field("token"), arrow::field("expires_at", arrow::float64(), /*nullable=*/false),
-         Utf8Field("grant_id")});
+    static const auto schema =
+        arrow::schema({Utf8Field("token"),
+                       arrow::field("expires_at", arrow::timestamp(arrow::TimeUnit::MICRO, "UTC"),
+                                    /*nullable=*/false),
+                       Utf8Field("grant_id")});
     return schema;
 }
 
 std::string IssuedGrant::serialize_to_bytes() const {
     auto batch = arrow::RecordBatch::Make(
-        arrow_schema(), 1, {OneString(token), OneFloat64(expires_at), OneString(grant_id)});
+        arrow_schema(), 1, {OneString(token), OneUtcTimestamp(expires_at), OneString(grant_id)});
     return BatchToIpc(batch);
 }
 
@@ -398,7 +401,7 @@ MintGrantHook sealed_mint_grant(GrantKeys keys) {
             throw GrantRefusedError(e.what());
         }
         IssuedGrant grant;
-        grant.expires_at = static_cast<double>(minted.claims.expires_at);
+        grant.expires_at = UtcMicros(std::chrono::seconds(minted.claims.expires_at));
         grant.grant_id = minted.claims.grant_id;
         grant.token = std::move(minted.token);
         return grant;
@@ -450,7 +453,7 @@ std::unordered_map<std::string, MethodInfo> IdentityMethods(const std::set<std::
     return methods;
 }
 
-/// Serve one call to `vgi_rpc.Identity.v1`.
+/// Serve one call to `vgi_rpc.Identity.v2`.
 ///
 /// Routed by the same protocol key as every other co-hosted protocol -- this is
 /// not a reserved method name bolted onto the application's table, which is

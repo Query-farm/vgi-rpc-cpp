@@ -224,7 +224,7 @@ jobs:
           # built above; its `build` step is a no-op rebuild) and compares
           # every protocol it hosts, by hash, against the in-process Python
           # server. identity_consistency greps this port's sources for the
-          # Identity.v1 invariants. Both exit non-zero on disagreement, and
+          # Identity.v2 invariants. Both exit non-zero on disagreement, and
           # `set -e` carries that out of the step.
           #
           # --verbose on the second one is not noise. It is a source-level

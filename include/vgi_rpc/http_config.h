@@ -45,7 +45,7 @@ struct AuthIdentity {
     bool authenticated = false;
     std::string domain;
     std::string principal;
-    // Claims the credential carried.  Only `vgi_rpc.Identity.v1`'s freshness
+    // Claims the credential carried.  Only `vgi_rpc.Identity.v2`'s freshness
     // guard reads one today (`auth_time`), and it must see the value exactly as
     // presented: a transport that parsed and dropped what would not parse would
     // turn "carries an unusable auth_time" into "carries none", which is a
@@ -200,7 +200,7 @@ struct HttpConfig {
     // aggregate source compatibility.
     std::function<std::optional<AuthContext>(const std::string& token)> bearer_authenticate;
 
-    // Accept `vgi_rpc.Identity.v1` credentials as bearers when the server
+    // Accept `vgi_rpc.Identity.v2` credentials as bearers when the server
     // hosts Identity with grant keys or a `resolve_token` hook
     // (WIRE_PROTOCOL.md §16, "Accepting identity credentials"): after the
     // deployment's own authenticators come sealed grants (`vgig1.` only; one

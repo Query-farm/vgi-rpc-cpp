@@ -58,7 +58,7 @@ internal.
 
 The order is the server's: application protocols in registration order, the
 primary first, then the framework's own (`vgi_rpc.Reflection.v1`, then
-`vgi_rpc.Identity.v1` where it is hosted). Equal hashes mean an identical wire
+`vgi_rpc.Identity.v2` where it is hosted). Equal hashes mean an identical wire
 surface in any port, so a client that cached a description under a hash can
 skip `describe_protocol()`. Use the listing to discover an optional protocol
 before calling it, rather than calling it and reading an error.
