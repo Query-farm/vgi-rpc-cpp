@@ -24,6 +24,21 @@
 # Usage:
 #   scripts/run_conformance.sh [path/to/conformance_worker]
 # or set CONFORMANCE_WORKER. Exits non-zero if any suite/transport fails.
+#
+# Parallelism. Every leg below (each CLI transport, the pytest suite, the
+# optional cloud suite) is independent -- its own worker process, an ephemeral
+# port or a socket under its own temp dir -- so they run concurrently, each
+# into its own log, printed grouped in the fixed order afterwards. The pytest
+# legs additionally fan out across pytest-xdist workers:
+#
+#   CONFORMANCE_WORKERS=N     pytest -n N per pytest leg (default: auto, the
+#                             cores split between the two pytest legs, which
+#                             run at the same time)
+#   CONFORMANCE_LEG_JOBS=N    at most N legs at once (default: all of them)
+#   CONFORMANCE_WORKERS=0     fully serial: legs one after another, no -n
+#
+# Without pytest-xdist installed the pytest legs run serially (with a warning)
+# rather than failing on an unknown -n flag.
 
 set -uo pipefail
 
@@ -45,6 +60,23 @@ TMPDIR_RUN="$(mktemp -d "${TMPDIR:-/tmp}/vgiXXXX")"
 trap 'rm -rf "$TMPDIR_RUN"' EXIT
 
 rc=0
+
+CONFORMANCE_WORKERS="${CONFORMANCE_WORKERS:-auto}"
+PYTEST_PAR=()
+if [[ "$CONFORMANCE_WORKERS" != "0" ]]; then
+  if python3 -c "import xdist" 2>/dev/null; then
+    workers="$CONFORMANCE_WORKERS"
+    # Two pytest legs run concurrently; `-n auto` in each would start two
+    # workers per core.
+    if [[ "$workers" == "auto" ]]; then
+      workers=$(( $(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2) / 2 ))
+      (( workers < 1 )) && workers=1
+    fi
+    PYTEST_PAR=(-n "$workers")
+  else
+    echo "WARNING: pytest-xdist not installed; pytest legs run serially" >&2
+  fi
+fi
 
 # Wait for a worker to print its discovery line, then echo the payload.
 # $1 = output file, $2 = line prefix, $3 = pid
@@ -169,22 +201,25 @@ run_pytest_suite() {
         "$REPO_ROOT/tests/conformance/test_polymorphic_stream.py" \
         "$REPO_ROOT/tests/conformance/test_http_concurrency.py" \
         "$REPO_ROOT/tests/conformance/test_socket_concurrency.py" \
-        -q -p no:randomly -rs 2>&1 | tee "$log"
+        -q -p no:randomly -rs ${PYTEST_PAR[@]+"${PYTEST_PAR[@]}"} 2>&1 | tee "$log"
     [[ "${PIPESTATUS[0]}" -eq 0 ]] || rc=1
     if grep -q '^SKIPPED' "$log"; then
       echo "ERROR: the mandatory shared suite skipped tests (see SKIPPED lines above)" >&2
       rc=1
     fi
     # The multi-protocol / error-model groups must have run, not merely been
-    # collected out of existence by a narrowed import.
-    for group in TestSecondaryIsHosted TestErrorModelRoundTrip TestErrorModelOnTheWire \
-                 TestTracebackPolicy TestUnavailableCarriesARetryHint; do
-      # Captured, not piped into `grep -q`: under pipefail, grep exiting at
-      # the first match SIGPIPEs pytest and fails the pipeline.
-      local collected
-      collected="$(VGI_RPC_CPP_WORKER="$WORKER" python3 -m pytest \
-             "$REPO_ROOT/tests/conformance/test_suite.py" -q -p no:randomly \
-             --collect-only -k "$group" 2>/dev/null || true)"
+    # collected out of existence by a narrowed import. One collection covers
+    # every group; each must appear in it.
+    local groups=(TestSecondaryIsHosted TestErrorModelRoundTrip TestErrorModelOnTheWire
+                  TestTracebackPolicy TestUnavailableCarriesARetryHint)
+    local expr collected group
+    expr="$(printf ' or %s' "${groups[@]}")"; expr="${expr# or }"
+    # Captured, not piped into `grep -q`: under pipefail, grep exiting at the
+    # first match SIGPIPEs pytest and fails the pipeline.
+    collected="$(VGI_RPC_CPP_WORKER="$WORKER" python3 -m pytest \
+           "$REPO_ROOT/tests/conformance/test_suite.py" -q -p no:randomly \
+           --collect-only -k "$expr" 2>/dev/null || true)"
+    for group in "${groups[@]}"; do
       if ! grep -q "$group" <<<"$collected"; then
         echo "ERROR: shared group $group is not collected by tests/conformance/test_suite.py" >&2
         rc=1
@@ -204,25 +239,57 @@ run_optional_cloud_suite() {
   else
     VGI_RPC_CPP_WORKER="$WORKER" \
       python3 -m pytest "$REPO_ROOT/tests/conformance/test_cloud_storage.py" \
-        -q -p no:randomly -rs || rc=1
+        -q -p no:randomly -rs ${PYTEST_PAR[@]+"${PYTEST_PAR[@]}"} || rc=1
   fi
   echo "::endgroup::"
 }
 
-run_pipe
-run_pipe_access_log
-run_shm
-run_unix
-run_tcp
-run_http "no-cap" ""
 # The capped run exists to activate the http_response_cap.* group, which
 # scales its payloads off the advertised cap. large_payload.echo_binary_4mib
 # sends a fixed 4 MiB and would (correctly) strict-fail against a 1 MiB cap,
-# so it is excluded here — the uncapped run above and all three raw-framing
+# so it is excluded there -- the uncapped run and all three raw-framing
 # transports already cover it.
-run_http "capped" '!large_payload.echo_binary_4mib' --max-response-bytes 1048576
-run_pytest_suite
-run_optional_cloud_suite
+LEGS=(
+  "run_pipe"
+  "run_pipe_access_log"
+  "run_shm"
+  "run_unix"
+  "run_tcp"
+  "run_http no-cap ''"
+  "run_http capped '!large_payload.echo_binary_4mib' --max-response-bytes 1048576"
+  "run_pytest_suite"
+  "run_optional_cloud_suite"
+)
+
+# One leg in a subshell with its own rc; its status lands in a file so the
+# result never depends on which `wait` reaped it.
+run_leg() {
+  local i="$1" start=$SECONDS
+  ( rc=0; eval "${LEGS[$i]}"; echo "($(( SECONDS - start ))s: ${LEGS[$i]%% *})"; exit "$rc" ) \
+    >"$TMPDIR_RUN/leg-$i.log" 2>&1
+  echo "$?" >"$TMPDIR_RUN/leg-$i.rc"
+}
+
+if [[ "$CONFORMANCE_WORKERS" == "0" ]]; then
+  LEG_JOBS=1
+else
+  LEG_JOBS="${CONFORMANCE_LEG_JOBS:-${#LEGS[@]}}"
+fi
+for i in "${!LEGS[@]}"; do
+  if [[ "$LEG_JOBS" -le 1 ]]; then
+    run_leg "$i"
+  else
+    # `wait -n` needs bash >= 4.3; macOS's stock 3.2 falls back to polling.
+    while [[ "$(jobs -rp | wc -l)" -ge "$LEG_JOBS" ]]; do wait -n 2>/dev/null || sleep 0.2; done
+    run_leg "$i" &
+  fi
+done
+wait
+# Logs are printed whole, in LEGS order, once every leg has finished.
+for i in "${!LEGS[@]}"; do
+  cat "$TMPDIR_RUN/leg-$i.log"
+  [[ "$(cat "$TMPDIR_RUN/leg-$i.rc" 2>/dev/null)" == "0" ]] || rc=1
+done
 
 if [[ "$rc" -ne 0 ]]; then
   echo "CONFORMANCE FAILED" >&2

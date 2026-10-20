@@ -35,6 +35,20 @@ Two conformance suites, both driven by `scripts/run_conformance.sh`:
 1. `vgi-rpc-test` — the CLI runner, over pipe, Unix socket, TCP, and HTTP, plus access-log validation.
 2. `pytest tests/conformance/test_suite.py tests/conformance/test_polymorphic_stream.py` — the mandatory, zero-skip shared suite re-exported from `vgi_rpc.conformance._pytest_suite`, which reaches the capability-gated HTTP groups the CLI runner cannot: sticky sessions, proxy proof, CORS, 401s, `vgi_rpc.Identity.v1`, zstd/gzip compression negotiation, external locations, response caps. `tests/conformance/conftest.py` supplies the fixtures by spawning the worker with the matching flags. `test_cloud_storage.py` runs separately because S3/GCS are opt-in build profiles.
 
+Both runners are parallel by default: the independent legs (each CLI transport,
+the pytest suite, the cloud suite; the client script's `python`/`cpp` legs) run
+concurrently with their logs printed in order afterwards, and every pytest
+invocation fans out with pytest-xdist. The default (`auto`) splits the cores
+between the two pytest legs that run at the same time, so a full run stays near
+one process per core instead of two. Every
+fixture binds an ephemeral port or a socket under its own `mkdtemp` dir, so xdist
+workers share nothing. `CONFORMANCE_WORKERS=N` sets the xdist count,
+`CONFORMANCE_LEG_JOBS=N` caps how many server-runner legs run at once (on a
+shared box keep legs + N within the cores you may use);
+`CONFORMANCE_WORKERS=0` restores the fully serial run (legs in sequence, no `-n`)
+for bisecting an ordering-dependent failure. Without pytest-xdist the pytest legs
+fall back to serial with a warning.
+
 Both of those drive this port's **server**. The **client** is tested by the same
 shared suite run in the other direction — `scripts/run_client_conformance.sh` —
 which opens every connection through `conformance/conformance_client_driver.cpp`,

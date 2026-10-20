@@ -69,7 +69,7 @@ jobs:
           python -m pip install '../vgi-rpc[http,conformance,external]'
           # boto3 creates the bucket and asserts objects landed in it; the
           # backend under test is the C++ one, not boto3.
-          python -m pip install pytest pytest-timeout boto3
+          python -m pip install pytest pytest-timeout pytest-xdist boto3
 
       - name: Clone and bootstrap vcpkg
         run: |

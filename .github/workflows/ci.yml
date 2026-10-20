@@ -121,7 +121,7 @@ jobs:
           # its Content-Encoding behaviour itself, so the old 2.9.1 pin is
           # unsatisfiable against it and would fail this install outright.
           python -m pip install '../vgi-rpc[http,conformance,external]'
-          python -m pip install pytest pytest-timeout
+          python -m pip install pytest pytest-timeout pytest-xdist
 
       - name: Clone and bootstrap vcpkg
         run: |
