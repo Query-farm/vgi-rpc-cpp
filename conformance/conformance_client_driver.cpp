@@ -89,7 +89,9 @@ void claim_control_channel() {
 }
 
 void write_response(const json& value) {
-    std::string line = value.dump();
+    // Replace, not strict: a relayed remote error message is peer bytes, and
+    // a throw here would end the driver rather than report the error.
+    std::string line = value.dump(-1, ' ', false, json::error_handler_t::replace);
     line.push_back('\n');
     size_t written = 0;
     while (written < line.size()) {

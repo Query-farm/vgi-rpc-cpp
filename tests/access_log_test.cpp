@@ -21,6 +21,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include "vgi_rpc/access_log.h"
 #include "vgi_rpc/http_config.h"
 #include "vgi_rpc/metadata.h"
 #include "vgi_rpc/output_collector.h"
@@ -796,4 +797,30 @@ TEST_CASE("a secret in an HTTP call or its stream state never reaches the access
     auto stream = records_for(log, "holding");
     REQUIRE(stream.size() == static_cast<size_t>(turns));
     require_value_shape(stream.front());
+}
+
+TEST_CASE("an error message that is not UTF-8 is logged, not thrown", "[access-log]") {
+    // error_message quotes whatever the exception said, and that is often a
+    // peer's bytes.  A strict JSON dump threw on them: the HTTP transport
+    // lost the record, and the pipe transport's emit sites failed the call.
+    const auto path =
+        std::filesystem::temp_directory_path() / ("vgi_access_utf8_" + random_hex(8) + ".jsonl");
+    {
+        AccessLogWriter writer(path.string(), "server-1");
+        AccessRecord rec("Probe", "hash");
+        rec.method = "m";
+        rec.status = "error";
+        rec.error_type = "RuntimeError";
+        rec.error_message = std::string("bad reply: \xff\xfe\xc3\x28 end");
+        REQUIRE_NOTHROW(writer.emit(rec));
+    }
+    std::ifstream in(path);
+    std::string line;
+    REQUIRE(std::getline(in, line));
+    const auto record = nlohmann::json::parse(line);
+    const auto message = record.at("error_message").get<std::string>();
+    CHECK(message.rfind("bad reply: ", 0) == 0);
+    CHECK(message.find(" end") != std::string::npos);
+    CHECK(message.find("\xef\xbf\xbd") != std::string::npos);  // U+FFFD
+    std::filesystem::remove(path);
 }

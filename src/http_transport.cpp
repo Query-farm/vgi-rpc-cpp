@@ -2015,78 +2015,103 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
             return externalize_cycle(batches, schema, &externalized);
         };
 
-        std::string body = build_body([&](const std::shared_ptr<arrow::io::OutputStream>& out) {
-            if (stream.header) {
-                auto header_schema = stream.header->schema();
-                std::vector<AnnotatedBatch> hb = log_sink->flush(header_schema);
-                hb.push_back(AnnotatedBatch::data(stream.header));
-                write_ipc_stream(out, header_schema, hb);
-            }
-
-            if (is_exchange) {
-                std::vector<AnnotatedBatch> ob;
-                if (!stream.header) ob = log_sink->flush(output_schema);
-                ob.push_back(AnnotatedBatch::with_metadata(make_empty_batch(output_schema),
-                                                           init_metadata(cursor, call_token)));
-                write_ipc_stream(out, output_schema, ob);
-                auto session = std::make_shared<HttpStreamSession>();
-                session->state = stream.state;
-                session->output_schema = output_schema;
-                session->input_schema = input_schema;
-                session->is_exchange = true;
-                session->method_name = method_name;
-                session->aad = stream_scope;
-                session->response_limit_bytes = response_limit;
-                session->preferred_response_bytes = preferred_response;
-                session->stream_id = stream_id;
-                // A token went out, so this turn is not the terminal one.
-                turn.record().response_state_bytes = static_cast<int64_t>(cursor.size());
-                std::lock_guard<std::mutex> registry_lock(streams_mutex_);
-                streams_[cursor] = std::move(session);
-            } else {
-                auto writer = unwrap(arrow::ipc::MakeStreamWriter(out, output_schema));
-                if (!stream.header) {
-                    for (auto& lb : log_sink->flush(output_schema)) {
-                        VGI_RPC_THROW_NOT_OK(
-                            lb.custom_metadata
-                                ? writer->WriteRecordBatch(*lb.batch, lb.custom_metadata)
-                                : writer->WriteRecordBatch(*lb.batch));
-                    }
+        std::string body;
+        try {
+            body = build_body([&](const std::shared_ptr<arrow::io::OutputStream>& out) {
+                if (stream.header) {
+                    auto header_schema = stream.header->schema();
+                    std::vector<AnnotatedBatch> hb = log_sink->flush(header_schema);
+                    hb.push_back(AnnotatedBatch::data(stream.header));
+                    write_ipc_stream(out, header_schema, hb);
                 }
-                // /init is the producer's first turn, so its request metadata
-                // is the first tick's -- the HTTP equivalent of the real tick
-                // the pipe transport delivers, and the only way first-tick
-                // metadata such as the result-cache validators can reach a
-                // producer over HTTP.
-                const bool finished = run_producer_turns(
-                    writer, stream.state, output_schema, ctx, rpc_.server_id(), request_id,
-                    &failure, externalize,
-                    AnnotatedBatch::with_metadata(make_empty_batch(empty_schema()),
-                                                  turn_input_metadata(custom_metadata, nullptr)),
-                    response_limit, preferred_response, traceback_where);
-                if (!finished) {
-                    VGI_RPC_THROW_NOT_OK(writer->WriteRecordBatch(
-                        *make_empty_batch(output_schema), init_metadata(cursor, call_token)));
+
+                if (is_exchange) {
+                    std::vector<AnnotatedBatch> ob;
+                    if (!stream.header) ob = log_sink->flush(output_schema);
+                    ob.push_back(AnnotatedBatch::with_metadata(make_empty_batch(output_schema),
+                                                               init_metadata(cursor, call_token)));
+                    write_ipc_stream(out, output_schema, ob);
                     auto session = std::make_shared<HttpStreamSession>();
                     session->state = stream.state;
                     session->output_schema = output_schema;
                     session->input_schema = input_schema;
-                    session->is_exchange = false;
+                    session->is_exchange = true;
                     session->method_name = method_name;
                     session->aad = stream_scope;
                     session->response_limit_bytes = response_limit;
                     session->preferred_response_bytes = preferred_response;
                     session->stream_id = stream_id;
-                    // Same here: a producer that ran to exhaustion inside
-                    // /init registers nothing and hands back no token, and the
-                    // absent response_state_bytes is what says so.
+                    // A token went out, so this turn is not the terminal one.
                     turn.record().response_state_bytes = static_cast<int64_t>(cursor.size());
                     std::lock_guard<std::mutex> registry_lock(streams_mutex_);
                     streams_[cursor] = std::move(session);
+                } else {
+                    auto writer = unwrap(arrow::ipc::MakeStreamWriter(out, output_schema));
+                    if (!stream.header) {
+                        for (auto& lb : log_sink->flush(output_schema)) {
+                            VGI_RPC_THROW_NOT_OK(
+                                lb.custom_metadata
+                                    ? writer->WriteRecordBatch(*lb.batch, lb.custom_metadata)
+                                    : writer->WriteRecordBatch(*lb.batch));
+                        }
+                    }
+                    // /init is the producer's first turn, so its request metadata
+                    // is the first tick's -- the HTTP equivalent of the real tick
+                    // the pipe transport delivers, and the only way first-tick
+                    // metadata such as the result-cache validators can reach a
+                    // producer over HTTP.
+                    const bool finished =
+                        run_producer_turns(writer, stream.state, output_schema, ctx,
+                                           rpc_.server_id(), request_id, &failure, externalize,
+                                           AnnotatedBatch::with_metadata(
+                                               make_empty_batch(empty_schema()),
+                                               turn_input_metadata(custom_metadata, nullptr)),
+                                           response_limit, preferred_response, traceback_where);
+                    if (!finished) {
+                        VGI_RPC_THROW_NOT_OK(writer->WriteRecordBatch(
+                            *make_empty_batch(output_schema), init_metadata(cursor, call_token)));
+                        auto session = std::make_shared<HttpStreamSession>();
+                        session->state = stream.state;
+                        session->output_schema = output_schema;
+                        session->input_schema = input_schema;
+                        session->is_exchange = false;
+                        session->method_name = method_name;
+                        session->aad = stream_scope;
+                        session->response_limit_bytes = response_limit;
+                        session->preferred_response_bytes = preferred_response;
+                        session->stream_id = stream_id;
+                        // Same here: a producer that ran to exhaustion inside
+                        // /init registers nothing and hands back no token, and the
+                        // absent response_state_bytes is what says so.
+                        turn.record().response_state_bytes = static_cast<int64_t>(cursor.size());
+                        std::lock_guard<std::mutex> registry_lock(streams_mutex_);
+                        streams_[cursor] = std::move(session);
+                    }
+                    VGI_RPC_THROW_NOT_OK(writer->Close());
                 }
-                VGI_RPC_THROW_NOT_OK(writer->Close());
+            });
+        } catch (const std::exception& e) {
+            // A failure the handler did not raise -- an upload the
+            // externalizer could not make, an IPC write -- is still this
+            // call's failure, answered as one.  Left to unwind, it reached
+            // cpp-httplib's catch-all as a bare 500, after the session it
+            // would have resumed was already registered.
+            {
+                std::lock_guard<std::mutex> registry_lock(streams_mutex_);
+                streams_.erase(cursor);
             }
-        });
+            turn.failed(exception_type_of(e), e.what(), code_name(error_code_of(e)));
+            res.status = 200;
+            res.set_header(RPC_ERROR_HEADER, "true");
+            apply_sticky();
+            set_arrow_content(req, res,
+                              build_body([&](const std::shared_ptr<arrow::io::OutputStream>& out) {
+                                  auto err = Result::error(output_schema, e, rpc_.server_id(),
+                                                           request_id, traceback_of(e));
+                                  write_ipc_stream(out, output_schema, {err.annotated_batch()});
+                              }));
+            return;
+        }
         // The external cap is hard even for a producer: by the time anyone
         // could mint a continuation the upload has already happened, so there
         // is nothing for a soft cap to spread the overshoot across.
@@ -2478,7 +2503,12 @@ void HttpServer::run() {
             std::cerr << "vgi_rpc: unhandled exception serving " << req.method << " " << req.path
                       << ": " << what << "\n";
             res.status = 500;
-            res.set_content(nlohmann::json{{"error", "internal"}, {"detail", what}}.dump(),
+            // `what` routinely quotes peer bytes -- a parser's "last read"
+            // excerpt of a storage reply, say -- and a strict dump of invalid
+            // UTF-8 throws.  Thrown from here, that is std::terminate: one bad
+            // reply would take the whole server down.
+            res.set_content(nlohmann::json{{"error", "internal"}, {"detail", what}}.dump(
+                                -1, ' ', false, nlohmann::json::error_handler_t::replace),
                             "application/json");
         });
 

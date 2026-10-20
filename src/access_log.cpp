@@ -147,7 +147,12 @@ void AccessLogWriter::emit(const AccessRecord& rec) {
     // §5b truncation ladder.  There is no payload to shed; rung 1 (claims) has
     // no C++ analogue yet since this emitter carries no claims, so an over-cap
     // record goes straight to the sentinel form.
-    std::string line = j.dump();
+    // Replace, not strict: error_message quotes whatever an exception said,
+    // which may be peer bytes, and a strict dump of invalid UTF-8 throws --
+    // losing the one record an operator is reading the log for, or, from the
+    // pipe transport's call sites, failing the call itself.
+    constexpr auto kReplace = nlohmann::json::error_handler_t::replace;
+    std::string line = j.dump(-1, ' ', false, kReplace);
     if (static_cast<int64_t>(line.size()) > max_record_bytes_) {
         // Sentinel form: envelope fields plus error_message, which is never
         // truncated — an operator debugging a failure needs it whole.
@@ -160,7 +165,7 @@ void AccessLogWriter::emit(const AccessRecord& rec) {
             s["error_code"] = j["error_code"];
         }
         s["truncated"] = "record_too_large";
-        line = s.dump();
+        line = s.dump(-1, ' ', false, kReplace);
     }
 
     out_ << line << '\n';

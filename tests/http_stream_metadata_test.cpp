@@ -155,23 +155,43 @@ private:
     int64_t turns_ = 0;
 };
 
+/// How `POST /alloc` answers.
+enum class AllocReply {
+    // A JSON allocation, compressed whenever the request's Accept-Encoding
+    // allows it -- cpp-httplib's server does that for application/json.
+    kNegotiated,
+    // Bytes that are neither JSON nor UTF-8, labelled gzip whatever was
+    // asked: a misbehaving store, and the reply whose parse error once quoted
+    // those bytes into a message the server could not format.
+    kForcedGarbageGzip,
+    // The same bytes, unlabelled.
+    kGarbage,
+};
+
 /// A minimal object store: `POST /alloc` hands out a URL that `PUT` fills and
 /// `GET` serves, as the HTTP external-storage backend expects.  The test can
 /// also write an object directly and read back whatever the server uploaded.
 class LoopbackStorage {
 public:
-    LoopbackStorage() {
-        server_.Post("/alloc", [this](const httplib::Request&, httplib::Response& res) {
+    explicit LoopbackStorage(AllocReply reply = AllocReply::kNegotiated) {
+        server_.Post("/alloc", [this, reply](const httplib::Request& req, httplib::Response& res) {
             std::lock_guard<std::mutex> lock(mutex_);
+            accept_encodings_.push_back(req.get_header_value("Accept-Encoding"));
+            if (reply != AllocReply::kNegotiated) {
+                if (reply == AllocReply::kForcedGarbageGzip) {
+                    res.set_header("Content-Encoding", "gzip");
+                }
+                res.set_content(std::string("\x1f\x8b\x08\x00\xff\xfe\xc3\x28", 8),
+                                "application/json");
+                return;
+            }
             const std::string id = std::to_string(next_id_++);
-            // Not application/json: httplib would compress that for a client
-            // advertising Accept-Encoding, and this is a fixture, not a test
-            // of the storage client's content negotiation.
             res.set_content("{\"object_url\": \"" + base_url() + "/obj/" + id + "\"}",
-                            "application/octet-stream");
+                            "application/json");
         });
         server_.Put(R"(/obj/(\d+))", [this](const httplib::Request& req, httplib::Response& res) {
             std::lock_guard<std::mutex> lock(mutex_);
+            accept_encodings_.push_back(req.get_header_value("Accept-Encoding"));
             objects_[req.matches[1].str()] = req.body;
             ++uploads_;
             res.status = 204;
@@ -219,6 +239,12 @@ public:
         return it->second;
     }
 
+    /// The Accept-Encoding of every `/alloc` and `PUT` request, in order.
+    std::vector<std::string> accept_encodings() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return accept_encodings_;
+    }
+
     /// How many objects the server under test has uploaded.
     int uploads() {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -231,6 +257,7 @@ private:
     std::map<std::string, std::string> objects_;
     int next_id_ = 0;
     int uploads_ = 0;
+    std::vector<std::string> accept_encodings_;
     int port_ = 0;
     std::thread thread_;
 };
@@ -705,4 +732,55 @@ TEST_CASE("a log-only producer cycle stays inline under a tiny threshold",
     while (auto batch = stream.tick()) rows += static_cast<int>(batch->batch->num_rows());
     CHECK(rows == 2);
     CHECK(stream.finished());
+}
+
+// The storage backend decodes nothing itself beyond a fetched object's zstd,
+// yet cpp-httplib advertised every codec it was built with on `/alloc` and
+// `PUT`.  A store that honoured that compressed the allocation, and the
+// backend failed to parse it.  Each request now names what it decodes.
+TEST_CASE("storage requests accept only identity, so a negotiating store answers plainly",
+          "[http-stream-metadata][external]") {
+    LoopbackStorage storage(AllocReply::kNegotiated);
+    ProbeServer server(storage.base_url(), /*externalize_threshold=*/1);
+    auto client = probe_client(server.port());
+    auto session = client.open_exchange("annotated_exchange",
+                                        AnnotatedBatch::data(make_empty_batch(empty_schema())),
+                                        input_schema(), seen_schema());
+    const AnnotatedBatch out = session.exchange(AnnotatedBatch::data(input_batch(4)));
+    REQUIRE(out.batch->num_rows() == 1);
+    CHECK(storage.uploads() == 1);
+    const auto encodings = storage.accept_encodings();
+    REQUIRE(encodings.size() == 2);  // one /alloc, one PUT
+    for (const auto& encoding : encodings) CHECK(encoding == "identity");
+}
+
+// An allocation reply that is not what was asked for -- labelled with a codec
+// nobody accepted, or not JSON at all, and not UTF-8 either -- is that call's
+// error.  It used to unwind out of /init to cpp-httplib's catch-all, whose
+// strict JSON dump of the parser's message (quoting the reply's bytes) threw
+// again and terminated the server.
+TEST_CASE("a malformed storage reply fails the call and the server keeps serving",
+          "[http-stream-metadata][external]") {
+    for (const auto reply : {AllocReply::kForcedGarbageGzip, AllocReply::kGarbage}) {
+        INFO("forced gzip label: " << (reply == AllocReply::kForcedGarbageGzip));
+        LoopbackStorage storage(reply);
+        ProbeServer server(storage.base_url(), /*externalize_threshold=*/1);
+        auto client = probe_client(server.port());
+        std::string message;
+        try {
+            auto stream = client.open_producer(
+                "produce_probe", AnnotatedBatch::data(count_params(1)), seen_schema());
+            FAIL("an unusable allocation did not fail the call");
+        } catch (const RpcRemoteError& e) {
+            message = e.what();
+        }
+        INFO("error: " << message);
+        CHECK(message.find(reply == AllocReply::kForcedGarbageGzip
+                               ? "unrequested Content-Encoding: gzip"
+                               : "invalid allocation") != std::string::npos);
+        // The server is still up and still answers.
+        const Turn init = post(server.port(), kExchangePath + "/init",
+                               init_body("exchange_probe", make_empty_batch(empty_schema())));
+        CHECK_FALSE(init.cursor.empty());
+    }
 }

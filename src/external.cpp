@@ -100,6 +100,11 @@ std::pair<std::string, std::string> split_url(const std::string& url) {
     return {origin, target};
 }
 
+// Decoding is done here, bounded, not by cpp-httplib.  But cpp-httplib still
+// advertises every codec it was built with on any request that names no
+// Accept-Encoding of its own, so each request below names exactly what this
+// backend decodes: a storage server free to compress would otherwise answer
+// `/alloc` in a codec nothing here can read.
 httplib::Client make_client(const std::string& origin) {
     httplib::Client client(origin);
     client.set_connection_timeout(10, 0);
@@ -108,6 +113,19 @@ httplib::Client make_client(const std::string& origin) {
     client.set_follow_location(false);
     client.set_decompress(false);
     return client;
+}
+
+// A response coded in something other than what the request accepted.  Raised
+// rather than parsed: compressed bytes read as JSON or IPC fail further on with
+// an error that names the wrong cause.
+void require_identity_response(const httplib::Response& res, const char* what) {
+    std::string encoding = res.get_header_value("Content-Encoding");
+    std::transform(encoding.begin(), encoding.end(), encoding.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (!encoding.empty() && encoding != "identity") {
+        throw std::runtime_error(std::string(what) +
+                                 " response has unrequested Content-Encoding: " + encoding);
+    }
 }
 
 bool is_redirect(int status) {
@@ -196,7 +214,7 @@ public:
         auto [origin, path] = split_url(urls.upload_url);
         auto client = make_client(origin);
 
-        httplib::Headers headers;
+        httplib::Headers headers{{"Accept-Encoding", "identity"}};
         if (!content_encoding.empty()) headers.emplace("Content-Encoding", content_encoding);
 
         auto res = client.Put(path, headers, data, "application/octet-stream");
@@ -227,8 +245,10 @@ public:
             std::string content_encoding;
             int response_status = 0;
             bool cap_exceeded = false;
+            // zstd is decoded below; a stored object may carry it whatever the
+            // request said, so say so rather than leave the server guessing.
             auto res = client.Get(
-                path,
+                path, httplib::Headers{{"Accept-Encoding", "zstd, identity"}},
                 [&](const httplib::Response& response) {
                     response_status = response.status;
                     location = response.get_header_value("Location");
@@ -279,6 +299,10 @@ public:
             if (content_encoding == "zstd") {
                 return zstd_decompress_bounded(body, config_.max_decompressed_bytes);
             }
+            if (!content_encoding.empty() && content_encoding != "identity") {
+                throw std::runtime_error("external location has unsupported Content-Encoding: " +
+                                         content_encoding);
+            }
             if (body.size() > static_cast<size_t>(config_.max_decompressed_bytes)) {
                 throw std::runtime_error("external location exceeds max_decompressed_bytes (" +
                                          std::to_string(config_.max_decompressed_bytes) + ")");
@@ -303,18 +327,28 @@ private:
         nlohmann::json body = nlohmann::json::object();
         if (!content_encoding.empty()) body["content_encoding"] = content_encoding;
 
-        auto res = client.Post("/alloc", body.dump(), "application/json");
+        auto res = client.Post("/alloc", httplib::Headers{{"Accept-Encoding", "identity"}},
+                               body.dump(), "application/json");
         if (!res || res->status != 200) {
             throw std::runtime_error(
                 "external storage alloc failed: " +
                 (res ? std::to_string(res->status) : std::string("no response")));
         }
-        const auto allocation = nlohmann::json::parse(res->body);
-        const std::string legacy = allocation.at("object_url").get<std::string>();
-        return UploadUrlPair{
-            allocation.value("upload_url", legacy),
-            allocation.value("download_url", legacy),
-        };
+        require_identity_response(*res, "external storage alloc");
+        // The storage server's bytes never reach the message: they are not
+        // ours to quote, and nlohmann's own error text would.
+        try {
+            const auto allocation = nlohmann::json::parse(res->body);
+            const std::string legacy = allocation.at("object_url").get<std::string>();
+            return UploadUrlPair{
+                allocation.value("upload_url", legacy),
+                allocation.value("download_url", legacy),
+            };
+        } catch (const nlohmann::json::exception&) {
+            throw std::runtime_error(
+                "external storage alloc returned an invalid allocation (expected a JSON object "
+                "with a string object_url)");
+        }
     }
 
     std::string base_url_;

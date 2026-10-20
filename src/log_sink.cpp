@@ -22,7 +22,10 @@ void LogSink::emit(LogLevel level, std::string_view message, const nlohmann::jso
     md->Append(keys::LOG_MESSAGE, std::string(message));
 
     if (!extra.is_null() && !extra.empty()) {
-        md->Append(keys::LOG_EXTRA, extra.dump());
+        // Replace, not strict: invalid UTF-8 in a handler's extra must not
+        // turn a log call into a thrown exception.
+        md->Append(keys::LOG_EXTRA,
+                   extra.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace));
     }
 
     if (!server_id_.empty()) {
