@@ -19,6 +19,8 @@
 
 #include <vgi_rpc/arrow_utils.h>
 #include <vgi_rpc/crypto.h>
+#include <vgi_rpc/client_external.h>
+#include <vgi_rpc/http_client.h>
 #include <vgi_rpc/http_config.h>
 #include <vgi_rpc/metadata.h>
 #include <vgi_rpc/server.h>
@@ -38,6 +40,7 @@
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -110,11 +113,69 @@ private:
     int64_t turns_ = 0;
 };
 
-/// A GET-only object store: the test writes an object and the server under
-/// test fetches it, as it would from any storage behind an external pointer.
+/// One output row per input, carrying the per-batch keys a VGI worker puts on
+/// its exchange output, plus a log batch ahead of it.  It also sets the
+/// framing cursor's own key, which the transport must overwrite.
+class AnnotatingExchange : public ExchangeState {
+public:
+    void exchange(const AnnotatedBatch& input, OutputCollector& out, CallContext&) override {
+        const auto value = std::static_pointer_cast<arrow::Int64Array>(input.batch->column(0));
+        const std::string index = std::to_string(value->Value(0));
+        out.client_log(LogLevel::INFO, "turn " + index);
+        arrow::StringBuilder builder;
+        VGI_RPC_THROW_NOT_OK(builder.Append("row " + index));
+        auto md = std::make_shared<arrow::KeyValueMetadata>();
+        md->Append("vgi_rpc.parent_row#b64", "AAAAAA==");
+        md->Append("vgi_batch_index", index);
+        md->Append("vgi.cache.max_age", "60");
+        md->Append(keys::STATE_B64, "forged-by-worker");
+        out.emit_batch(arrow::RecordBatch::Make(seen_schema(), 1, {unwrap(builder.Finish())}), md);
+    }
+};
+
+/// One data row per tick, then a final tick that only logs and finishes: the
+/// log-only cycle the externalizer must leave inline.
+class LogFinishingProducer : public ProducerState {
+public:
+    explicit LogFinishingProducer(int64_t count) : count_(count) {}
+
+    void produce(OutputCollector& out, CallContext&) override {
+        if (turns_ >= count_) {
+            out.client_log(LogLevel::INFO, std::string(256, 'x'));
+            out.finish();
+            return;
+        }
+        arrow::StringBuilder builder;
+        VGI_RPC_THROW_NOT_OK(builder.Append("row " + std::to_string(turns_++)));
+        out.emit_arrays({unwrap(builder.Finish())});
+    }
+
+private:
+    int64_t count_;
+    int64_t turns_ = 0;
+};
+
+/// A minimal object store: `POST /alloc` hands out a URL that `PUT` fills and
+/// `GET` serves, as the HTTP external-storage backend expects.  The test can
+/// also write an object directly and read back whatever the server uploaded.
 class LoopbackStorage {
 public:
     LoopbackStorage() {
+        server_.Post("/alloc", [this](const httplib::Request&, httplib::Response& res) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            const std::string id = std::to_string(next_id_++);
+            // Not application/json: httplib would compress that for a client
+            // advertising Accept-Encoding, and this is a fixture, not a test
+            // of the storage client's content negotiation.
+            res.set_content("{\"object_url\": \"" + base_url() + "/obj/" + id + "\"}",
+                            "application/octet-stream");
+        });
+        server_.Put(R"(/obj/(\d+))", [this](const httplib::Request& req, httplib::Response& res) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            objects_[req.matches[1].str()] = req.body;
+            ++uploads_;
+            res.status = 204;
+        });
         server_.Get(R"(/obj/(\d+))", [this](const httplib::Request& req, httplib::Response& res) {
             std::lock_guard<std::mutex> lock(mutex_);
             auto it = objects_.find(req.matches[1].str());
@@ -143,15 +204,33 @@ public:
     /// Store `body` and return the URL it is served from.
     std::string put(std::string body) {
         std::lock_guard<std::mutex> lock(mutex_);
-        const std::string id = std::to_string(objects_.size());
+        const std::string id = std::to_string(next_id_++);
         objects_[id] = std::move(body);
         return base_url() + "/obj/" + id;
+    }
+
+    /// The object behind a URL this store handed out.
+    std::string get(const std::string& url) {
+        const std::string prefix = base_url() + "/obj/";
+        REQUIRE(url.rfind(prefix, 0) == 0);
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = objects_.find(url.substr(prefix.size()));
+        REQUIRE(it != objects_.end());
+        return it->second;
+    }
+
+    /// How many objects the server under test has uploaded.
+    int uploads() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return uploads_;
     }
 
 private:
     httplib::Server server_;
     std::mutex mutex_;
     std::map<std::string, std::string> objects_;
+    int next_id_ = 0;
+    int uploads_ = 0;
     int port_ = 0;
     std::thread thread_;
 };
@@ -159,7 +238,8 @@ private:
 /// One `Server::serve_http` on a background thread, with its bound port.
 class ProbeServer {
 public:
-    explicit ProbeServer(const std::string& storage_url = "") {
+    explicit ProbeServer(const std::string& storage_url = "",
+                         std::optional<int64_t> externalize_threshold = std::nullopt) {
         ServerBuilder builder;
         builder.add_exchange("exchange_probe", empty_schema(), input_schema(), seen_schema(),
                              [](const Request&, CallContext&) {
@@ -172,6 +252,17 @@ public:
                               std::make_shared<ReportingProducer>(req.get<int64_t>("count")),
                               nullptr};
             });
+        builder.add_exchange("annotated_exchange", empty_schema(), input_schema(), seen_schema(),
+                             [](const Request&, CallContext&) {
+                                 return Stream{seen_schema(), input_schema(),
+                                               std::make_shared<AnnotatingExchange>(), nullptr};
+                             });
+        builder.add_producer(
+            "log_finishing", count_schema(), seen_schema(), [](const Request& req, CallContext&) {
+                return Stream{seen_schema(), empty_schema(),
+                              std::make_shared<LogFinishingProducer>(req.get<int64_t>("count")),
+                              nullptr};
+            });
         builder.protocol(kProtocol);
         server_ = builder.build();
 
@@ -182,6 +273,12 @@ public:
         if (!storage_url.empty()) {
             cfg.external_storage_url = storage_url;
             cfg.external_url_validator = [](const std::string&) {};  // loopback http
+        }
+        if (externalize_threshold) {
+            cfg.externalize_threshold = *externalize_threshold;
+            // The threshold otherwise doubles as the inline request ceiling,
+            // and these cases externalize responses, not requests.
+            cfg.max_request_bytes = 1 << 20;
         }
         cfg.on_listen = [this](int port) {
             {
@@ -258,9 +355,10 @@ std::shared_ptr<arrow::RecordBatch> input_batch(int64_t value) {
 }
 
 struct Turn {
-    std::vector<std::string> seen;  // one entry per data row, in order
-    std::string cursor;             // the next cursor, when one came back
-    std::string call_token;         // only /init hands one over
+    std::vector<std::string> seen;        // one entry per data row, in order
+    std::string cursor;                   // the next cursor, when one came back
+    std::string call_token;               // only /init hands one over
+    std::vector<AnnotatedBatch> batches;  // the response as it came off the wire
 };
 
 Turn post(int port, const std::string& path, const std::string& body) {
@@ -279,6 +377,7 @@ Turn post(int port, const std::string& path, const std::string& body) {
     auto contents = read_ipc_stream(std::make_shared<arrow::io::BufferReader>(buffer));
     REQUIRE(contents);
     Turn turn;
+    turn.batches = contents->batches;
     for (const auto& ab : contents->batches) {
         if (ab.batch->num_rows() > 0 && ab.batch->schema()->GetFieldIndex("seen") >= 0) {
             auto column =
@@ -307,6 +406,61 @@ void check_no_transport_keys(const std::string& seen) {
 
 const std::string kExchangePath = std::string("/vgi/") + kProtocol + "/exchange_probe";
 const std::string kProducePath = std::string("/vgi/") + kProtocol + "/produce_probe";
+const std::string kAnnotatedPath = std::string("/vgi/") + kProtocol + "/annotated_exchange";
+
+bool is_log(const AnnotatedBatch& ab) {
+    return ab.batch->num_rows() == 0 && ab.custom_metadata &&
+           ab.custom_metadata->FindKey(keys::LOG_LEVEL) >= 0;
+}
+
+/// The location of the one pointer batch in a response, or empty when the
+/// response carried none.
+std::string pointer_url(const Turn& turn) {
+    std::string url;
+    for (const auto& ab : turn.batches) {
+        if (const auto location = get_metadata_value(ab.custom_metadata, keys::LOCATION);
+            !location.empty()) {
+            REQUIRE(url.empty());
+            REQUIRE(ab.batch->num_rows() == 0);
+            url = location;
+        }
+    }
+    return url;
+}
+
+/// Fetch, verify and decode the object a pointer batch names.
+IpcStreamContents resolve(LoopbackStorage& storage, const Turn& turn) {
+    const std::string url = pointer_url(turn);
+    REQUIRE_FALSE(url.empty());
+    const std::string payload = storage.get(url);
+    crypto::Sha256 digest;
+    digest.update(payload);
+    std::string sha256;
+    for (const auto& ab : turn.batches) {
+        if (const auto v = get_metadata_value(ab.custom_metadata, keys::LOCATION_SHA256);
+            !v.empty()) {
+            sha256 = v;
+        }
+    }
+    CHECK(sha256 == digest.hex_digest());
+    auto contents = read_ipc_stream(
+        std::make_shared<arrow::io::BufferReader>(arrow::Buffer::FromString(payload)));
+    REQUIRE(contents);
+    return std::move(*contents);
+}
+
+HttpClient probe_client(int port, std::function<void(const AnnotatedBatch&)> on_log = {}) {
+    HttpClientConfig config;
+    config.prefix = "/vgi";
+    config.protocol = kProtocol;
+    config.on_log = std::move(on_log);
+    ClientExternalHttpOptions external;
+    external.url_policy = ExternalUrlPolicy::LOOPBACK_HTTP_TEST;
+    return HttpClient::builder("http://127.0.0.1:" + std::to_string(port))
+        .config(config)
+        .external_http_options(external)
+        .build();
+}
 
 }  // namespace
 
@@ -424,4 +578,131 @@ TEST_CASE("a producer turn hands process() its tick's metadata, less the transpo
         CHECK(turn.seen[0] == "vgi_pushdown_filters=" + delta);
         cursor = turn.cursor;
     }
+}
+
+// Exchange output is externalized like producer output.  Every other port
+// does so; this one wrote every exchange turn inline whatever its size, so a
+// configured externalize_threshold silently bounded nothing on the exchange
+// path and an oversized turn was refused at the response cap instead.
+TEST_CASE("an over-threshold exchange turn is externalized with its metadata and cursor",
+          "[http-stream-metadata][external]") {
+    LoopbackStorage storage;
+    ProbeServer server(storage.base_url(), /*externalize_threshold=*/1);
+    const Turn init = post(server.port(), kAnnotatedPath + "/init",
+                           init_body("annotated_exchange", make_empty_batch(empty_schema())));
+    REQUIRE_FALSE(init.cursor.empty());
+    REQUIRE_FALSE(init.call_token.empty());
+
+    std::string cursor = init.cursor;
+    for (int64_t i = 0; i < 3; ++i) {
+        INFO("exchange turn " << i + 1);
+        auto md = metadata({{keys::STATE_B64, cursor}, {keys::CALL_STATE_B64, init.call_token}});
+        const Turn turn = post(server.port(), kAnnotatedPath + "/exchange",
+                               ipc_body(input_schema(), input_batch(i), md));
+        // Nothing but the pointer on the wire: the log went with the data.
+        REQUIRE(turn.batches.size() == 1);
+        CHECK(turn.seen.empty());
+        CHECK(storage.uploads() == i + 1);
+
+        const IpcStreamContents resolved = resolve(storage, turn);
+        REQUIRE(resolved.batches.size() == 2);
+        CHECK(is_log(resolved.batches[0]));
+        CHECK(get_metadata_value(resolved.batches[0].custom_metadata, keys::LOG_MESSAGE) ==
+              "turn " + std::to_string(i));
+        const AnnotatedBatch& data = resolved.batches[1];
+        REQUIRE(data.batch->num_rows() == 1);
+        CHECK(std::static_pointer_cast<arrow::StringArray>(data.batch->column(0))->GetString(0) ==
+              "row " + std::to_string(i));
+        // The worker's own per-batch keys ride in the resolved object ...
+        CHECK(get_metadata_value(data.custom_metadata, "vgi_rpc.parent_row#b64") == "AAAAAA==");
+        CHECK(get_metadata_value(data.custom_metadata, "vgi_batch_index") == std::to_string(i));
+        CHECK(get_metadata_value(data.custom_metadata, "vgi.cache.max_age") == "60");
+        // ... and so does the cursor, applied last so the worker's same-named
+        // key cannot stand in for it.
+        const std::string next = get_metadata_value(data.custom_metadata, keys::STATE_B64);
+        REQUIRE_FALSE(next.empty());
+        CHECK(next != "forged-by-worker");
+        CHECK(data.custom_metadata->FindKey(keys::LOCATION) < 0);
+        // The next turn resumes from the cursor read off the resolved batch.
+        cursor = next;
+    }
+}
+
+TEST_CASE("a below-threshold exchange turn stays inline", "[http-stream-metadata][external]") {
+    LoopbackStorage storage;
+    ProbeServer server(storage.base_url(), /*externalize_threshold=*/1 << 20);
+    const Turn init = post(server.port(), kAnnotatedPath + "/init",
+                           init_body("annotated_exchange", make_empty_batch(empty_schema())));
+    std::string cursor = init.cursor;
+    for (int64_t i = 0; i < 2; ++i) {
+        auto md = metadata({{keys::STATE_B64, cursor}, {keys::CALL_STATE_B64, init.call_token}});
+        const Turn turn = post(server.port(), kAnnotatedPath + "/exchange",
+                               ipc_body(input_schema(), input_batch(i), md));
+        CHECK(pointer_url(turn).empty());
+        REQUIRE(turn.seen.size() == 1);
+        CHECK(turn.seen[0] == "row " + std::to_string(i));
+        REQUIRE_FALSE(turn.cursor.empty());
+        CHECK(turn.cursor != "forged-by-worker");
+        cursor = turn.cursor;
+    }
+    CHECK(storage.uploads() == 0);
+}
+
+TEST_CASE("the HTTP client resolves externalized exchange turns and continues the stream",
+          "[http-stream-metadata][external]") {
+    LoopbackStorage storage;
+    ProbeServer server(storage.base_url(), /*externalize_threshold=*/1);
+    std::vector<std::string> logs;
+    auto client = probe_client(server.port(), [&](const AnnotatedBatch& ab) {
+        logs.push_back(get_metadata_value(ab.custom_metadata, keys::LOG_MESSAGE));
+    });
+    auto session = client.open_exchange("annotated_exchange",
+                                        AnnotatedBatch::data(make_empty_batch(empty_schema())),
+                                        input_schema(), seen_schema());
+    for (int64_t i = 0; i < 3; ++i) {
+        INFO("exchange turn " << i + 1);
+        const AnnotatedBatch out = session.exchange(AnnotatedBatch::data(input_batch(i)));
+        REQUIRE(out.batch->num_rows() == 1);
+        CHECK(std::static_pointer_cast<arrow::StringArray>(out.batch->column(0))->GetString(0) ==
+              "row " + std::to_string(i));
+        CHECK(get_metadata_value(out.custom_metadata, "vgi_rpc.parent_row#b64") == "AAAAAA==");
+        CHECK(get_metadata_value(out.custom_metadata, "vgi_batch_index") == std::to_string(i));
+        CHECK(get_metadata_value(out.custom_metadata, "vgi.cache.max_age") == "60");
+    }
+    CHECK(storage.uploads() == 3);
+    CHECK(logs == std::vector<std::string>{"turn 0", "turn 1", "turn 2"});
+}
+
+// The reference's maybe_externalize_collector leaves a cycle with no data
+// batch inline however large it is.  This port externalized one, and since a
+// resolved payload must hold exactly one data batch, a producer whose last
+// turn only logged and finished failed in the client.
+TEST_CASE("a log-only producer cycle stays inline under a tiny threshold",
+          "[http-stream-metadata][external]") {
+    LoopbackStorage storage;
+    ProbeServer server(storage.base_url(), /*externalize_threshold=*/1);
+    const std::string path = std::string("/vgi/") + kProtocol + "/log_finishing";
+
+    // On the wire: the data turn is externalized, the log-only finish is not.
+    const Turn init =
+        post(server.port(), path + "/init", init_body("log_finishing", count_params(1)));
+    CHECK_FALSE(pointer_url(init).empty());
+    REQUIRE_FALSE(init.cursor.empty());
+    auto md = metadata({{keys::STATE_B64, init.cursor}, {keys::CALL_STATE_B64, init.call_token}});
+    const Turn last = post(server.port(), path + "/exchange",
+                           ipc_body(empty_schema(), make_empty_batch(empty_schema()), md));
+    CHECK(pointer_url(last).empty());
+    REQUIRE(last.batches.size() == 1);
+    CHECK(is_log(last.batches[0]));
+    CHECK(last.cursor.empty());
+    CHECK(storage.uploads() == 1);
+
+    // And through the client, which refuses a pointer to a data-less payload.
+    auto client = probe_client(server.port());
+    auto stream =
+        client.open_producer("log_finishing", AnnotatedBatch::data(count_params(2)), seen_schema());
+    int rows = 0;
+    while (auto batch = stream.tick()) rows += static_cast<int>(batch->batch->num_rows());
+    CHECK(rows == 2);
+    CHECK(stream.finished());
 }

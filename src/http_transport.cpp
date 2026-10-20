@@ -1066,6 +1066,15 @@ std::shared_ptr<arrow::KeyValueMetadata> HttpServer::externalize_cycle(
     const std::vector<AnnotatedBatch>& batches, const std::shared_ptr<arrow::Schema>& schema,
     int64_t* externalized_bytes) const {
     if (!storage_ || cfg_.externalize_threshold < 0 || batches.empty()) return nullptr;
+    // A cycle with no data batch -- log-only, or a finish carrying nothing
+    // but logs -- stays inline however large it is, as the reference's
+    // `maybe_externalize_collector` returns early: an external payload holds
+    // exactly one data batch, and a client resolving one with none refuses it.
+    const bool has_data = std::any_of(batches.begin(), batches.end(), [](const AnnotatedBatch& ab) {
+        const BatchType type = ab.type();
+        return type != BatchType::LOG && type != BatchType::EXCEPTION;
+    });
+    if (!has_data) return nullptr;
 
     const std::string cycle = build_body([&](const std::shared_ptr<arrow::io::OutputStream>& out) {
         write_ipc_stream(out, schema, batches);
@@ -2310,23 +2319,40 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
                 AnnotatedBatch::with_metadata(
                     coerced, turn_input_metadata(custom_metadata, input_provenance)),
                 oc, ctx);
+            std::vector<AnnotatedBatch> batches = oc.batches();
+            // Only the cursor is re-minted; re-issuing the call token here
+            // would be exactly the work the split avoids. Merged, not
+            // assigned, and merged last: whatever the handler attached to its
+            // own data batch has to survive the ride, and a handler key of
+            // the same name must not displace the framing token.
+            for (auto& ab : batches) {
+                if (ab.batch && ab.batch->num_rows() > 0) {
+                    ab.merge_metadata(cursor_metadata(cursor));
+                }
+            }
+            const bool trailing_cursor = batches.empty() || batches.back().batch->num_rows() == 0;
+            // An over-threshold turn is externalized exactly like a producer
+            // cycle: logs and the data batch -- its own metadata and the
+            // cursor included, since the client reads both off the resolved
+            // batch -- go to storage, one pointer stands in for them.  A
+            // cursor on a batch of its own stays inline after the pointer,
+            // where the client reads it as a control batch either way.
+            const auto pointer = externalize(batches, output_schema);
             std::string body = build_body([&](const std::shared_ptr<arrow::io::OutputStream>& out) {
-                std::vector<AnnotatedBatch> batches = oc.batches();
-                // Only the cursor is re-minted; re-issuing the call token
-                // here would be exactly the work the split avoids. Merged,
-                // not assigned: whatever the handler attached to its own
-                // data batch has to survive the ride.
-                for (auto& ab : batches) {
-                    if (ab.batch && ab.batch->num_rows() > 0) {
-                        ab.merge_metadata(cursor_metadata(cursor));
-                    }
+                std::vector<AnnotatedBatch> wire;
+                if (pointer) {
+                    wire.push_back(
+                        AnnotatedBatch::with_metadata(make_empty_batch(output_schema), pointer));
+                } else {
+                    wire = std::move(batches);
                 }
-                if (batches.empty() || batches.back().batch->num_rows() == 0) {
-                    batches.push_back(AnnotatedBatch::with_metadata(make_empty_batch(output_schema),
-                                                                    cursor_metadata(cursor)));
+                if (trailing_cursor) {
+                    wire.push_back(AnnotatedBatch::with_metadata(make_empty_batch(output_schema),
+                                                                 cursor_metadata(cursor)));
                 }
-                write_ipc_stream(out, output_schema, batches);
+                write_ipc_stream(out, output_schema, wire);
             });
+            if (external_cap_exceeded()) return;
             // An exchange turn always hands the cursor back: the stream ends
             // when the client stops asking, not when the server says so.
             turn.record().response_state_bytes = static_cast<int64_t>(cursor.size());

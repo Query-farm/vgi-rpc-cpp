@@ -41,7 +41,10 @@ struct AnnotatedBatch {
         }
         auto merged = custom_metadata->Copy();
         for (int64_t i = 0; i < md->size(); ++i) {
-            if (const auto index = merged->FindKey(md->key(i)); index >= 0) {
+            // Every occurrence: metadata may repeat a key, and a reader takes
+            // the first, so leaving one behind would let it shadow `md`'s.
+            for (auto index = merged->FindKey(md->key(i)); index >= 0;
+                 index = merged->FindKey(md->key(i))) {
                 (void)merged->Delete(index);
             }
             merged->Append(md->key(i), md->value(i));
