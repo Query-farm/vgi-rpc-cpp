@@ -53,7 +53,7 @@ jobs:
           - os: ubuntu-24.04-arm
             compiler: gcc
             conformance: true
-          - os: macos-14
+          - os: macos-latest
             compiler: apple-clang
             conformance: true
 
