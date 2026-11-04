@@ -311,6 +311,10 @@ jobs:
         # the capability-gated HTTP groups.
         env:
           CONFORMANCE_WORKER: ${{ github.workspace }}/build/conformance/conformance_worker
+          # One leg at a time. echo_binary_over_int32_max round-trips 2 GiB and
+          # costs the client about 8 GiB; five legs run it, which overlapping
+          # would need far more than a hosted runner's 16 GB.
+          CONFORMANCE_WORKERS: "0"
         run: ./scripts/run_conformance.sh
 
       # Everything above drives this port's *server* with the reference
