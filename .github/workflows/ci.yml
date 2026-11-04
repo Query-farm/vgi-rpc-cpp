@@ -9,6 +9,9 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+  # Python reference changes do not trigger this repo, so test against them daily.
+  schedule:
+    - cron: "47 9 * * *"
 
 concurrency:
   group: ci-${{ github.ref }}
