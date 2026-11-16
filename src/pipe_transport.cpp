@@ -58,6 +58,40 @@ void write_stream_error(const std::shared_ptr<arrow::ipc::RecordBatchWriter>& wr
     VGI_RPC_THROW_NOT_OK(writer->WriteRecordBatch(*error_batch, md));
 }
 
+// The error a stream call fails with when the client's input stream cannot be
+// read: a truncated or corrupt IPC message, an unreadable input schema, or an
+// I/O error.  Named and worded as the Python reference reports the same Arrow
+// status (pyarrow raises the C++ status as ArrowInvalid, OSError, ...), with no
+// error code of its own, as there.
+KindedError stream_input_error(const arrow::Status& status) {
+    std::string type = "ArrowException";
+    if (status.IsInvalid()) {
+        type = "ArrowInvalid";
+    } else if (status.IsIOError()) {
+        type = "OSError";
+    } else if (status.IsTypeError()) {
+        type = "ArrowTypeError";
+    } else if (status.IsNotImplemented()) {
+        type = "ArrowNotImplementedError";
+    } else if (status.IsCapacityError()) {
+        type = "ArrowCapacityError";
+    } else if (status.IsOutOfMemory()) {
+        type = "ArrowMemoryError";
+    } else if (status.IsKeyError()) {
+        type = "ArrowKeyError";
+    } else if (status.IsIndexError()) {
+        type = "ArrowIndexError";
+    }
+    return KindedError("", type, status.message(), Code::UNKNOWN);
+}
+
+void report_stream_input_error(const std::string& method, const arrow::Status& status) {
+    fprintf(stderr,
+            "vgi_rpc: warning: failed to decode streaming input for %s; failing the call and "
+            "closing the connection: %s\n",
+            method.c_str(), status.ToString().c_str());
+}
+
 // "Protocol/method", for a traceback's "in" line.
 std::string call_site(const ProtocolIdentity& owner, const std::string& method) {
     return owner.name.empty() ? method : owner.name + "/" + method;
@@ -572,18 +606,21 @@ bool Server::serve_one_with_state(const std::shared_ptr<arrow::io::InputStream>&
 
     Request request(batch, custom_metadata);
 
+    // False when a stream call lost its input framing: the error has been
+    // reported to the client, but the next request boundary cannot be found.
+    bool connection_reusable = true;
     if (method_info.method_type == MethodType::UNARY) {
         serve_unary(method_info, target->binding, request, request_id, output, transport_kind,
                     connection.call_shm, auth, peer_evidence);
     } else {
-        serve_stream(method_info, target->binding, request, request_id, input, output,
-                     transport_kind, connection, auth, peer_evidence);
+        connection_reusable = serve_stream(method_info, target->binding, request, request_id, input,
+                                           output, transport_kind, connection, auth, peer_evidence);
     }
 
     // The region is dead once the handler has read its columns out.
     if (shm_free_offset >= 0 && connection.shm) connection.shm->free_alloc(shm_free_offset);
     connection.call_shm.reset();
-    return true;
+    return connection_reusable;
 }
 
 void Server::refresh_shm(ConnectionState& connection,
@@ -703,7 +740,7 @@ void Server::serve_unary(const MethodInfo& method_info, const ProtocolIdentity& 
     serve_unary_impl(method_info, owner, request, request_id, output, ctx, call_shm);
 }
 
-void Server::serve_stream(const MethodInfo& method_info, const ProtocolIdentity& owner,
+bool Server::serve_stream(const MethodInfo& method_info, const ProtocolIdentity& owner,
                           const Request& request, const std::string& request_id,
                           const std::shared_ptr<arrow::io::InputStream>& input,
                           const std::shared_ptr<arrow::io::OutputStream>& output,
@@ -728,8 +765,10 @@ void Server::serve_stream(const MethodInfo& method_info, const ProtocolIdentity&
     // Call the stream factory
     Stream stream_result = Stream{};
 
+    // Returns whether the connection is still usable: false when the input
+    // stream that follows could not be drained, as its framing is then lost.
     auto handle_factory_error = [&](const std::string& error_type, const char* msg,
-                                    const std::exception* cause = nullptr) {
+                                    const std::exception* cause = nullptr) -> bool {
         ErrorExtras extras = cause != nullptr ? error_extras_of(*cause) : ErrorExtras{};
         if (cause == nullptr) {
             // The factory broke the framework's own contract (a null schema or
@@ -752,8 +791,11 @@ void Server::serve_stream(const MethodInfo& method_info, const ProtocolIdentity&
         } catch (const std::exception& e) {
             fprintf(stderr, "vgi_rpc: warning: error draining input after factory error: %s\n",
                     e.what());
+            return false;
         } catch (...) {
+            return false;
         }
+        return true;
     };
 
     try {
@@ -762,8 +804,7 @@ void Server::serve_stream(const MethodInfo& method_info, const ProtocolIdentity&
         // exception_type_of maps the C++ class exactly as the old per-class
         // catch ladder did, and lets a KindedError name itself and carry its
         // code and details.
-        handle_factory_error(exception_type_of(e), e.what(), &e);
-        return;
+        return handle_factory_error(exception_type_of(e), e.what(), &e);
     }
 
     auto& output_schema = stream_result.output_schema;
@@ -771,16 +812,13 @@ void Server::serve_stream(const MethodInfo& method_info, const ProtocolIdentity&
     auto& state = stream_result.state;
 
     if (!output_schema) {
-        handle_factory_error("RuntimeError", "Stream factory returned null output_schema");
-        return;
+        return handle_factory_error("RuntimeError", "Stream factory returned null output_schema");
     }
     if (!input_schema) {
-        handle_factory_error("RuntimeError", "Stream factory returned null input_schema");
-        return;
+        return handle_factory_error("RuntimeError", "Stream factory returned null input_schema");
     }
     if (!state) {
-        handle_factory_error("RuntimeError", "Stream factory returned null state");
-        return;
+        return handle_factory_error("RuntimeError", "Stream factory returned null state");
     }
 
     // Write header if present
@@ -801,17 +839,22 @@ void Server::serve_stream(const MethodInfo& method_info, const ProtocolIdentity&
         VGI_RPC_THROW_NOT_OK(output->Flush());
     }
 
-    // Open input reader (client sends ticks for producer, data for exchange)
+    // Open input reader (client sends ticks for producer, data for exchange).
+    // An input schema that cannot be read is the call's error, reported on the
+    // output stream below, not a silent drop of the call.
     auto input_reader_result = arrow::ipc::RecordBatchStreamReader::Open(input);
-    if (!input_reader_result.ok()) {
-        return;  // Client disconnected
+    std::shared_ptr<arrow::ipc::RecordBatchStreamReader> input_reader;
+    if (input_reader_result.ok()) {
+        input_reader = std::move(input_reader_result).ValueUnsafe();
     }
-    auto input_reader = std::move(input_reader_result).ValueUnsafe();
+    // Set once the input stream could not be decoded: its framing is lost, so
+    // it cannot be drained and the connection cannot carry another request.
+    bool input_broken = false;
 
     // Open output writer
     auto output_writer_result = arrow::ipc::MakeStreamWriter(output, output_schema);
     if (!output_writer_result.ok()) {
-        return;
+        return false;
     }
     auto output_writer = std::move(output_writer_result).ValueUnsafe();
 
@@ -830,11 +873,24 @@ void Server::serve_stream(const MethodInfo& method_info, const ProtocolIdentity&
 
     // Stream loop
     try {
+        if (!input_reader) {
+            input_broken = true;
+            report_stream_input_error(method_info.name, input_reader_result.status());
+            throw stream_input_error(input_reader_result.status());
+        }
         while (true) {
             // Read input batch (with per-batch custom metadata so we can
             // detect client cancellation).
             auto read_result = input_reader->ReadNext();
-            if (!read_result.ok()) break;  // I/O error / disconnect
+            if (!read_result.ok()) {
+                // A truncated or corrupt input message (or an I/O error) fails
+                // the call.  Ending the loop as on a clean end-of-stream would
+                // run the handler over a prefix of the client's input and
+                // report success.
+                input_broken = true;
+                report_stream_input_error(method_info.name, read_result.status());
+                throw stream_input_error(read_result.status());
+            }
             auto batch_with_md = std::move(read_result).ValueUnsafe();
             if (!batch_with_md.batch) break;  // EOS
 
@@ -933,8 +989,10 @@ void Server::serve_stream(const MethodInfo& method_info, const ProtocolIdentity&
     } catch (...) {
     }
 
-    // Drain remaining input
-    drain_reader(input_reader);
+    // Drain remaining input so the connection is clean for the next request --
+    // unless the input could not be decoded: draining would then read garbage,
+    // or block on a length prefix that never arrives.
+    if (!input_broken) drain_reader(input_reader);
 
     if (access_log_ && access_log_->enabled()) {
         // Streams are application surface only: neither framework protocol
@@ -954,6 +1012,7 @@ void Server::serve_stream(const MethodInfo& method_info, const ProtocolIdentity&
         fill_request_shape(rec, request.batch());
         access_log_->emit(rec);
     }
+    return !input_broken;
 }
 
 }  // namespace vgi_rpc

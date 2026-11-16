@@ -518,7 +518,10 @@ private:
                           const std::shared_ptr<ShmSegment>& call_shm,
                           bool* external_ref = nullptr);
 
-    void serve_stream(const MethodInfo& method_info, const ProtocolIdentity& owner,
+    // Returns false when the connection cannot carry another request: the
+    // client's input stream could not be decoded, so its framing is lost.  The
+    // decode error has then been sent as the call's error.
+    bool serve_stream(const MethodInfo& method_info, const ProtocolIdentity& owner,
                       const Request& request, const std::string& request_id,
                       const std::shared_ptr<arrow::io::InputStream>& input,
                       const std::shared_ptr<arrow::io::OutputStream>& output,

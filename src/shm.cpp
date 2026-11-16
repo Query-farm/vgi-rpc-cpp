@@ -82,9 +82,9 @@ std::string serialize_dictionary_batch(const std::shared_ptr<arrow::RecordBatch>
 
     auto kept = unwrap(arrow::io::BufferOutputStream::Create());
     while (true) {
-        auto msg_result = message_reader->ReadNextMessage();
-        if (!msg_result.ok()) break;
-        auto msg = std::move(msg_result).ValueUnsafe();
+        // A read error is not the end of the stream: stopping here would
+        // store a batch with its tail missing.
+        auto msg = unwrap(message_reader->ReadNextMessage());
         if (!msg) break;  // EOS
         int64_t written = 0;
         VGI_RPC_THROW_NOT_OK(

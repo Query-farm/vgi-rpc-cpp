@@ -8,6 +8,8 @@
 #include "vgi_rpc/wire.h"
 #include "vgi_rpc/request.h"
 #include "vgi_rpc/result.h"
+#include "vgi_rpc/output_collector.h"
+#include "vgi_rpc/stream.h"
 
 #include <arrow/array.h>
 #include <arrow/builder.h>
@@ -684,4 +686,154 @@ TEST_CASE("serve_one: a server that declares no protocol requires no routing key
     auto batch = arrow::RecordBatch::Make(schema, 1, {*sb.Finish()});
     auto contents = read_response(run_request(*server, make_valid_request("echo", schema, batch)));
     REQUIRE(get_error_type(contents).empty());
+}
+
+// ── Stream input that cannot be decoded ──────────────────────────────
+//
+// A failed read of a stream's input -- a message cut off mid-body, corrupt
+// bytes, an unreadable input schema -- used to end the stream loop exactly as
+// a clean end-of-stream does: the handler ran over a prefix of the client's
+// input and the call reported success.  It must fail the call with the decode
+// error (named as the Python reference names the same Arrow status), and end
+// the connection, whose framing is lost.
+
+namespace {
+
+std::shared_ptr<arrow::Schema> int_schema() {
+    return arrow::schema({arrow::field("v", arrow::int64(), false)});
+}
+
+std::shared_ptr<arrow::RecordBatch> int_batch(const std::vector<int64_t>& values) {
+    arrow::Int64Builder b;
+    REQUIRE(b.AppendValues(values).ok());
+    return arrow::RecordBatch::Make(int_schema(), static_cast<int64_t>(values.size()),
+                                    {*b.Finish()});
+}
+
+class CountingEcho : public StreamState {
+public:
+    explicit CountingEcho(std::shared_ptr<std::atomic<int64_t>> rows) : rows_(std::move(rows)) {}
+    void process(const AnnotatedBatch& input, OutputCollector& out, CallContext&) override {
+        *rows_ += input.batch->num_rows();
+        out.emit_batch(input.batch);
+    }
+
+private:
+    std::shared_ptr<std::atomic<int64_t>> rows_;
+};
+
+std::unique_ptr<Server> make_exchange_server(const std::shared_ptr<std::atomic<int64_t>>& rows) {
+    ServerBuilder builder;
+    builder.add_exchange("echo", empty_schema(), int_schema(), int_schema(),
+                         [rows](const Request&, CallContext&) {
+                             return Stream{int_schema(), int_schema(),
+                                           std::make_shared<CountingEcho>(rows), nullptr};
+                         });
+    return builder.build();
+}
+
+// An IPC stream of `batches` on the int schema; without its 8-byte
+// end-of-stream marker unless `eos`.
+std::string int_stream_bytes(const std::vector<std::shared_ptr<arrow::RecordBatch>>& batches,
+                             bool eos) {
+    std::vector<AnnotatedBatch> abs;
+    for (const auto& b : batches) abs.push_back(AnnotatedBatch::data(b));
+    auto sink = arrow::io::BufferOutputStream::Create().ValueUnsafe();
+    write_ipc_stream(sink, int_schema(), abs);
+    std::string bytes = sink->Finish().ValueUnsafe()->ToString();
+    if (!eos) bytes.resize(bytes.size() - 8);
+    return bytes;
+}
+
+struct ExchangeOutcome {
+    bool reusable = true;
+    IpcStreamContents output;
+    int64_t data_rows = 0;
+};
+
+// One `echo` call whose input stream is `input_stream` (raw bytes).
+ExchangeOutcome run_exchange(Server& server, const std::string& input_stream) {
+    auto request = make_valid_request(
+        "echo", empty_schema(),
+        arrow::RecordBatch::Make(empty_schema(), 1, std::vector<std::shared_ptr<arrow::Array>>{}));
+    std::string wire = request->ToString() + input_stream;
+    auto input = std::make_shared<arrow::io::BufferReader>(arrow::Buffer::FromString(wire));
+    auto output = arrow::io::BufferOutputStream::Create().ValueUnsafe();
+    ExchangeOutcome outcome;
+    outcome.reusable = server.serve_one(input, output);
+    outcome.output = read_response(output->Finish().ValueUnsafe());
+    for (const auto& ab : outcome.output.batches) {
+        if (classify_batch(ab) == BatchType::DATA) outcome.data_rows += ab.batch->num_rows();
+    }
+    return outcome;
+}
+
+}  // namespace
+
+TEST_CASE("stream input: a clean end-of-stream completes the call", "[server][stream-input]") {
+    auto rows = std::make_shared<std::atomic<int64_t>>(0);
+    auto server = make_exchange_server(rows);
+    auto outcome =
+        run_exchange(*server, int_stream_bytes({int_batch({1, 2, 3}), int_batch({4, 5, 6, 7})},
+                                               /*eos=*/true));
+    REQUIRE(outcome.reusable);
+    REQUIRE(get_error_type(outcome.output).empty());
+    REQUIRE(*rows == 7);
+    REQUIRE(outcome.data_rows == 7);
+}
+
+TEST_CASE("stream input: a batch cut off mid-message fails the call", "[server][stream-input]") {
+    auto rows = std::make_shared<std::atomic<int64_t>>(0);
+    auto server = make_exchange_server(rows);
+    const std::string prefix = int_stream_bytes({int_batch({1, 2, 3})}, false);
+    const std::string full =
+        int_stream_bytes({int_batch({1, 2, 3}), int_batch({4, 5, 6, 7})}, false);
+    const size_t second_len = full.size() - prefix.size();
+    REQUIRE(second_len > 16);
+
+    // Cut inside the metadata, and inside the body.  The error types and
+    // messages are what pyarrow reports for the same bytes.
+    const std::vector<std::pair<size_t, std::string>> cuts = {{6, "ArrowInvalid"},
+                                                              {second_len - 8, "OSError"}};
+    for (const auto& [keep, expected_type] : cuts) {
+        rows->store(0);
+        auto outcome = run_exchange(*server, full.substr(0, prefix.size() + keep));
+        INFO("kept " << keep << " of " << second_len << " bytes of the second message");
+        REQUIRE_FALSE(outcome.reusable);  // input framing is lost
+        REQUIRE(*rows == 3);              // only the complete batch reached the handler
+        REQUIRE(outcome.data_rows == 3);
+        REQUIRE(get_error_type(outcome.output) == expected_type);
+        REQUIRE_FALSE(log_message_of(outcome.output).empty());
+    }
+}
+
+TEST_CASE("stream input: a corrupt message fails the call", "[server][stream-input]") {
+    auto rows = std::make_shared<std::atomic<int64_t>>(0);
+    auto server = make_exchange_server(rows);
+    // A continuation marker and a metadata length, then bytes that are not a
+    // flatbuffer Message, then a clean end-of-stream marker the reader never
+    // reaches.
+    std::string garbage("\xff\xff\xff\xff\x10\x00\x00\x00", 8);
+    garbage += std::string(16, '\x5a');
+    garbage += std::string("\xff\xff\xff\xff\x00\x00\x00\x00", 8);
+    auto outcome = run_exchange(*server, int_stream_bytes({int_batch({1, 2, 3})}, false) + garbage);
+    REQUIRE_FALSE(outcome.reusable);
+    REQUIRE(*rows == 3);
+    REQUIRE(outcome.data_rows == 3);
+    REQUIRE(get_error_type(outcome.output) == "OSError");
+    REQUIRE(log_message_of(outcome.output) == "Invalid flatbuffers message.");
+}
+
+TEST_CASE("stream input: an unreadable input schema fails the call", "[server][stream-input]") {
+    auto rows = std::make_shared<std::atomic<int64_t>>(0);
+    auto server = make_exchange_server(rows);
+    const std::string stream = int_stream_bytes({int_batch({1, 2, 3})}, true);
+    // The schema message itself, cut short.
+    auto outcome = run_exchange(*server, stream.substr(0, 12));
+    REQUIRE_FALSE(outcome.reusable);
+    REQUIRE(*rows == 0);
+    REQUIRE(outcome.data_rows == 0);
+    REQUIRE(get_error_type(outcome.output) == "ArrowInvalid");
+    REQUIRE(log_message_of(outcome.output) ==
+            "Expected to read 120 metadata bytes, but only read 4");
 }
