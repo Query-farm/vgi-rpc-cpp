@@ -20,6 +20,7 @@
 #include "vgi_rpc/server.h"
 #include "traceback_scope.h"
 #include "vgi_rpc/arrow_utils.h"
+#include "vgi_rpc/client_external.h"
 #include "vgi_rpc/crypto.h"
 #include "vgi_rpc/errors.h"
 #include "vgi_rpc/external.h"
@@ -81,6 +82,93 @@ constexpr const char* ACCEPT_MAX_RESPONSE_BYTES_SUPPORT_HEADER =
 constexpr int64_t MAX_SAFE_RESPONSE_BYTES = 9'007'199'254'740'991LL;
 constexpr int64_t MIN_RESPONSE_BYTES = 64LL << 10;
 constexpr const char* AUTH_REASON_HEADER = "VGI-Auth-Reason";
+// The upload-URL protocol this server speaks, as advertised in
+// `VGI-Upload-URL-Support`.  v1 ("true", a bare `count`) is retired.
+constexpr const char* UPLOAD_URL_PROTOCOL_VERSION = "2";
+constexpr int64_t MAX_UPLOAD_URLS_PER_REQUEST = 100;
+
+// One `__upload_url__/init` entry: the exact size and SHA-256 of a body the
+// client is about to PUT.
+struct UploadRequestEntry {
+    int64_t size = 0;
+    std::string sha256;
+};
+
+bool is_lower_hex_sha256(std::string_view value) {
+    return value.size() == 64 && std::all_of(value.begin(), value.end(), [](char c) {
+               return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+           });
+}
+
+std::shared_ptr<arrow::Schema> upload_url_response_schema() {
+    return arrow::schema({
+        arrow::field("upload_url", arrow::utf8(), /*nullable=*/false),
+        arrow::field("download_url", arrow::utf8(), /*nullable=*/false),
+        arrow::field("expires_at", arrow::timestamp(arrow::TimeUnit::MICRO, "UTC"),
+                     /*nullable=*/false),
+        arrow::field("upload_headers", arrow::map(arrow::utf8(), arrow::utf8()),
+                     /*nullable=*/false),
+    });
+}
+
+// Parse and validate a v2 `__upload_url__/init` request into `out`.  Returns
+// the refusal message when the request must be refused (HTTP 400, before any
+// URL is minted), nullopt when it is acceptable.
+std::optional<std::string> parse_upload_url_request(
+    const std::shared_ptr<arrow::RecordBatch>& batch, int64_t max_upload_bytes,
+    std::vector<UploadRequestEntry>& out) {
+    // Texts are the reference's (vgi-rpc-python, UPLOAD_URL_V2.md), checked
+    // in its order: per entry size, then sha256, then the upload cap.
+    const std::string method = "__upload_url__";
+    if (!batch || batch->GetColumnByName("count") != nullptr ||
+        batch->GetColumnByName("uploads") == nullptr) {
+        return method +
+               " request uses the retired count shape: this server requires "
+               "VGI-Upload-URL-Support: 2 and an 'uploads' parameter (list<struct<size: int64, "
+               "sha256: utf8>>, one entry per upload)";
+    }
+    const auto list =
+        std::dynamic_pointer_cast<arrow::ListArray>(batch->GetColumnByName("uploads"));
+    if (!list || batch->num_rows() != 1 || list->IsNull(0)) {
+        return method + " 'uploads' must have 1-" + std::to_string(MAX_UPLOAD_URLS_PER_REQUEST) +
+               " entries, got null";
+    }
+    const int64_t begin = list->value_offset(0);
+    const int64_t count = list->value_length(0);
+    if (count < 1 || count > MAX_UPLOAD_URLS_PER_REQUEST) {
+        return method + " 'uploads' must have 1-" + std::to_string(MAX_UPLOAD_URLS_PER_REQUEST) +
+               " entries, got " + std::to_string(count);
+    }
+    // Entries are read by name; a list of anything but the struct reads as
+    // entries with no size, which the size check below refuses.
+    const auto entries = std::dynamic_pointer_cast<arrow::StructArray>(list->values());
+    const auto sizes =
+        entries ? std::dynamic_pointer_cast<arrow::Int64Array>(entries->GetFieldByName("size"))
+                : nullptr;
+    const auto hashes =
+        entries ? std::dynamic_pointer_cast<arrow::StringArray>(entries->GetFieldByName("sha256"))
+                : nullptr;
+    out.clear();
+    out.reserve(static_cast<size_t>(count));
+    for (int64_t i = begin; i < begin + count; ++i) {
+        const std::string entry = method + " uploads[" + std::to_string(i - begin) + "]";
+        const bool has_size = entries && !entries->IsNull(i) && sizes && !sizes->IsNull(i);
+        if (!has_size || sizes->Value(i) < 1) {
+            return entry + ".size must be an integer >= 1, got " +
+                   (has_size ? std::to_string(sizes->Value(i)) : std::string("None"));
+        }
+        const int64_t size = sizes->Value(i);
+        if (!hashes || hashes->IsNull(i) || !is_lower_hex_sha256(hashes->GetView(i))) {
+            return entry + ".sha256 must be 64 lowercase hex characters";
+        }
+        if (max_upload_bytes > 0 && size > max_upload_bytes) {
+            return entry + ".size " + std::to_string(size) + " exceeds VGI-Max-Upload-Bytes (" +
+                   std::to_string(max_upload_bytes) + ")";
+        }
+        out.push_back(UploadRequestEntry{size, hashes->GetString(i)});
+    }
+    return std::nullopt;
+}
 
 // A bearer the authentication chain refused, with the 401 reason to report.
 // Never carries the credential.
@@ -929,7 +1017,9 @@ void HttpServer::stamp_capabilities(httplib::Response& res) const {
     // to know whether to expect pointer batches at all.
     res.set_header("VGI-Externalization-Enabled", externalization() ? "true" : "false");
     if (externalization()) {
-        res.set_header("VGI-Upload-URL-Support", "true");
+        // "2": upload URLs v2, `__upload_url__/init` takes (size, sha256)
+        // entries.  A clean break -- no server answers the retired count shape.
+        res.set_header("VGI-Upload-URL-Support", UPLOAD_URL_PROTOCOL_VERSION);
         // The threshold doubles as the inline-request ceiling: a body over it
         // is what the client externalizes instead, so advertising one number
         // keeps the two sides from disagreeing about where the line is.
@@ -1097,17 +1187,31 @@ std::optional<IpcStreamContents> HttpServer::resolve_request_pointer(
     const std::string url = get_metadata_value(first.custom_metadata, keys::LOCATION);
     if (url.empty()) return std::nullopt;
 
-    const std::string fetched = storage_->fetch(url);
+    // Upload URLs v2: a request pointer must name the digest of what it points
+    // at, and the bytes are verified before anything decodes them.  Some
+    // backends (GCS) cannot check the hash at storage, so this is the check
+    // that always runs.
     const std::string expected_sha256 =
         get_metadata_value(first.custom_metadata, keys::LOCATION_SHA256);
-    if (!expected_sha256.empty()) {
-        const auto digest =
-            crypto::sha256(reinterpret_cast<const uint8_t*>(fetched.data()), fetched.size());
-        const std::string actual_sha256 = crypto::hex_encode(digest.data(), digest.size());
-        if (actual_sha256 != expected_sha256) {
-            throw std::runtime_error("external location checksum mismatch: expected " +
-                                     expected_sha256 + ", got " + actual_sha256);
-        }
+    if (expected_sha256.empty()) {
+        throw std::runtime_error(
+            "Request pointer is missing vgi_rpc.location.sha256 (required on request pointers "
+            "since vgi-rpc upload-URL protocol v2): " +
+            redact_external_url(url));
+    }
+    if (!is_lower_hex_sha256(expected_sha256)) {
+        throw std::runtime_error(
+            "Request pointer vgi_rpc.location.sha256 is not 64 lowercase hex characters: " +
+            redact_external_url(url));
+    }
+    const std::string fetched = storage_->fetch(url);
+    const auto digest =
+        crypto::sha256(reinterpret_cast<const uint8_t*>(fetched.data()), fetched.size());
+    const std::string actual_sha256 = crypto::hex_encode(digest.data(), digest.size());
+    if (actual_sha256 != expected_sha256) {
+        throw std::runtime_error(
+            "ExternalLocation sha256 mismatch (SHA-256 checksum mismatch) for " +
+            redact_external_url(url) + ": expected " + expected_sha256 + ", got " + actual_sha256);
     }
     auto buf = arrow::Buffer::FromString(fetched);
     auto reader = std::make_shared<arrow::io::BufferReader>(buf);
@@ -1736,32 +1840,51 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
         }
         TurnRecord turn(upload_log, std::move(rec));
 
-        int64_t count = 1;
-        if (auto col = batch->GetColumnByName("count");
-            col && col->length() > 0 && col->type()->id() == arrow::Type::INT64) {
-            count = std::static_pointer_cast<arrow::Int64Array>(col)->Value(0);
+        // v2: one (size, sha256) entry per upload, so each URL can be signed
+        // for exactly the body the client will PUT.  Refused before any URL
+        // is minted.
+        std::vector<UploadRequestEntry> entries;
+        if (const auto refusal = parse_upload_url_request(batch, cfg_.max_upload_bytes, entries)) {
+            turn.failed("ValueError", *refusal);
+            fail(400, "ValueError", *refusal);
+            return;
         }
-        count = std::clamp<int64_t>(count, 1, 100);
 
         try {
-            const auto pairs = storage_->upload_urls(count);
-            auto schema = arrow::schema({
-                arrow::field("upload_url", arrow::utf8()),
-                arrow::field("download_url", arrow::utf8()),
-                arrow::field("expires_at", arrow::timestamp(arrow::TimeUnit::MICRO, "UTC")),
-            });
+            std::vector<UploadUrl> urls;
+            urls.reserve(entries.size());
+            for (const auto& entry : entries) {
+                urls.push_back(storage_->generate_upload_url(entry.size, entry.sha256));
+            }
+            const auto schema = upload_url_response_schema();
             arrow::StringBuilder up, down;
             arrow::TimestampBuilder exp(arrow::timestamp(arrow::TimeUnit::MICRO, "UTC"),
                                         arrow::default_memory_pool());
-            const int64_t expires_us = (static_cast<int64_t>(std::time(nullptr)) + 3600) * 1000000;
-            for (const auto& pair : pairs) {
-                VGI_RPC_THROW_NOT_OK(up.Append(pair.upload_url));
-                VGI_RPC_THROW_NOT_OK(down.Append(pair.download_url));
-                VGI_RPC_THROW_NOT_OK(exp.Append(expires_us));
+            auto key_builder = std::make_shared<arrow::StringBuilder>();
+            auto item_builder = std::make_shared<arrow::StringBuilder>();
+            arrow::MapBuilder headers(arrow::default_memory_pool(), key_builder, item_builder,
+                                      schema->field(3)->type());
+            for (const auto& url : urls) {
+                VGI_RPC_THROW_NOT_OK(up.Append(url.upload_url));
+                VGI_RPC_THROW_NOT_OK(down.Append(url.download_url));
+                VGI_RPC_THROW_NOT_OK(exp.Append(url.expires_at_us));
+                VGI_RPC_THROW_NOT_OK(headers.Append());
+                for (const auto& [name, value] : url.headers) {
+                    // The client sends its own plain Content-Length; a
+                    // provider that lists one must not hand it a second.
+                    std::string lower = name;
+                    std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) {
+                        return static_cast<char>(std::tolower(c));
+                    });
+                    if (lower == "content-length") continue;
+                    VGI_RPC_THROW_NOT_OK(key_builder->Append(name));
+                    VGI_RPC_THROW_NOT_OK(item_builder->Append(value));
+                }
             }
-            auto out_batch = arrow::RecordBatch::Make(
-                schema, static_cast<int64_t>(pairs.size()),
-                {unwrap(up.Finish()), unwrap(down.Finish()), unwrap(exp.Finish())});
+            auto out_batch =
+                arrow::RecordBatch::Make(schema, static_cast<int64_t>(urls.size()),
+                                         {unwrap(up.Finish()), unwrap(down.Finish()),
+                                          unwrap(exp.Finish()), unwrap(headers.Finish())});
             res.status = 200;
             std::string body = build_body([&](const std::shared_ptr<arrow::io::OutputStream>& out) {
                 write_ipc_stream(out, schema, {AnnotatedBatch::data(out_batch)});

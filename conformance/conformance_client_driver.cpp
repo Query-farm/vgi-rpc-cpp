@@ -790,6 +790,9 @@ json Driver::op_capabilities() {
                                   {"sticky_default_ttl", optional_int(caps.sticky_default_ttl)},
                                   {"sticky_echo_headers", caps.sticky_echo_headers},
                                   {"upload_url_support", caps.upload_url_support},
+                                  {"upload_url_version", caps.upload_url_version > 0
+                                                             ? json(caps.upload_url_version)
+                                                             : json(nullptr)},
                                   {"max_request_bytes", optional_int(caps.max_request_bytes)},
                                   {"max_response_bytes", optional_int(caps.max_response_bytes)},
                                   {"max_externalized_response_bytes",
@@ -804,9 +807,15 @@ json Driver::op_capabilities() {
 
 json Driver::op_request_upload_urls(const json& request) {
     try {
-        const int64_t count = request.value("count", int64_t{1});
-        const auto urls =
-            session() ? session()->request_upload_urls(count) : http_->request_upload_urls(count);
+        // Upload URLs v2: one {size, sha256} entry per upload, relayed as
+        // given -- no default, no hashing, no fallback to the retired count.
+        std::vector<HttpUploadRequest> uploads;
+        for (const auto& entry : request.at("uploads")) {
+            uploads.push_back(HttpUploadRequest{entry.at("size").get<int64_t>(),
+                                                entry.at("sha256").get<std::string>()});
+        }
+        const auto urls = session() ? session()->request_upload_urls(uploads)
+                                    : http_->request_upload_urls(uploads);
         json list = json::array();
         for (const auto& url : urls) {
             // The protocol asks for integer Unix seconds; the client carries
@@ -815,7 +824,8 @@ json Driver::op_request_upload_urls(const json& request) {
                                                          : json(nullptr);
             list.push_back(json{{"upload_url", url.upload_url},
                                 {"download_url", url.download_url},
-                                {"expires_at", std::move(expires)}});
+                                {"expires_at", std::move(expires)},
+                                {"upload_headers", url.upload_headers}});
         }
         return json{{"ok", true}, {"urls", std::move(list)}};
     } catch (const std::exception& error) {

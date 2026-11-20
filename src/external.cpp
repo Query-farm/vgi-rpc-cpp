@@ -19,6 +19,7 @@
 #include <array>
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <memory>
 #include <stdexcept>
 #include <utility>
@@ -178,6 +179,42 @@ std::string zstd_decompress_bounded(const std::string& encoded, int64_t max_byte
     return decoded;
 }
 
+// Expiry of a URL minted now with `ttl_seconds` to live, in microseconds since
+// the Unix epoch.
+int64_t expiry_us(int ttl_seconds) {
+    const auto now = std::chrono::duration_cast<std::chrono::microseconds>(
+                         std::chrono::system_clock::now().time_since_epoch())
+                         .count();
+    return now + static_cast<int64_t>(ttl_seconds) * 1000000;
+}
+
+// Standard (padded) base64, the encoding `x-amz-checksum-sha256` takes.
+std::string base64_std(const uint8_t* data, size_t len) {
+    static constexpr char kAlphabet[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    out.reserve((len + 2) / 3 * 4);
+    for (size_t i = 0; i < len; i += 3) {
+        const uint32_t n = (uint32_t{data[i]} << 16) |
+                           (i + 1 < len ? uint32_t{data[i + 1]} << 8 : 0) |
+                           (i + 2 < len ? uint32_t{data[i + 2]} : 0);
+        out.push_back(kAlphabet[(n >> 18) & 63]);
+        out.push_back(kAlphabet[(n >> 12) & 63]);
+        out.push_back(i + 1 < len ? kAlphabet[(n >> 6) & 63] : '=');
+        out.push_back(i + 2 < len ? kAlphabet[n & 63] : '=');
+    }
+    return out;
+}
+
+// The base64 form of a lowercase-hex SHA-256 the caller already validated.
+std::string sha256_hex_to_base64(const std::string& sha256_hex) {
+    const auto raw = crypto::hex_decode(sha256_hex);
+    if (!raw || raw->size() != 32) {
+        throw std::invalid_argument("upload sha256 must be 64 lowercase hex characters");
+    }
+    return base64_std(raw->data(), raw->size());
+}
+
 #if defined(VGI_RPC_WITH_S3) || defined(VGI_RPC_WITH_GCS)
 // A random object key under the configured prefix.  The extension records the
 // coding so a human browsing the bucket can tell what is in there.
@@ -210,7 +247,7 @@ public:
     }
 
     std::string upload(const std::string& data, const std::string& content_encoding) override {
-        const UploadUrlPair urls = allocate(content_encoding);
+        const UploadUrl urls = allocate(content_encoding);
         auto [origin, path] = split_url(urls.upload_url);
         auto client = make_client(origin);
 
@@ -311,21 +348,25 @@ public:
         }
     }
 
-    std::vector<UploadUrlPair> upload_urls(int64_t count) override {
-        std::vector<UploadUrlPair> out;
-        out.reserve(static_cast<size_t>(count));
-        for (int64_t i = 0; i < count; ++i) {
-            out.push_back(allocate(""));
-        }
-        return out;
+    UploadUrl generate_upload_url(int64_t size, const std::string& sha256_hex) override {
+        // The fixture's sized allocation: it then verifies the PUT like
+        // S3/R2 and names the checksum header the client must send.
+        nlohmann::json body = nlohmann::json::object();
+        body["size"] = size;
+        body["sha256_b64"] = sha256_hex_to_base64(sha256_hex);
+        return allocate(body);
     }
 
 private:
-    UploadUrlPair allocate(const std::string& content_encoding) {
-        auto [origin, _] = split_url(base_url_);
-        auto client = make_client(origin);
+    UploadUrl allocate(const std::string& content_encoding) {
         nlohmann::json body = nlohmann::json::object();
         if (!content_encoding.empty()) body["content_encoding"] = content_encoding;
+        return allocate(body);
+    }
+
+    UploadUrl allocate(const nlohmann::json& body) {
+        auto [origin, _] = split_url(base_url_);
+        auto client = make_client(origin);
 
         auto res = client.Post("/alloc", httplib::Headers{{"Accept-Encoding", "identity"}},
                                body.dump(), "application/json");
@@ -340,10 +381,19 @@ private:
         try {
             const auto allocation = nlohmann::json::parse(res->body);
             const std::string legacy = allocation.at("object_url").get<std::string>();
-            return UploadUrlPair{
-                allocation.value("upload_url", legacy),
-                allocation.value("download_url", legacy),
-            };
+            UploadUrl url;
+            url.upload_url = allocation.value("upload_url", legacy);
+            url.download_url = allocation.value("download_url", legacy);
+            url.expires_at_us = expiry_us(config_.signed_url_ttl_seconds);
+            // Headers the storage service signed into the PUT, if any; the
+            // fixture's sized allocations name them so a client must send them.
+            if (auto found = allocation.find("upload_headers");
+                found != allocation.end() && !found->is_null()) {
+                for (const auto& [name, value] : found->items()) {
+                    url.headers[name] = value.get<std::string>();
+                }
+            }
+            return url;
         } catch (const nlohmann::json::exception&) {
             throw std::runtime_error(
                 "external storage alloc returned an invalid allocation (expected a JSON object "
@@ -424,15 +474,25 @@ public:
         return HttpExternalStorage(url, config_).fetch(url);
     }
 
-    std::vector<UploadUrlPair> upload_urls(int64_t count) override {
-        std::vector<UploadUrlPair> out;
-        out.reserve(static_cast<size_t>(count));
-        for (int64_t i = 0; i < count; ++i) {
-            const std::string key = make_key(prefix_, "");
-            // Distinct credentials per verb: a client given an upload URL
-            // cannot use it to read anything else in the bucket.
-            out.push_back(UploadUrlPair{presign("PUT", key), presign("GET", key)});
-        }
+    UploadUrl generate_upload_url(int64_t size, const std::string& sha256_hex) override {
+        const std::string key = make_key(prefix_, "");
+        UploadUrl out;
+        // The PUT signs the exact length and the SHA-256, so S3 itself refuses
+        // any other body.  The checksum header goes back to the client; the
+        // length rides the plain Content-Length it sends anyway.
+        const std::string checksum = sha256_hex_to_base64(sha256_hex);
+        Aws::Http::HeaderValueCollection signed_headers;
+        signed_headers.emplace("content-length", std::to_string(size));
+        signed_headers.emplace("x-amz-checksum-sha256", checksum);
+        auto put = client_->GeneratePresignedUrl(bucket_, key, Aws::Http::HttpMethod::HTTP_PUT,
+                                                 signed_headers, static_cast<uint64_t>(ttl_));
+        if (put.empty()) throw std::runtime_error("S3 pre-signing produced no URL");
+        out.upload_url = std::string(put.c_str());
+        // Distinct credentials per verb: a client given an upload URL
+        // cannot use it to read anything else in the bucket.
+        out.download_url = presign("GET", key);
+        out.expires_at_us = expiry_us(ttl_);
+        out.headers.emplace("x-amz-checksum-sha256", checksum);
         return out;
     }
 
@@ -493,29 +553,46 @@ public:
         return HttpExternalStorage(url, config_).fetch(url);
     }
 
-    std::vector<UploadUrlPair> upload_urls(int64_t count) override {
-        std::vector<UploadUrlPair> out;
-        out.reserve(static_cast<size_t>(count));
-        for (int64_t i = 0; i < count; ++i) {
-            const std::string key = make_key(prefix_, "");
-            out.push_back(UploadUrlPair{sign("PUT", key), sign("GET", key)});
-        }
+    UploadUrl generate_upload_url(int64_t size, const std::string& sha256_hex) override {
+        (void)sha256_hex;  // GCS cannot verify SHA-256 at storage; the server's
+                           // pointer check does.
+        const std::string key = make_key(prefix_, "");
+        // GCS signs the length instead: a range pinned to exactly `size`.
+        const std::string range = std::to_string(size) + "," + std::to_string(size);
+        UploadUrl out;
+        out.upload_url = sign("PUT", key, range);
+        out.download_url = sign("GET", key);
+        out.expires_at_us = expiry_us(ttl_);
+        out.headers.emplace("Content-Type", "application/octet-stream");
+        out.headers.emplace("x-goog-content-length-range", range);
         return out;
     }
 
 private:
-    std::string sign(const char* method, const std::string& key) {
+    std::string sign(const char* method, const std::string& key,
+                     const std::string& content_length_range = {}) {
         namespace gcs = google::cloud::storage;
         // Without an explicit account the library derives the signing email
         // from the ambient credentials, which anonymous or impersonated ones
         // do not carry — hence the knob.
+        const auto range_header =
+            content_length_range.empty()
+                ? gcs::AddExtensionHeaderOption()
+                : gcs::AddExtensionHeader("x-goog-content-length-range", content_length_range);
+        // A sized PUT also signs its content type, which the client then
+        // must send verbatim.
+        const auto content_type =
+            content_length_range.empty()
+                ? gcs::AddExtensionHeaderOption()
+                : gcs::AddExtensionHeader("content-type", "application/octet-stream");
         auto url =
             signing_account_.empty()
                 ? client_.CreateV4SignedUrl(method, bucket_, key,
-                                            gcs::SignedUrlDuration(std::chrono::seconds(ttl_)))
-                : client_.CreateV4SignedUrl(method, bucket_, key,
                                             gcs::SignedUrlDuration(std::chrono::seconds(ttl_)),
-                                            gcs::SigningAccount(signing_account_));
+                                            range_header, content_type)
+                : client_.CreateV4SignedUrl(
+                      method, bucket_, key, gcs::SignedUrlDuration(std::chrono::seconds(ttl_)),
+                      gcs::SigningAccount(signing_account_), range_header, content_type);
         if (!url) {
             throw std::runtime_error("GCS pre-signing failed: " + url.status().message());
         }

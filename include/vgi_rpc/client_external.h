@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -78,10 +79,14 @@ public:
                                    ExternalLogHandler on_log = {}) const;
 
     /// Credential-free PUT for a method-bound pre-signed upload URL. No
-    /// Authorization, cookies, or caller-controlled headers are attached and
-    /// redirects are rejected rather than replaying the upload elsewhere.
+    /// Authorization or cookies are attached and redirects are rejected rather
+    /// than replaying the upload elsewhere. `upload_headers` are the headers
+    /// the server's upload-URL response says the signature covers; they are
+    /// sent verbatim (a Content-Type among them replaces `content_type`).  The
+    /// body goes with a plain Content-Length, never chunked.
     void put(const std::string& url, const std::string& body,
-             const std::string& content_type = "application/vnd.apache.arrow.stream") const;
+             const std::string& content_type = "application/vnd.apache.arrow.stream",
+             const std::map<std::string, std::string>& upload_headers = {}) const;
 
 private:
     class Impl;

@@ -743,11 +743,37 @@ AnnotatedBatch ClientExternalHttp::resolve_pointer(const AnnotatedBatch& pointer
 }
 
 void ClientExternalHttp::put(const std::string& url, const std::string& body,
-                             const std::string& content_type) const {
+                             const std::string& content_type,
+                             const std::map<std::string, std::string>& upload_headers) const {
     if (body.size() > static_cast<uint64_t>(impl_->options.max_upload_bytes)) {
         throw ExternalHttpError("external upload exceeds max_upload_bytes");
     }
-    if (content_type.empty() || content_type.find_first_of("\r\n") != std::string::npos) {
+    // The server's signed headers go out verbatim.  Content-Length is the one
+    // the client owns (exact body length, never chunked), and hop-by-hop or
+    // credential headers have no business on a pre-signed PUT.
+    std::string effective_content_type = content_type;
+    httplib::Headers headers{{"Accept-Encoding", "identity"}};
+    for (const auto& [name, value] : upload_headers) {
+        if (name.empty() || name.find_first_of("\r\n:") != std::string::npos ||
+            value.find_first_of("\r\n") != std::string::npos) {
+            throw ExternalHttpError("external upload header is invalid");
+        }
+        std::string lower = name;
+        std::transform(lower.begin(), lower.end(), lower.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (lower == "content-length" || lower == "transfer-encoding" || lower == "host" ||
+            lower == "authorization" || lower == "cookie" || lower == "connection") {
+            throw ExternalHttpError("external upload header '" + name + "' is not allowed");
+        }
+        if (lower == "content-type") {
+            effective_content_type = value;
+            continue;
+        }
+        if (lower == "accept-encoding") headers.erase("Accept-Encoding");
+        headers.emplace(name, value);
+    }
+    if (effective_content_type.empty() ||
+        effective_content_type.find_first_of("\r\n") != std::string::npos) {
         throw std::invalid_argument("external upload Content-Type is invalid");
     }
     const ResolvedTarget target = validate_and_resolve(url, impl_->options.url_policy);
@@ -756,11 +782,11 @@ void ClientExternalHttp::put(const std::string& url, const std::string& body,
         throw ExternalHttpError("external HTTP client could not be initialized");
     client.set_hostname_addr_map({{target.url.host, target.pinned_address}});
     set_timeouts(client, impl_->options);
-    httplib::Headers headers{{"Accept-Encoding", "identity"}};
     std::string response_body;
     bool cap_exceeded = false;
     auto response = client.Put(
-        target.url.path_and_query, headers, body, content_type, [&](const char* data, size_t size) {
+        target.url.path_and_query, headers, body, effective_content_type,
+        [&](const char* data, size_t size) {
             if (size > static_cast<uint64_t>(impl_->options.max_upload_response_bytes) ||
                 response_body.size() >
                     static_cast<uint64_t>(impl_->options.max_upload_response_bytes) - size) {

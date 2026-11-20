@@ -642,6 +642,30 @@ private:
 
 }  // namespace
 
+/// A v2 `__upload_url__/init` body: one (size, sha256) entry.
+std::string upload_init_body() {
+    auto type = arrow::struct_({arrow::field("size", arrow::int64(), false),
+                                arrow::field("sha256", arrow::utf8(), false)});
+    auto sizes = std::make_shared<arrow::Int64Builder>();
+    auto hashes = std::make_shared<arrow::StringBuilder>();
+    auto structs = std::make_shared<arrow::StructBuilder>(
+        type, arrow::default_memory_pool(),
+        std::vector<std::shared_ptr<arrow::ArrayBuilder>>{sizes, hashes});
+    arrow::ListBuilder list(arrow::default_memory_pool(), structs, arrow::list(type));
+    REQUIRE(list.Append().ok());
+    REQUIRE(structs->Append().ok());
+    REQUIRE(sizes->Append(16).ok());
+    REQUIRE(hashes->Append(std::string(64, 'a')).ok());
+    auto schema = arrow::schema({arrow::field("uploads", arrow::list(type), false)});
+    auto batch = arrow::RecordBatch::Make(schema, 1, {list.Finish().ValueUnsafe()});
+    auto metadata = std::make_shared<arrow::KeyValueMetadata>();
+    metadata->Append(keys::METHOD, "__upload_url__");
+    metadata->Append(keys::REQUEST_VERSION, REQUEST_VERSION_VALUE);
+    auto sink = arrow::io::BufferOutputStream::Create().ValueUnsafe();
+    write_ipc_stream(sink, schema, {AnnotatedBatch::with_metadata(batch, metadata)});
+    return buffer_string(sink->Finish().ValueUnsafe());
+}
+
 TEST_CASE("__upload_url__ files a record under the server's primary", "[access-log]") {
     TempLog log;
     FakeAllocServer storage;
@@ -649,8 +673,7 @@ TEST_CASE("__upload_url__ files a record under the server's primary", "[access-l
 
     httplib::Client client("127.0.0.1", server.port());
     client.set_read_timeout(10, 0);
-    auto response =
-        client.Post("/vgi/__upload_url__/init", init_body("__upload_url__"), kArrowContentType);
+    auto response = client.Post("/vgi/__upload_url__/init", upload_init_body(), kArrowContentType);
     REQUIRE(response);
     REQUIRE(response->status == 200);
 

@@ -197,7 +197,7 @@ std::string encode_ipc(const AnnotatedBatch& batch,
 }
 
 std::string external_pointer_body(const std::string& original_body, const std::string& download_url,
-                                  int64_t max_bytes) {
+                                  const std::string& sha256_hex, int64_t max_bytes) {
     auto input =
         std::make_shared<arrow::io::BufferReader>(arrow::Buffer::FromString(original_body));
     const auto contents = read_ipc_stream(input);
@@ -212,22 +212,50 @@ std::string external_pointer_body(const std::string& original_body, const std::s
                         ? contents->batches.front().custom_metadata->Copy()
                         : std::make_shared<arrow::KeyValueMetadata>();
     replace_metadata(metadata, keys::LOCATION, download_url);
-    crypto::Sha256 digest;
-    digest.update(original_body);
-    replace_metadata(metadata, keys::LOCATION_SHA256, digest.hex_digest());
+    // Required on request pointers since upload URLs v2: the server verifies
+    // the fetched bytes against it before decoding.
+    replace_metadata(metadata, keys::LOCATION_SHA256, sha256_hex);
     return encode_ipc(AnnotatedBatch::data(make_empty_batch(contents->schema)), metadata,
                       max_bytes);
 }
 
+std::shared_ptr<arrow::DataType> upload_entry_type() {
+    return arrow::struct_({arrow::field("size", arrow::int64(), /*nullable=*/false),
+                           arrow::field("sha256", arrow::utf8(), /*nullable=*/false)});
+}
+
 std::shared_ptr<arrow::Schema> upload_url_request_schema() {
-    return arrow::schema({arrow::field("count", arrow::int64(), true)});
+    return arrow::schema(
+        {arrow::field("uploads", arrow::list(upload_entry_type()), /*nullable=*/false)});
 }
 
 std::shared_ptr<arrow::Schema> upload_url_response_schema() {
     return arrow::schema(
-        {arrow::field("upload_url", arrow::utf8(), true),
-         arrow::field("download_url", arrow::utf8(), true),
-         arrow::field("expires_at", arrow::timestamp(arrow::TimeUnit::MICRO, "UTC"), true)});
+        {arrow::field("upload_url", arrow::utf8(), false),
+         arrow::field("download_url", arrow::utf8(), false),
+         arrow::field("expires_at", arrow::timestamp(arrow::TimeUnit::MICRO, "UTC"), false),
+         arrow::field("upload_headers", arrow::map(arrow::utf8(), arrow::utf8()), false)});
+}
+
+constexpr int kUploadUrlProtocolVersion = 2;
+
+// Why this client will not upload to a server advertising `version` of the
+// upload-URL protocol, or nullopt when it speaks it.  `version` 0 (absent or
+// unrecognised) is the caller's "no upload support" case.  Texts are the
+// reference's; a v1 server is never fallen back to.
+std::optional<std::string> upload_version_refusal(int version) {
+    if (version > 0 && version < kUploadUrlProtocolVersion) {
+        return "Server upload protocol is too old: it advertises VGI-Upload-URL-Support v" +
+               std::to_string(version) + " and this client needs " +
+               std::to_string(kUploadUrlProtocolVersion);
+    }
+    if (version > kUploadUrlProtocolVersion) {
+        return "Server upload protocol is newer than this client: it advertises "
+               "VGI-Upload-URL-Support: " +
+               std::to_string(version) + " and this client speaks " +
+               std::to_string(kUploadUrlProtocolVersion);
+    }
+    return std::nullopt;
 }
 
 /// The one-row `{protocol}` batch that reflection's `describe` takes.
@@ -238,11 +266,28 @@ std::shared_ptr<arrow::RecordBatch> describe_params(const std::string& protocol)
     return arrow::RecordBatch::Make(schema, 1, {unwrap(builder.Finish())});
 }
 
-AnnotatedBatch upload_url_request(int64_t count) {
-    arrow::Int64Builder builder;
-    VGI_RPC_THROW_NOT_OK(builder.Append(count));
+AnnotatedBatch upload_url_request(const std::vector<HttpUploadRequest>& uploads) {
+    auto size_builder = std::make_shared<arrow::Int64Builder>();
+    auto sha_builder = std::make_shared<arrow::StringBuilder>();
+    auto struct_builder = std::make_shared<arrow::StructBuilder>(
+        upload_entry_type(), arrow::default_memory_pool(),
+        std::vector<std::shared_ptr<arrow::ArrayBuilder>>{size_builder, sha_builder});
+    arrow::ListBuilder list_builder(arrow::default_memory_pool(), struct_builder,
+                                    arrow::list(upload_entry_type()));
+    VGI_RPC_THROW_NOT_OK(list_builder.Append());
+    for (const auto& upload : uploads) {
+        VGI_RPC_THROW_NOT_OK(struct_builder->Append());
+        VGI_RPC_THROW_NOT_OK(size_builder->Append(upload.size));
+        VGI_RPC_THROW_NOT_OK(sha_builder->Append(upload.sha256));
+    }
     return AnnotatedBatch::data(
-        arrow::RecordBatch::Make(upload_url_request_schema(), 1, {unwrap(builder.Finish())}));
+        arrow::RecordBatch::Make(upload_url_request_schema(), 1, {unwrap(list_builder.Finish())}));
+}
+
+bool is_lower_hex_sha256(const std::string& value) {
+    return value.size() == 64 && std::all_of(value.begin(), value.end(), [](char c) {
+               return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+           });
 }
 
 // Deliberately narrower than arrow::Schema::Equals(): compares field
@@ -649,8 +694,19 @@ void harvest_capabilities(const httplib::Response& response, HttpServerCapabilit
         caps.sticky_echo_headers = parse_list(response.get_header_value("VGI-Sticky-Echo-Headers"));
     }
     if (response.has_header("VGI-Upload-URL-Support")) {
-        caps.upload_url_support =
-            ascii_lower(response.get_header_value("VGI-Upload-URL-Support")) == "true";
+        // "true" is the retired v1; a positive decimal without a leading
+        // zero is that version ("2"); anything else is unrecognised (0).
+        const std::string value = trim_ascii(response.get_header_value("VGI-Upload-URL-Support"));
+        if (ascii_lower(value) == "true") {
+            caps.upload_url_version = 1;
+        } else if (!value.empty() && value.size() <= 6 && value[0] != '0' &&
+                   std::all_of(value.begin(), value.end(),
+                               [](char c) { return c >= '0' && c <= '9'; })) {
+            caps.upload_url_version = std::stoi(value);
+        }
+        // Present at any version, as in the reference; whether this client
+        // can use it is upload_version_refusal's call.
+        caps.upload_url_support = caps.upload_url_version != 0;
     }
     if (auto value = positive_header_int(response, "VGI-Max-Request-Bytes")) {
         caps.max_request_bytes = value;
@@ -1659,6 +1715,13 @@ public:
                                        : config.max_request_bytes;
         if (request_body.size() > static_cast<uint64_t>(inline_cap) && external_http &&
             caps.upload_url_support) {
+            if (auto refusal = upload_version_refusal(caps.upload_url_version)) {
+                throw HttpClientError(HttpClientErrorKind::PROTOCOL, *refusal, 0, method,
+                                      request_id);
+            }
+        }
+        if (request_body.size() > static_cast<uint64_t>(inline_cap) && external_http &&
+            caps.upload_url_support) {
             request_body = externalize_request(body, options, sticky_session);
             externalized = true;
         }
@@ -1669,6 +1732,11 @@ public:
         // method-bound pointer and retrying once is safe even for exchange.
         if (response.status == 413 && !externalized && external_http) {
             caps = cached_caps();
+            if (auto refusal = upload_version_refusal(caps.upload_url_version);
+                refusal && caps.upload_url_support) {
+                throw HttpClientError(HttpClientErrorKind::PROTOCOL, *refusal, 413, method,
+                                      request_id);
+            }
             if (caps.upload_url_support) {
                 response.sticky_guard.reset();
                 request_body = externalize_request(body, options, sticky_session);
@@ -1687,10 +1755,17 @@ public:
     }
 
     std::vector<HttpUploadUrl> request_upload_urls(
-        int64_t count, const CallOptions& options,
+        const std::vector<HttpUploadRequest>& uploads, const CallOptions& options,
         const std::shared_ptr<HttpStickySessionState>& sticky_session = nullptr) {
+        const auto count = static_cast<int64_t>(uploads.size());
         if (count < 1 || count > 100) {
-            throw std::invalid_argument("upload URL count must be between 1 and 100");
+            throw std::invalid_argument("upload URL requests take between 1 and 100 uploads");
+        }
+        for (const auto& upload : uploads) {
+            if (upload.size < 1) throw std::invalid_argument("upload size must be >= 1");
+            if (!is_lower_hex_sha256(upload.sha256)) {
+                throw std::invalid_argument("upload sha256 must be 64 lowercase hex characters");
+            }
         }
         if (!external_http) {
             throw HttpClientError(HttpClientErrorKind::LIMIT,
@@ -1698,10 +1773,17 @@ public:
         }
         const std::string control_method = "__upload_url__";
         const std::string control_id = logical_request_id(options);
+        // Only a v2 server is asked: never the retired count shape.  An
+        // absent advertisement is still asked, and its 404 reported.
+        if (auto refusal = upload_version_refusal(
+                capabilities(control_id, options, sticky_session).upload_url_version)) {
+            throw HttpClientError(HttpClientErrorKind::PROTOCOL, *refusal, 0, control_method,
+                                  control_id);
+        }
         const auto metadata = request_metadata(nullptr, control_method, config.protocol,
                                                config.protocol_version, control_id);
         const std::string control_body =
-            encode_ipc(upload_url_request(count), metadata, config.max_request_bytes);
+            encode_ipc(upload_url_request(uploads), metadata, config.max_request_bytes);
         const auto response = post_inline(control_method, path(control_method, "/init"),
                                           control_body, control_id, options, true, sticky_session);
         auto decoded = decode(response, ResponseShape::UNARY, false, nullptr, sticky_session);
@@ -1711,20 +1793,35 @@ public:
             throw HttpClientError("upload URL response has an invalid Arrow shape");
         }
         const auto& batch = decoded.data.front().batch;
-        auto uploads = std::dynamic_pointer_cast<arrow::StringArray>(batch->column(0));
+        auto upload_urls = std::dynamic_pointer_cast<arrow::StringArray>(batch->column(0));
         auto downloads = std::dynamic_pointer_cast<arrow::StringArray>(batch->column(1));
         auto expirations = std::dynamic_pointer_cast<arrow::TimestampArray>(batch->column(2));
-        if (!uploads || !downloads || !expirations) {
+        auto header_maps = std::dynamic_pointer_cast<arrow::MapArray>(batch->column(3));
+        if (!upload_urls || !downloads || !expirations || !header_maps) {
             throw HttpClientError("upload URL response has invalid Arrow column types");
         }
         std::vector<HttpUploadUrl> urls;
         urls.reserve(static_cast<size_t>(count));
         for (int64_t row = 0; row < count; ++row) {
-            if (uploads->IsNull(row) || downloads->IsNull(row)) {
+            if (upload_urls->IsNull(row) || downloads->IsNull(row)) {
                 throw HttpClientError("upload URL response contains a null URL");
             }
             HttpUploadUrl url;
-            url.upload_url = uploads->GetString(row);
+            url.upload_url = upload_urls->GetString(row);
+            if (!header_maps->IsNull(row)) {
+                auto keys = std::dynamic_pointer_cast<arrow::StringArray>(header_maps->keys());
+                auto items = std::dynamic_pointer_cast<arrow::StringArray>(header_maps->items());
+                if (!keys || !items) {
+                    throw HttpClientError("upload URL response has invalid upload_headers types");
+                }
+                for (int64_t i = header_maps->value_offset(row);
+                     i < header_maps->value_offset(row + 1); ++i) {
+                    if (keys->IsNull(i) || items->IsNull(i)) {
+                        throw HttpClientError("upload URL response has a null upload header");
+                    }
+                    url.upload_headers[keys->GetString(i)] = items->GetString(i);
+                }
+            }
             url.download_url = downloads->GetString(row);
             if (!expirations->IsNull(row)) url.expires_at_us = expirations->Value(row);
             try {
@@ -2169,6 +2266,9 @@ private:
             std::lock_guard<std::timed_mutex> lock(mutex);
             caps = server_capabilities;
         }
+        if (auto refusal = upload_version_refusal(caps.upload_url_version)) {
+            throw HttpClientError(HttpClientErrorKind::PROTOCOL, *refusal, 0, {}, {});
+        }
         if (!caps.upload_url_support) {
             throw HttpClientError(HttpClientErrorKind::LIMIT,
                                   "server does not advertise upload URL support", 0, {}, {});
@@ -2183,17 +2283,25 @@ private:
                                   0, {}, {});
         }
 
-        const auto urls = request_upload_urls(1, options, sticky_session);
+        // Hash once: the same digest signs the PUT and rides the pointer.
+        crypto::Sha256 digest;
+        digest.update(body);
+        const std::string sha256_hex = digest.hex_digest();
+        const auto urls =
+            request_upload_urls({HttpUploadRequest{static_cast<int64_t>(body.size()), sha256_hex}},
+                                options, sticky_session);
         const std::string& upload_url = urls.front().upload_url;
         const std::string& download_url = urls.front().download_url;
         try {
-            external_http->put(upload_url, body, kArrowContentType);
+            // The reference's content type when the server signed none.
+            external_http->put(upload_url, body, "application/octet-stream",
+                               urls.front().upload_headers);
         } catch (const ExternalHttpError& error) {
             throw HttpClientError(HttpClientErrorKind::TRANSPORT,
                                   std::string("request externalization failed: ") + error.what(), 0,
                                   {}, {});
         }
-        return external_pointer_body(body, download_url, config.max_request_bytes);
+        return external_pointer_body(body, download_url, sha256_hex, config.max_request_bytes);
     }
 
     std::unique_ptr<httplib::Client> client;
@@ -2541,10 +2649,10 @@ ServiceDescription HttpClient::describe(const CallOptions& options) const {
         &listing);
 }
 
-std::vector<HttpUploadUrl> HttpClient::request_upload_urls(int64_t count,
-                                                           const CallOptions& options) const {
+std::vector<HttpUploadUrl> HttpClient::request_upload_urls(
+    const std::vector<HttpUploadRequest>& uploads, const CallOptions& options) const {
     if (!state_) throw HttpClientError("HttpClient is moved from");
-    return state_->request_upload_urls(count, options, sticky_session_);
+    return state_->request_upload_urls(uploads, options, sticky_session_);
 }
 
 HttpSessionView HttpClient::with_session_token(
@@ -2623,10 +2731,10 @@ ServiceDescription HttpSessionView::describe(const CallOptions& options) const {
     return impl_->client.describe(options);
 }
 
-std::vector<HttpUploadUrl> HttpSessionView::request_upload_urls(int64_t count,
-                                                                const CallOptions& options) const {
+std::vector<HttpUploadUrl> HttpSessionView::request_upload_urls(
+    const std::vector<HttpUploadRequest>& uploads, const CallOptions& options) const {
     if (!impl_) throw HttpClientError("HTTP sticky-session view is moved from");
-    return impl_->client.request_upload_urls(count, options);
+    return impl_->client.request_upload_urls(uploads, options);
 }
 
 HttpExchangeSession HttpSessionView::open_exchange(const std::string& method,

@@ -218,7 +218,7 @@ int main() {
                 .build();
         bool disabled_urls_rejected = false;
         try {
-            (void)external_disabled.request_upload_urls(1);
+            (void)external_disabled.request_upload_urls({{16, std::string(64, '0')}});
         } catch (const HttpClientError& error) {
             disabled_urls_rejected = error.kind() == HttpClientErrorKind::LIMIT;
         }
@@ -234,13 +234,14 @@ int main() {
         require(saved_token.has_value(), "session-opening response did not return a token");
         require(has_header_case_insensitive(saved_echo, "X-VGI-Worker-Affinity"),
                 "session-opening response did not capture its routing echo header");
-        const auto upload_urls = session.request_upload_urls(2);
+        const auto upload_urls = session.request_upload_urls(std::vector<HttpUploadRequest>{
+            {32768, std::string(64, 'a')}, {16, std::string(64, 'b')}});
         require(upload_urls.size() == 2 && !upload_urls[0].upload_url.empty() &&
                     !upload_urls[0].download_url.empty() && upload_urls[0].expires_at_us,
                 "sticky upload-URL control request returned invalid URL records");
         bool invalid_count_rejected = false;
         try {
-            (void)session.request_upload_urls(0);
+            (void)session.request_upload_urls({});
         } catch (const std::invalid_argument&) {
             invalid_count_rejected = true;
         }

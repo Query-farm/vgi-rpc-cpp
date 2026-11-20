@@ -269,7 +269,7 @@ private:
                 }
                 response.set_header("VGI-Max-Externalized-Response-Bytes", "345678");
                 response.set_header("VGI-Externalization-Enabled", "true");
-                response.set_header("VGI-Upload-URL-Support", "true");
+                response.set_header("VGI-Upload-URL-Support", "2");
                 response.set_header("VGI-Max-Upload-Bytes", "456789");
                 response.set_header("VGI-Supported-Encodings", "ZSTD, gzip");
             });
@@ -612,6 +612,8 @@ void test_encoded_request_cap(const FaultServer& server, const std::string& orig
     metadata->Append(keys::METHOD, "encoded-request-cap");
     metadata->Append(keys::REQUEST_VERSION, REQUEST_VERSION_VALUE);
     metadata->Append(keys::REQUEST_ID, "0123456789abcdef");
+    // The routing key the client stamps, so `raw` is the size it sends.
+    metadata->Append(keys::PROTOCOL, "Test.v1");
     const std::string raw =
         encode_response(request.batch->schema(),
                         {AnnotatedBatch::with_metadata(request.batch, std::move(metadata))});
@@ -624,7 +626,11 @@ void test_encoded_request_cap(const FaultServer& server, const std::string& orig
     // slightly larger than its Arrow input.  That pins the post-compression
     // guard, distinct from the existing decoded IPC preflight test.
     config.compression_level = -131072;
-    HttpClient client(origin, config);
+    // External locations off: the body sits right at the inline ceiling, and
+    // with them on the client externalizes it instead, whose v2 control
+    // request (a list<struct> schema) no longer fits a ceiling this small.
+    // This case pins the inline post-compression guard, not that path.
+    auto client = HttpClient::builder(origin).config(config).disable_external_locations().build();
     const auto error = require_http_client_error(
         [&] { (void)client.call("encoded-request-cap", request); }, "encoded request cap");
     require(std::string(error.what()).find("encoded HTTP RPC request") != std::string::npos,
@@ -801,7 +807,7 @@ void test_capabilities_and_row_metadata(FaultServer& server, const std::string& 
             "sticky capability fields were not parsed");
     require(caps.sticky_echo_headers == std::vector<std::string>({"X-Tenant", "X-Region"}),
             "sticky echo capability list was not parsed");
-    require(caps.upload_url_support && caps.externalization_enabled,
+    require(caps.upload_url_support && caps.upload_url_version == 2 && caps.externalization_enabled,
             "externalization capability flags were not parsed");
     require(caps.max_request_bytes == 123456 && caps.max_response_bytes == 234567 &&
                 caps.max_externalized_response_bytes == 345678 && caps.max_upload_bytes == 456789,

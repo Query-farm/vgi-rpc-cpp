@@ -99,7 +99,7 @@ public:
     std::string fetch(const std::string&) override {
         throw std::logic_error("RecordingStorage does not fetch");
     }
-    std::vector<UploadUrlPair> upload_urls(int64_t) override { return {}; }
+    UploadUrl generate_upload_url(int64_t, const std::string&) override { return {}; }
 
     std::vector<Upload> uploads;
 };

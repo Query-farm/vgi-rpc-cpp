@@ -241,13 +241,19 @@ supported-encoding advertisements.
 Capability headers on ordinary responses refine the same internal model and the
 server request limit is enforced on later calls.
 
-`request_upload_urls(count)` exposes the `__upload_url__` control method for
-counts from 1 through 100 and returns `HttpUploadUrl` values containing upload,
-download, and optional microsecond expiry fields. The response schema, row
-count, non-null URLs, and configured external URL policy are validated before
-anything is returned. The operation fails closed when external resolution and
-its URL policy are disabled. Automatic request externalization uses this same
-parser.
+`request_upload_urls(uploads)` exposes the `__upload_url__` control method
+(upload URLs v2). It takes 1 through 100 `HttpUploadRequest{size, sha256}`
+entries, one per body to upload, and returns one `HttpUploadUrl` per entry
+containing upload, download, optional microsecond expiry and `upload_headers`
+(the headers the PUT must carry, verbatim). The response schema, row count,
+non-null URLs, and configured external URL policy are validated before anything
+is returned. The operation fails closed when external resolution and its URL
+policy are disabled, and refuses a server whose `VGI-Upload-URL-Support` is not
+`2` ("upload protocol is too old" for the retired v1 `true`). Automatic request
+externalization uses this same path: it hashes the body, requests one URL for
+its exact size and SHA-256, PUTs exactly those bytes with every
+`upload_headers` entry, and posts a pointer carrying both `vgi_rpc.location`
+and `vgi_rpc.location.sha256`.
 
 Shared-memory pointer resolution and code generation are not provided.
 Disabled or policy-rejected external locations remain fail-closed rather than

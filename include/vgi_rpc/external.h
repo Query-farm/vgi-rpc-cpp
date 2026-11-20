@@ -14,6 +14,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -24,9 +25,17 @@
 
 namespace vgi_rpc {
 
-struct UploadUrlPair {
+/// One vended upload: a pre-signed PUT for exactly one body, and the GET the
+/// server later fetches it from (WIRE_PROTOCOL.md §12, upload URLs v2).
+struct UploadUrl {
     std::string upload_url;
     std::string download_url;
+    /// Expiry of both URLs, microseconds since the Unix epoch (UTC).
+    int64_t expires_at_us = 0;
+    /// Headers the client MUST send on the PUT, verbatim.  Never contains
+    /// Content-Length: the client sends exactly the declared size with a plain
+    /// Content-Length, which the backend signature covers.
+    std::map<std::string, std::string> headers;
 };
 
 // Where a backend puts objects, and how long the URLs it hands out live.
@@ -67,8 +76,11 @@ public:
     // through a vended upload URL.
     virtual std::string fetch(const std::string& url) = 0;
 
-    // Vend `count` upload/download URL pairs for client-side externalization.
-    virtual std::vector<UploadUrlPair> upload_urls(int64_t count) = 0;
+    // Vend one upload/download URL pair for a client body of exactly `size`
+    // bytes whose SHA-256 is `sha256_hex` (64 lowercase hex characters).
+    // Backends that can sign the length and digest do, so storage itself
+    // refuses a mismatched body; the server's pointer check catches the rest.
+    virtual UploadUrl generate_upload_url(int64_t size, const std::string& sha256_hex) = 0;
 };
 
 // Build the backend named by `config.uri`, dispatching on its scheme.  Throws

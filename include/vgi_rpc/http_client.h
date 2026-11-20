@@ -95,12 +95,26 @@ struct HttpServerCapabilities {
     std::vector<std::string> supported_encodings = {"zstd"};
     // Appended for positional aggregate source compatibility.
     bool accept_max_response_bytes_support = false;
+    // The upload-URL protocol the server advertises in `VGI-Upload-URL-Support`:
+    // 0 absent or unrecognised, 1 the retired "true" (count-based) form, 2 for
+    // upload URLs v2.  `upload_url_support` is true whenever the header names a
+    // version; this client uploads only to 2 and refuses any other.
+    int upload_url_version = 0;
+};
+
+// One body the client is about to upload: its exact byte length and the
+// lowercase-hex SHA-256 of exactly those bytes.
+struct HttpUploadRequest {
+    int64_t size = 0;
+    std::string sha256;
 };
 
 struct HttpUploadUrl {
     std::string upload_url;
     std::string download_url;
     std::optional<int64_t> expires_at_us;
+    // Headers the PUT MUST carry, verbatim (e.g. x-amz-checksum-sha256).
+    std::map<std::string, std::string> upload_headers;
 };
 
 struct HttpClientConfig {
@@ -349,8 +363,10 @@ public:
     // listed protocol outside the reserved vgi_rpc. prefix.
     ServiceDescription describe(const CallOptions& options = {}) const;
 
-    // Request one or more method-bound external upload/download URL pairs.
-    std::vector<HttpUploadUrl> request_upload_urls(int64_t count,
+    // Request one method-bound upload/download URL pair per body (1-100),
+    // each signed for that body's size and SHA-256 (upload URLs v2).  Refuses
+    // a server advertising the retired v1 protocol.
+    std::vector<HttpUploadUrl> request_upload_urls(const std::vector<HttpUploadRequest>& uploads,
                                                    const CallOptions& options = {}) const;
 
     // Initialize a bidirectional exchange.  Every input and output batch is
@@ -426,7 +442,7 @@ public:
     ServiceDescription describe_protocol(const std::string& name,
                                          const CallOptions& options = {}) const;
     ServiceDescription describe(const CallOptions& options = {}) const;
-    std::vector<HttpUploadUrl> request_upload_urls(int64_t count,
+    std::vector<HttpUploadUrl> request_upload_urls(const std::vector<HttpUploadRequest>& uploads,
                                                    const CallOptions& options = {}) const;
     HttpExchangeSession open_exchange(const std::string& method, const AnnotatedBatch& request,
                                       std::shared_ptr<arrow::Schema> input_schema,
