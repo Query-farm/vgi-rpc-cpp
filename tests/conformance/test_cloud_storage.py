@@ -250,18 +250,27 @@ def test_upload_urls_are_usable_by_a_credential_free_client(s3_worker: int) -> N
     Distinct credentials per verb is why two are vended: a client given the
     pair can PUT its payload and GET it back, and nothing else.
     """
+    import hashlib
+
     import httpx2
 
-    from vgi_rpc.http import request_upload_urls
+    from vgi_rpc.http import request_upload_urls, upload_put_headers
 
-    urls = request_upload_urls(f"http://127.0.0.1:{s3_worker}", count=2)
+    # Upload URLs v2: each URL is signed for one declared (size, sha256) body.
+    payload = b"client-vended upload contents"
+    other = b"a second, distinct upload"
+    urls = request_upload_urls(
+        f"http://127.0.0.1:{s3_worker}",
+        uploads=[(len(p), hashlib.sha256(p).hexdigest()) for p in (payload, other)],
+    )
     assert len(urls) == 2
     assert urls[0].upload_url != urls[0].download_url, (
         "a pre-signing backend must vend one credential per verb"
     )
 
-    payload = b"client-vended upload contents"
-    put = httpx2.put(urls[0].upload_url, content=payload, timeout=30.0)
+    put = httpx2.put(
+        urls[0].upload_url, content=payload, headers=upload_put_headers(urls[0]), timeout=30.0
+    )
     assert put.status_code in (200, 204), f"PUT failed: {put.status_code} {put.text[:200]}"
 
     got = httpx2.get(urls[0].download_url, timeout=30.0)
@@ -336,9 +345,16 @@ def test_gcs_vends_v4_signed_urls(gcs_worker: int) -> None:
     a client fetches it with no credentials, so if the query string is wrong
     the object is unreachable and nothing else in the feature works.
     """
+    import hashlib
+
     from vgi_rpc.http import request_upload_urls
 
-    urls = request_upload_urls(f"http://127.0.0.1:{gcs_worker}", count=2)
+    # Upload URLs v2: one (size, sha256) entry per URL requested.
+    bodies = (b"first upload", b"second upload")
+    urls = request_upload_urls(
+        f"http://127.0.0.1:{gcs_worker}",
+        uploads=[(len(b), hashlib.sha256(b).hexdigest()) for b in bodies],
+    )
     assert len(urls) == 2
 
     for pair in urls:
