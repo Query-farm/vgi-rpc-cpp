@@ -54,14 +54,12 @@ constexpr const char* kArrowContentType = "application/vnd.apache.arrow.stream";
 constexpr int64_t kMaxUploadBytes = 1 << 20;
 
 std::string sha256_hex(const std::string& data) {
-    const auto digest =
-        crypto::sha256(reinterpret_cast<const uint8_t*>(data.data()), data.size());
+    const auto digest = crypto::sha256(reinterpret_cast<const uint8_t*>(data.data()), data.size());
     return crypto::hex_encode(digest.data(), digest.size());
 }
 
 std::string sha256_b64(const std::string& data) {
-    const auto digest =
-        crypto::sha256(reinterpret_cast<const uint8_t*>(data.data()), data.size());
+    const auto digest = crypto::sha256(reinterpret_cast<const uint8_t*>(data.data()), data.size());
     static constexpr char kAlphabet[] =
         "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     std::string out;
@@ -189,10 +187,10 @@ public:
                 --corrupt_next_;
                 body[0] = static_cast<char>(body[0] ^ 0xff);
             }
-            if (sized && (static_cast<int64_t>(body.size()) != found->second.size ||
-                          req.get_header_value("x-amz-checksum-sha256") !=
-                              found->second.sha256_b64 ||
-                          sha256_b64(body) != found->second.sha256_b64)) {
+            if (sized &&
+                (static_cast<int64_t>(body.size()) != found->second.size ||
+                 req.get_header_value("x-amz-checksum-sha256") != found->second.sha256_b64 ||
+                 sha256_b64(body) != found->second.sha256_b64)) {
                 ++refusals;
                 res.status = 400;
                 res.set_content("<Error><Code>BadDigest</Code></Error>", "application/xml");
@@ -264,12 +262,12 @@ public:
     explicit UploadServer(const std::string& storage_url) {
         ServerBuilder builder;
         builder.protocol(kProtocol);
-        builder.add_unary("echo_bytes", bytes_schema(), result_schema(),
-                          [](const Request& request, CallContext&) -> Result {
-                              auto value = request.batch()->column(0);
-                              return Result::value(arrow::RecordBatch::Make(
-                                  result_schema(), 1, {value}));
-                          });
+        builder.add_unary(
+            "echo_bytes", bytes_schema(), result_schema(),
+            [](const Request& request, CallContext&) -> Result {
+                auto value = request.batch()->column(0);
+                return Result::value(arrow::RecordBatch::Make(result_schema(), 1, {value}));
+            });
         server_ = builder.build();
 
         HttpConfig cfg;
@@ -411,8 +409,8 @@ TEST_CASE("the client uploads through a sized URL and the pointer carries the sh
     UploadServer server(storage.url());
     auto client = make_client(server.url());
     const std::string payload = big_payload();
-    auto result = client.call("echo_bytes", AnnotatedBatch::data(bytes_batch(payload)),
-                              result_schema());
+    auto result =
+        client.call("echo_bytes", AnnotatedBatch::data(bytes_batch(payload)), result_schema());
     REQUIRE(result.batch);
     auto column = std::static_pointer_cast<arrow::BinaryArray>(result.batch->column(0));
     CHECK(column->GetString(0) == payload);

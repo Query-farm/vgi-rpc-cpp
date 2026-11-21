@@ -172,11 +172,10 @@ TEST_CASE("only HEAD /health and preflights are anonymous", "[http][auth]") {
     CHECK(head->has_header("VGI-Supported-Encodings"));
     CHECK(server.send("HEAD", "/vgi/health", std::nullopt)->status == 200);
 
-    const auto preflight =
-        server.send("OPTIONS", "/vgi/Guarded/noop", std::nullopt,
-                    {{"Origin", "https://shell.example.com"},
-                     {"Access-Control-Request-Method", "POST"},
-                     {"Access-Control-Request-Headers", "authorization"}});
+    const auto preflight = server.send("OPTIONS", "/vgi/Guarded/noop", std::nullopt,
+                                       {{"Origin", "https://shell.example.com"},
+                                        {"Access-Control-Request-Method", "POST"},
+                                        {"Access-Control-Request-Headers", "authorization"}});
     REQUIRE(preflight);
     CHECK(preflight->status / 100 == 2);
     CHECK(preflight->get_header_value("Access-Control-Allow-Origin") == "*");
