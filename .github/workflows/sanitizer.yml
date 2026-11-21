@@ -11,6 +11,13 @@ on:
   workflow_dispatch:
 
 env:
+  # Build every vcpkg port with the CMake (and ninja) that vcpkg pins for
+  # this baseline, not whatever the runner image ships. The macOS image moved
+  # to CMake 4.5.0, which rejects boost-locale 1.90 at configure time
+  # (source_group: "include/boost/locale" is not a prefix of "locale.hpp").
+  # Linux runners already used vcpkg's own CMake 4.2.3 because theirs was too
+  # old; this makes that the rule on every runner.
+  VCPKG_FORCE_DOWNLOADED_BINARIES: "1"
   # Use Cloudflare's S3-compatible R2 endpoint directly because vcpkg binary
   # archives can exceed the Worker request-size limit. Fork PRs do not receive
   # secrets, so disable the remote cache instead of issuing broken AWS calls.
