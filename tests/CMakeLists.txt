@@ -54,6 +54,7 @@ target_link_libraries(external_ref_test PRIVATE zstd::libzstd)
 vgi_rpc_add_test(client_test)
 vgi_rpc_add_test(http_routing_test)
 vgi_rpc_add_test(http_stream_metadata_test)
+vgi_rpc_add_test(http_require_auth_test)
 
 add_executable(client_integration client_integration.cpp)
 target_link_libraries(client_integration PRIVATE vgi_rpc)

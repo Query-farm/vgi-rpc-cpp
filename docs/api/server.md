@@ -172,13 +172,36 @@ The HTTP authentication order is: the deployment's own authenticators
   the hook's `Retry-After`. JWS-shaped, blank and over-4096-byte tokens are
   never passed to it.
 - With no deployment bearer authenticator, a request with no `Authorization`
-  header stays anonymous. With one, it is a 401, unless
+  header stays anonymous. With one, it is a 401 (`missing_credential`), unless
   `HttpConfig::bearer_optional` is set: then a header-less request stays
   anonymous too, so one server can serve anonymous and bearer-identified
   callers. The flag changes only the absent header. A present credential runs
   the chain exactly as before (a non-`Bearer` scheme, or a bearer nothing
   accepts, is still a 401), so an authenticator that wants unknown tokens to be
   anonymous returns `AuthContext::anonymous()` for them itself.
+
+`bearer_authenticate` chooses its refusal's reason by throwing
+`vgi_rpc::AuthRejectedError(reason)` (`EXPIRED_CREDENTIAL` for a credential
+that was valid and has lapsed, so the client refreshes instead of
+re-authenticating); any other exception is `invalid_credential`.
+
+### One way in: `authenticate_every_request`
+
+A deployment whose only door is its bearer authenticator (an Orchard hosted
+worker, for one) sets `HttpConfig::authenticate_every_request`. The chain then
+runs for **every** request, from cpp-httplib's pre-routing hook, before the body
+is read, size-checked or decompressed and before a route is chosen:
+`GET`/`OPTIONS /health`, the static assets, unknown paths and the RPC routes
+alike. A client waiting on `Expect: 100-continue` is refused instead of told to
+go ahead. Only `HEAD {prefix}/health` (a liveness probe) and CORS preflights
+(`OPTIONS` with `Origin` and `Access-Control-Request-Method`) are exempt. A
+request that does not resolve to an *authenticated* caller is refused 401
+(`missing_credential` with no `Authorization` header), with the capability and
+CORS headers; `AuthUnavailableError` is 503 + `Retry-After`. The handler that
+serves an admitted request runs the chain again, unchanged.
+
+`HttpConfig::www_authenticate`, when non-empty, is sent as `WWW-Authenticate`
+on every 401 (for example `Bearer error="invalid_token"`).
 
 A `peer_authentication_policy` is transport- or proxy-injected evidence — a
 gate. Bearer alternatives OR-ed beside it would bypass it, so `serve_http`

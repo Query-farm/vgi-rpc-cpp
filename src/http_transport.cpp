@@ -171,16 +171,9 @@ std::optional<std::string> parse_upload_url_request(
 }
 
 // A bearer the authentication chain refused, with the 401 reason to report.
-// Never carries the credential.
-class BearerRejected : public std::runtime_error {
-public:
-    explicit BearerRejected(AuthReason reason)
-        : std::runtime_error("bearer credential rejected"), reason_(reason) {}
-    AuthReason reason() const noexcept { return reason_; }
-
-private:
-    AuthReason reason_;
-};
+// Never carries the credential.  The public type, so a deployment's
+// `bearer_authenticate` can choose the reason too.
+using BearerRejected = AuthRejectedError;
 constexpr const char* AUTH_PROXY_REQUIRED_HEADER = "VGI-Auth-Proxy-Required";
 constexpr const char* PROOF_HEADER = "VGI-Proxy-Proof";
 constexpr const char* PROOF_REQUIRED_HEADER = "VGI-Proxy-Proof-Required";
@@ -956,6 +949,11 @@ private:
                                 const std::string& request_id);
     void write_unauthorized(const httplib::Request& req, httplib::Response& res,
                             AuthReason reason) const;
+    // `authenticate_every_request`: whether this request is one of the two
+    // exemptions, and the check itself.  Returns true when the request was
+    // refused; `res` is then complete.
+    bool exempt_from_authentication(const httplib::Request& req) const;
+    bool refuse_before_body(const httplib::Request& req, httplib::Response& res);
 
     void handle_health(const httplib::Request& req, httplib::Response& res) const;
     void handle_session_delete(const httplib::Request& req, httplib::Response& res);
@@ -1268,7 +1266,7 @@ HttpServer::ResolvedHttpIdentity HttpServer::resolve_http_identity(
         // credential is a refusal -- unless the deployment made it optional.
         // Without one, nothing changes for a request that carries none.
         if (cfg_.bearer_authenticate && !cfg_.bearer_optional) {
-            throw BearerRejected(AuthReason::INVALID_CREDENTIAL);
+            throw BearerRejected(AuthReason::MISSING_CREDENTIAL);
         }
         return resolved;
     }
@@ -1395,6 +1393,7 @@ void HttpServer::write_unauthorized(const httplib::Request& req, httplib::Respon
                                     AuthReason reason) const {
     res.status = 401;
     res.set_header(AUTH_REASON_HEADER, auth_reason_name(reason));
+    if (!cfg_.www_authenticate.empty()) res.set_header("WWW-Authenticate", cfg_.www_authenticate);
     // A 401 is per-request and flips to 200 on the next attempt with a
     // credential, so it must never land in a shared cache.
     res.set_header("Cache-Control", "no-store");
@@ -1471,6 +1470,43 @@ bool HttpServer::refuse_if_unauthorized(const httplib::Request& req, httplib::Re
             reason = *requested;
         }
     }
+    write_unauthorized(req, res, reason);
+    return true;
+}
+
+bool HttpServer::exempt_from_authentication(const httplib::Request& req) const {
+    // A CORS preflight: a browser sends it without credentials, by design.
+    if (req.method == "OPTIONS" && req.has_header("Origin") &&
+        req.has_header("Access-Control-Request-Method")) {
+        return true;
+    }
+    // The liveness probe, and nothing else on that path: GET carries the
+    // server id and protocol, OPTIONS the capabilities.
+    return req.method == "HEAD" && (req.path == "/health" || req.path == cfg_.prefix + "/health");
+}
+
+bool HttpServer::refuse_before_body(const httplib::Request& req, httplib::Response& res) {
+    if (exempt_from_authentication(req)) return false;
+    std::string request_id = req.get_header_value(REQUEST_ID_HEADER);
+    if (request_id.empty()) request_id = random_hex(16);
+    AuthReason reason = AuthReason::NONE;
+    try {
+        const ResolvedHttpIdentity resolved = resolve_http_identity(req);
+        if (resolved.auth.authenticated) return false;
+        reason = req.has_header("Authorization") ? AuthReason::INVALID_CREDENTIAL
+                                                 : AuthReason::MISSING_CREDENTIAL;
+    } catch (const AuthUnavailableError& e) {
+        stamp_common(req, res, request_id);
+        res.status = 503;
+        res.set_header("Retry-After", std::to_string(std::max(0, e.retry_after())));
+        res.set_header("Cache-Control", "no-store");
+        return true;
+    } catch (const BearerRejected& e) {
+        reason = e.reason();
+    } catch (const std::exception&) {
+        reason = AuthReason::INVALID_CREDENTIAL;
+    }
+    stamp_common(req, res, request_id);
     write_unauthorized(req, res, reason);
     return true;
 }
@@ -2643,6 +2679,23 @@ void HttpServer::run() {
         rpc_.notify_serve_start(TransportKind::HTTP);
         return httplib::Server::HandlerResponse::Unhandled;
     });
+
+    if (cfg_.authenticate_every_request) {
+        // Pre-routing runs before cpp-httplib reads, caps or decodes a body,
+        // and before it picks a route, so an unknown path is refused exactly
+        // like a known one.  A refusal is >= 400, which closes the
+        // connection, so the unread body cannot poison a keep-alive.
+        svr.set_pre_routing_handler([this](const httplib::Request& req, httplib::Response& res) {
+            return refuse_before_body(req, res) ? httplib::Server::HandlerResponse::Handled
+                                                : httplib::Server::HandlerResponse::Unhandled;
+        });
+        // `Expect: 100-continue` is answered before routing; refuse there
+        // too, so a client that waits for the go-ahead never sends the body.
+        svr.set_expect_100_continue_handler(
+            [this](const httplib::Request& req, httplib::Response& res) {
+                return refuse_before_body(req, res) ? res.status : 100;
+            });
+    }
 
     auto health = [this](const httplib::Request& req, httplib::Response& res) {
         handle_health(req, res);

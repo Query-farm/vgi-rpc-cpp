@@ -12,6 +12,7 @@
 #include <functional>
 #include <map>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -37,6 +38,23 @@ enum class AuthReason {
 
 VGI_RPC_EXPORT const char* auth_reason_name(AuthReason reason);
 VGI_RPC_EXPORT std::optional<AuthReason> auth_reason_from_name(const std::string& name);
+
+/// A credential the authentication chain refused, with the 401 reason to
+/// report.  `HttpConfig::bearer_authenticate` throws it to choose the reason
+/// (`EXPIRED_CREDENTIAL` for a token that was valid and has lapsed, so a client
+/// knows to refresh rather than re-authenticate); any other exception from the
+/// hook is `INVALID_CREDENTIAL`.  Must never carry the credential: the message
+/// may be logged.
+class AuthRejectedError : public std::runtime_error {
+public:
+    explicit AuthRejectedError(AuthReason reason,
+                               const std::string& detail = "bearer credential rejected")
+        : std::runtime_error(detail), reason_(reason) {}
+    AuthReason reason() const noexcept { return reason_; }
+
+private:
+    AuthReason reason_;
+};
 
 // Resolved identity for one request.  `domain` and `principal` are the stable
 // identity the sticky AAD binds; they are deliberately not derived from the
@@ -226,6 +244,24 @@ struct HttpConfig {
     // `bearer_authenticate` the flag has no effect: a header-less request is already anonymous.
     // Appended for positional aggregate source compatibility.
     bool bearer_optional = false;
+
+    // Authenticate every request before its body is read, size-checked or
+    // decompressed: the RPC routes, `GET`/`OPTIONS {prefix}/health`, the static
+    // assets and unknown paths alike.  The only exemptions are `HEAD
+    // {prefix}/health` (a liveness probe) and CORS preflights (`OPTIONS` with
+    // `Origin` and `Access-Control-Request-Method`), which carry no credential.
+    // A request that does not resolve to an *authenticated* caller is refused
+    // 401 (`missing_credential` when it carries no `Authorization` header);
+    // `AuthUnavailableError` is 503 + `Retry-After`.  Runs again, unchanged, in
+    // the handler that serves the request.  For deployments with exactly one way
+    // in, such as an Orchard hosted worker.  Appended for positional aggregate
+    // source compatibility.
+    bool authenticate_every_request = false;
+
+    // When non-empty, every 401 carries `WWW-Authenticate: <value>` (e.g.
+    // `Bearer error="invalid_token"`).  Empty sends none, as before.  Appended
+    // for positional aggregate source compatibility.
+    std::string www_authenticate;
 };
 
 }  // namespace vgi_rpc
