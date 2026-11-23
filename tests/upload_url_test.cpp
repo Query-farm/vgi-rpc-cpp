@@ -730,3 +730,80 @@ TEST_CASE("the externalization threshold is not advertised as a request cap",
     CHECK_FALSE(res->has_header("VGI-Max-Request-Bytes"));
     CHECK(res->get_header_value("VGI-Upload-URL-Support") == "2");
 }
+
+TEST_CASE("extra capability headers ride every response beside vgi-rpc's own",
+          "[upload-url][capabilities]") {
+    VerifyingStorage storage;
+    UploadServer server(storage.url(), [](HttpConfig& cfg) {
+        cfg.extra_capability_headers["VGI-Arguments-Ref-Bytes"] = "4194304";
+    });
+    httplib::Client client("127.0.0.1", server.port());
+    auto res = client.Options("/vgi/health");
+    REQUIRE(res);
+    CHECK(res->get_header_value("VGI-Arguments-Ref-Bytes") == "4194304");
+    CHECK(res->get_header_value("VGI-Upload-URL-Support") == "2");
+}
+
+TEST_CASE("an extra capability header may not shadow one vgi-rpc stamps",
+          "[upload-url][capabilities]") {
+    ServerBuilder builder;
+    builder.protocol(kProtocol);
+    builder.add_unary("noop", bytes_schema(), result_schema(),
+                      [](const Request& request, CallContext&) -> Result {
+                          return Result::value(arrow::RecordBatch::Make(
+                              result_schema(), 1, {request.batch()->column(0)}));
+                      });
+    auto server = builder.build();
+    HttpConfig cfg;
+    cfg.host = "127.0.0.1";
+    cfg.port = 0;
+    cfg.extra_capability_headers["vgi-max-upload-bytes"] = "1";
+    CHECK_THROWS_WITH(server->serve_http(cfg), ContainsSubstring("stamps itself"));
+}
+
+TEST_CASE("an injected storage backend serves upload URLs without a storage URL",
+          "[upload-url][capabilities]") {
+    VerifyingStorage storage;
+    const auto url = storage.url();
+    UploadServer server("", [url](HttpConfig& cfg) {
+        ExternalStorageConfig config;
+        config.uri = url;
+        cfg.external_storage = make_external_storage(config);
+    });
+    httplib::Client client("127.0.0.1", server.port());
+    auto res = client.Options("/vgi/health");
+    REQUIRE(res);
+    CHECK(res->get_header_value("VGI-Upload-URL-Support") == "2");
+    CHECK(res->get_header_value("VGI-Externalization-Enabled") == "true");
+
+    // And the externalized request round-trips through it.
+    auto http = make_client(server.url());
+    const std::string payload = big_payload();
+    auto result =
+        http.call("echo_bytes", AnnotatedBatch::data(bytes_batch(payload)), result_schema());
+    REQUIRE(result.batch);
+    auto column = std::static_pointer_cast<arrow::BinaryArray>(result.batch->column(0));
+    CHECK(column->GetString(0) == payload);
+    CHECK(storage.sized_uploads.load() == 1);
+}
+
+TEST_CASE("an injected backend and a storage URL together refuse to start",
+          "[upload-url][capabilities]") {
+    VerifyingStorage storage;
+    ServerBuilder builder;
+    builder.protocol(kProtocol);
+    builder.add_unary("noop", bytes_schema(), result_schema(),
+                      [](const Request& request, CallContext&) -> Result {
+                          return Result::value(arrow::RecordBatch::Make(
+                              result_schema(), 1, {request.batch()->column(0)}));
+                      });
+    auto server = builder.build();
+    HttpConfig cfg;
+    cfg.host = "127.0.0.1";
+    cfg.port = 0;
+    cfg.external_storage_url = storage.url();
+    ExternalStorageConfig config;
+    config.uri = storage.url();
+    cfg.external_storage = make_external_storage(config);
+    CHECK_THROWS_WITH(server->serve_http(cfg), ContainsSubstring("not both"));
+}

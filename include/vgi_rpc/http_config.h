@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <functional>
 #include <map>
+#include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -22,6 +23,8 @@
 #include "vgi_rpc/proxy_proof.h"
 
 namespace vgi_rpc {
+
+class ExternalStorage;
 
 // How an authenticate hook refused a request.  The closed set of
 // docs/unauthorized-spec.md §3 — implementations must not widen it, because a
@@ -273,6 +276,20 @@ struct HttpConfig {
     // `Bearer error="invalid_token"`).  Empty sends none, as before.  Appended
     // for positional aggregate source compatibility.
     std::string www_authenticate;
+
+    // Extra capability headers, stamped on every response beside vgi-rpc's own
+    // (capability discovery included), for a protocol layered on top that
+    // advertises capabilities of its own -- the vgi framework's
+    // `VGI-Arguments-Ref-Bytes` (protocol 3.4).  A name vgi-rpc stamps itself
+    // is refused at startup.  Appended for positional aggregate source
+    // compatibility.
+    std::map<std::string, std::string> extra_capability_headers;
+
+    // An externalization backend built by the caller (the blob vendor,
+    // `vgi_rpc/vendor.h`, or a custom one).  When set it is used instead of
+    // `external_storage_url`, which must then be empty.  Appended for
+    // positional aggregate source compatibility.
+    std::shared_ptr<ExternalStorage> external_storage;
 };
 
 }  // namespace vgi_rpc

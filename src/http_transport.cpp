@@ -188,6 +188,22 @@ constexpr const char* AUTH_PROXY_REQUIRED_HEADER = "VGI-Auth-Proxy-Required";
 constexpr const char* PROOF_HEADER = "VGI-Proxy-Proof";
 constexpr const char* PROOF_REQUIRED_HEADER = "VGI-Proxy-Proof-Required";
 constexpr const char* SESSION_HEADER = "VGI-Session";
+// Every capability header stamp_capabilities writes itself, lowercased: an
+// extra capability header may not shadow one of them.
+constexpr const char* kOwnCapabilityHeaders[] = {
+    "vgi-accept-max-response-bytes-support",
+    "vgi-max-response-bytes",
+    "vgi-max-externalized-response-bytes",
+    "vgi-max-request-bytes",
+    "vgi-externalization-enabled",
+    "vgi-upload-url-support",
+    "vgi-max-upload-bytes",
+    "vgi-supported-encodings",
+    "vgi-sticky-enabled",
+    "vgi-sticky-default-ttl",
+    "vgi-sticky-echo-headers",
+    "vgi-proxy-proof-required",
+};
 constexpr const char* SESSION_ACCEPT_HEADER = "VGI-Session-Accept";
 constexpr const char* SESSION_CLOSE_HEADER = "VGI-Session-Close";
 constexpr const char* PRINCIPAL_HEADER = "X-Conformance-Principal";
@@ -922,7 +938,27 @@ public:
                       << ") is below 16384: the cursor rule is disabled and stream continuations "
                          "may not fit\n";
         }
-        if (!cfg.external_storage_url.empty()) {
+        for (const auto& [name, _] : cfg.extra_capability_headers) {
+            if (name.empty() || name.find_first_of(" :\r\n\t") != std::string::npos) {
+                throw std::invalid_argument("invalid extra capability header name");
+            }
+            std::string lower = name;
+            std::transform(lower.begin(), lower.end(), lower.begin(),
+                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            for (const char* own : kOwnCapabilityHeaders) {
+                if (lower == own) {
+                    throw std::invalid_argument("extra capability header " + name +
+                                                " is one vgi-rpc stamps itself");
+                }
+            }
+        }
+        if (cfg.external_storage) {
+            if (!cfg.external_storage_url.empty()) {
+                throw std::invalid_argument(
+                    "set either HttpConfig::external_storage or external_storage_url, not both");
+            }
+            storage_ = cfg.external_storage;
+        } else if (!cfg.external_storage_url.empty()) {
             // Throws for a scheme this build cannot serve, so an operator who
             // configured a bucket learns at startup rather than on the first
             // payload large enough to externalise.
@@ -954,7 +990,7 @@ public:
 private:
     // --- helpers ---
     bool proof_required() const noexcept { return cfg_.proof_mode == ProofMode::REQUIRE; }
-    bool externalization() const noexcept { return !cfg_.external_storage_url.empty(); }
+    bool externalization() const noexcept { return storage_ != nullptr; }
 
     void stamp_common(const httplib::Request& req, httplib::Response& res,
                       const std::string& request_id) const;
@@ -1027,7 +1063,7 @@ private:
     HttpConfig cfg_;
     SessionRegistry sessions_;
     ProofVerifier proof_;
-    std::unique_ptr<ExternalStorage> storage_;
+    std::shared_ptr<ExternalStorage> storage_;
     std::shared_ptr<const StateRefRuntime> state_ref_runtime_;
 
     std::mutex streams_mutex_;
@@ -1093,6 +1129,7 @@ void HttpServer::stamp_capabilities(httplib::Response& res) const {
     if (proof_required()) {
         res.set_header(PROOF_REQUIRED_HEADER, "true");
     }
+    for (const auto& [name, value] : cfg_.extra_capability_headers) res.set_header(name, value);
 }
 
 void HttpServer::stamp_cors(const httplib::Request& req, httplib::Response& res) const {
