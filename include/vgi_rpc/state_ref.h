@@ -120,8 +120,7 @@ VGI_RPC_EXPORT std::string encode(std::string_view plaintext);
 /// `std::invalid_argument` for an empty payload, an unknown codec, a body that
 /// does not decompress, or one over the bound (a frame's declared content size
 /// is checked before anything is inflated).
-VGI_RPC_EXPORT std::string decode(std::string_view payload,
-                                  int64_t max_bytes = MAX_TOKEN_BYTES);
+VGI_RPC_EXPORT std::string decode(std::string_view payload, int64_t max_bytes = MAX_TOKEN_BYTES);
 
 }  // namespace token_codec
 
@@ -201,9 +200,9 @@ struct ArgumentRefClaims {
 /// Open a reference for the presenting principal.  Every failure (wrong key,
 /// other principal, tampered byte, bad layout) is `InvalidArgumentsRefError`,
 /// with no distinction between them.
-VGI_RPC_EXPORT ArgumentRefClaims open_argument_ref(
-    const std::array<uint8_t, crypto::kAeadKeyBytes>& key, const AuthContext& auth,
-    const std::string& ref);
+VGI_RPC_EXPORT ArgumentRefClaims
+open_argument_ref(const std::array<uint8_t, crypto::kAeadKeyBytes>& key, const AuthContext& auth,
+                  const std::string& ref);
 
 /// Resolve a reference (§10.2): check the claimed location, open the ref, check
 /// its sealed size and digest equal the claimed ones, then the object cache by

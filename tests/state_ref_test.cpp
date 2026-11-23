@@ -204,10 +204,10 @@ TEST_CASE("object cache: single flight, byte bound, no retention over the bound,
     }
 
     SECTION("a failed fetch is shared, not cached") {
-        CHECK_THROWS_AS(cache.get_or_fetch("bad", []() -> std::string {
-            throw std::runtime_error("storage down");
-        }),
-                        std::runtime_error);
+        CHECK_THROWS_AS(
+            cache.get_or_fetch("bad",
+                               []() -> std::string { throw std::runtime_error("storage down"); }),
+            std::runtime_error);
         CHECK(cache.get_or_fetch("bad", [] { return std::string("ok"); }).first->size() == 2);
     }
 }

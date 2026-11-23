@@ -269,8 +269,7 @@ std::shared_ptr<const std::string> resolve_argument_ref(
             throw;
         } catch (const std::exception& e) {
             // Never the URL or the id: the backends redact, and this adds none.
-            throw StorageUnavailableError(std::string("argument object fetch failed: ") +
-                                          e.what());
+            throw StorageUnavailableError(std::string("argument object fetch failed: ") + e.what());
         }
         if (static_cast<int64_t>(data.size()) != size) {
             throw ArgumentsRefIntegrityError("argument object size mismatch: expected " +

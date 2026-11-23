@@ -86,7 +86,9 @@ ObjectCache::ObjectCache(int64_t max_bytes, int64_t max_age_seconds, Clock clock
       max_age_seconds_(max_age_seconds),
       clock_(std::move(clock)) {}
 
-double ObjectCache::now() const { return clock_ ? clock_() : wall_seconds(); }
+double ObjectCache::now() const {
+    return clock_ ? clock_() : wall_seconds();
+}
 
 ObjectCacheStats ObjectCache::stats() const {
     std::lock_guard<std::mutex> lock(mutex_);

@@ -64,8 +64,7 @@ public:
 
     /// `max_bytes = 0` retains nothing (every lookup fetches, still
     /// single-flight).  `clock` is injectable for tests.
-    explicit ObjectCache(int64_t max_bytes,
-                         int64_t max_age_seconds = OBJECT_CACHE_MAX_AGE_SECONDS,
+    explicit ObjectCache(int64_t max_bytes, int64_t max_age_seconds = OBJECT_CACHE_MAX_AGE_SECONDS,
                          Clock clock = {});
 
     ObjectCache(const ObjectCache&) = delete;
