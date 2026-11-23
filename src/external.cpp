@@ -3,6 +3,8 @@
 
 #include "vgi_rpc/external.h"
 
+#include "external_internal.h"
+
 #include "vgi_rpc/arrow_utils.h"
 #include "vgi_rpc/crypto.h"
 #include "vgi_rpc/metadata.h"
@@ -44,7 +46,8 @@
 
 namespace vgi_rpc {
 
-namespace {
+// Shared with the blob-vendor backend (src/vendor.cpp): src/external_internal.h.
+namespace external_internal {
 
 // Split "scheme://host/path" into (scheme, rest-after-the-slashes).
 std::pair<std::string, std::string> split_scheme(const std::string& uri) {
@@ -214,6 +217,12 @@ std::string sha256_hex_to_base64(const std::string& sha256_hex) {
     }
     return base64_std(raw->data(), raw->size());
 }
+
+}  // namespace external_internal
+
+using namespace external_internal;
+
+namespace {
 
 #if defined(VGI_RPC_WITH_S3) || defined(VGI_RPC_WITH_GCS)
 // A random object key under the configured prefix.  The extension records the
