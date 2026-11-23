@@ -1,10 +1,13 @@
 // © Copyright 2025-2026, Query.Farm LLC - https://query.farm
 // SPDX-License-Identifier: Apache-2.0
 
-// Conformance worker implementing all 90 methods from ConformanceService.
+// Conformance worker implementing all 94 methods from ConformanceService.
 // Wire-compatible with the Python vgi_rpc conformance test suite.
 
+#include "vgi_rpc/crypto.h"
 #include "vgi_rpc/external.h"
+#include "vgi_rpc/object_cache.h"
+#include "vgi_rpc/state_ref.h"
 #include "vgi_rpc/server.h"
 #include "vgi_rpc/stream.h"
 #include "vgi_rpc/token_identity.h"
@@ -1484,6 +1487,143 @@ static Stream make_stream_session_counter(const Request& req, CallContext&) {
 }
 
 // =========================================================================
+// StateRef, the object cache and argument references (protocol 3.4)
+// =========================================================================
+//
+// STATE_REF_V1.md §15.  This port is single-replica: its refs stay in memory,
+// so the stream's own ref always reports form "memory" and no encoded bytes.
+
+// The deterministic payload every port builds (`state_ref_payload`).
+static std::string state_ref_payload(int64_t size, bool compressible, const std::string& seed) {
+    if (size <= 0) return {};
+    std::string out;
+    out.reserve(static_cast<size_t>(size));
+    if (compressible) {
+        const std::string unit = "vgi-rpc StateRef conformance " + seed + " ";
+        while (static_cast<int64_t>(out.size()) < size) out += unit;
+    } else {
+        for (uint64_t i = 0; static_cast<int64_t>(out.size()) < size; ++i) {
+            std::string block = seed;
+            for (int b = 0; b < 8; ++b) block.push_back(static_cast<char>((i >> (8 * b)) & 0xff));
+            const auto digest =
+                crypto::sha256(reinterpret_cast<const uint8_t*>(block.data()), block.size());
+            out.append(reinterpret_cast<const char*>(digest.data()), digest.size());
+        }
+    }
+    out.resize(static_cast<size_t>(size));
+    return out;
+}
+
+static std::string sha256_hex_of(const std::string& data) {
+    const auto digest = crypto::sha256(reinterpret_cast<const uint8_t*>(data.data()), data.size());
+    return crypto::hex_encode(digest.data(), digest.size());
+}
+
+static std::shared_ptr<arrow::Schema> state_ref_input_schema() {
+    static auto s = arrow::schema({arrow::field("override", arrow::binary(), /*nullable=*/true)});
+    return s;
+}
+
+static std::shared_ptr<arrow::Schema> state_ref_output_schema() {
+    static auto s = arrow::schema({
+        arrow::field("size", arrow::int64(), /*nullable=*/false),
+        arrow::field("sha256", arrow::utf8(), /*nullable=*/false),
+        arrow::field("form", arrow::utf8(), /*nullable=*/false),
+        arrow::field("ref", arrow::binary(), /*nullable=*/true),
+    });
+    return s;
+}
+
+class StateRefExchangeState : public ExchangeState {
+public:
+    StateRefExchangeState(StateRef value, std::string padding, bool misuse)
+        : value_(std::move(value)), padding_(std::move(padding)), misuse_(misuse) {}
+
+    void exchange(const AnnotatedBatch& input, OutputCollector& out, CallContext& ctx) override {
+        if (misuse_) (void)ctx.state_ref(std::string("a continuation may not create a StateRef"));
+        StateRef presented;
+        if (input.batch && input.batch->num_rows() > 0) {
+            auto column = std::dynamic_pointer_cast<arrow::BinaryArray>(
+                input.batch->GetColumnByName("override"));
+            if (column && !column->IsNull(0)) {
+                presented = StateRef::decode(column->GetView(0));
+            }
+        }
+        const std::string& data = ctx.resolve(presented.valid() ? presented : value_);
+        arrow::Int64Builder size;
+        arrow::StringBuilder sha, form;
+        arrow::BinaryBuilder ref;
+        VGI_RPC_THROW_NOT_OK(size.Append(static_cast<int64_t>(data.size())));
+        VGI_RPC_THROW_NOT_OK(sha.Append(sha256_hex_of(data)));
+        VGI_RPC_THROW_NOT_OK(form.Append(value_.form()));
+        // Never encoded into a token in this port, so there are no bytes to show.
+        VGI_RPC_THROW_NOT_OK(ref.AppendNull());
+        out.emit_arrays({unwrap(size.Finish()), unwrap(sha.Finish()), unwrap(form.Finish()),
+                         unwrap(ref.Finish())});
+    }
+
+private:
+    StateRef value_;
+    // Held directly in the stream state, as the reference's cursor padding is.
+    std::string padding_;
+    bool misuse_;
+};
+
+static Stream make_state_ref_exchange(const Request& req, CallContext& ctx) {
+    const std::string seed = req.get<std::string>("seed");
+    // In the stream method itself: the one place state_ref() is allowed.
+    StateRef value = ctx.state_ref(
+        state_ref_payload(req.get<int64_t>("size"), req.get<bool>("compressible"), seed));
+    std::string padding =
+        state_ref_payload(req.get<int64_t>("cursor_padding"), false, seed + ":padding");
+    return {state_ref_output_schema(), state_ref_input_schema(),
+            std::make_shared<StateRefExchangeState>(std::move(value), std::move(padding),
+                                                    req.get<bool>("misuse")),
+            nullptr};
+}
+
+static Result object_cache_stats_handler(const Request&, CallContext&) {
+    const ObjectCacheStats stats = default_object_cache().stats();
+    std::vector<std::shared_ptr<arrow::Field>> fields;
+    std::vector<std::shared_ptr<arrow::Array>> columns;
+    for (const auto& [name, value] :
+         std::vector<std::pair<const char*, int64_t>>{{"resident_bytes", stats.resident_bytes},
+                                                      {"entries", stats.entries},
+                                                      {"max_bytes", stats.max_bytes},
+                                                      {"hits", stats.hits},
+                                                      {"misses", stats.misses},
+                                                      {"evictions", stats.evictions},
+                                                      {"fetches", stats.fetches}}) {
+        arrow::Int64Builder builder;
+        VGI_RPC_THROW_NOT_OK(builder.Append(value));
+        fields.push_back(arrow::field(name, arrow::int64(), /*nullable=*/false));
+        columns.push_back(unwrap(builder.Finish()));
+    }
+    const std::string record =
+        serialize_batch(arrow::RecordBatch::Make(arrow::schema(fields), 1, columns));
+    arrow::BinaryBuilder result;
+    VGI_RPC_THROW_NOT_OK(result.Append(record));
+    return Result::value(binary_result_schema(), {unwrap(result.Finish())});
+}
+
+static Result object_cache_age_handler(const Request& req, CallContext&) {
+    arrow::Int64Builder result;
+    VGI_RPC_THROW_NOT_OK(result.Append(
+        default_object_cache().age_entries(static_cast<double>(req.get<int64_t>("seconds")))));
+    return Result::value(int_result_schema(), {unwrap(result.Finish())});
+}
+
+static Result resolve_argument_ref_handler(const Request& req, CallContext& ctx) {
+    const auto raw = req.get<std::vector<uint8_t>>("ref");
+    const auto data =
+        ctx.resolve_argument_ref(std::string(raw.begin(), raw.end()), req.get<int64_t>("size"),
+                                 req.get<std::string>("sha256"));
+    arrow::StringBuilder result;
+    VGI_RPC_THROW_NOT_OK(result.Append(sha256_hex_of(*data)));
+    return Result::value(str_result_schema(), {unwrap(result.Finish())});
+}
+
+// =========================================================================
 // Exchange stream factories
 // =========================================================================
 
@@ -1888,6 +2028,7 @@ int main(int argc, char** argv) {
     http_cfg.sticky = true;
     http_cfg.test_drain_endpoint = true;
     bool sticky_echo = true;
+    bool max_request_bytes_given = false;
     int64_t access_log_max_record_bytes = vgi_rpc::kDefaultMaxRecordBytes;
     if (const char* env = std::getenv("VGI_RPC_ACCESS_LOG_MAX_RECORD_BYTES")) {
         try {
@@ -1947,7 +2088,11 @@ int main(int argc, char** argv) {
         } else if (arg == "--max-externalized-response-bytes") {
             http_cfg.max_externalized_response_bytes = std::stoll(take_value(i));
         } else if (arg == "--max-request-bytes") {
+            // 0 means "no request cap", as in the reference worker; otherwise
+            // storage mode defaults the cap to the externalization threshold.
             http_cfg.max_request_bytes = std::stoll(take_value(i));
+            if (http_cfg.max_request_bytes == 0) http_cfg.max_request_bytes = -1;
+            max_request_bytes_given = true;
         } else if (arg == "--hosting-max-request-bytes") {
             http_cfg.hosting_max_request_bytes = std::stoll(take_value(i));
         } else if (arg == "--externalize-threshold") {
@@ -2022,6 +2167,21 @@ int main(int argc, char** argv) {
                 return 2;
             }
             std::copy(raw->begin(), raw->end(), http_cfg.token_key.begin());
+        } else if (arg == "--require-principal") {
+            // Every request authenticated by X-Conformance-Principal, 401
+            // without it: the shared StateRef / argument-reference cases need
+            // two principals and an unauthenticated grant refused exactly like
+            // an unauthenticated call.
+            http_cfg.sticky_header_auth = true;
+            http_cfg.authenticate_every_request = true;
+        } else if (arg == "--object-cache-bytes") {
+            // Before the process-wide cache is first used, which reads it.
+            const std::string value = take_value(i);
+#ifdef _WIN32
+            _putenv_s(vgi_rpc::OBJECT_CACHE_BYTES_ENV, value.c_str());
+#else
+            setenv(vgi_rpc::OBJECT_CACHE_BYTES_ENV, value.c_str(), 1);
+#endif
         } else if (arg == "--no-call-state-cache") {
             http_cfg.call_state_cache = false;
         } else if (arg == "--auth-reject-all") {
@@ -2065,6 +2225,15 @@ int main(int argc, char** argv) {
                    i + 1 < argc) {
             ++i;  // rotation knobs: accepted so the harness can launch us
         }
+    }
+
+    // The reference worker's storage mode: with no explicit request cap the
+    // externalization threshold is also the request cap, so the external-
+    // request groups see a client externalize.  The library itself no longer
+    // couples the two (protocol 3.4).
+    if (!max_request_bytes_given && !http_cfg.external_storage_url.empty() &&
+        http_cfg.externalize_threshold > 0) {
+        http_cfg.max_request_bytes = http_cfg.externalize_threshold;
     }
 
     auto builder = ServerBuilder();
@@ -2464,6 +2633,29 @@ int main(int argc, char** argv) {
         "exchange_session_counter", empty_schema(), session_by_schema(), session_value_schema(),
         make_exchange_session_counter,
         "Exchange stream adding each input by column to the sticky session counter.");
+
+    // --- StateRef, the object cache and argument references (protocol 3.4) ---
+    builder.add_exchange(
+        "state_ref_exchange",
+        params({arrow::field("size", arrow::int64()),
+                arrow::field("compressible", arrow::boolean()), arrow::field("seed", arrow::utf8()),
+                arrow::field("misuse", arrow::boolean()),
+                arrow::field("cursor_padding", arrow::int64())}),
+        state_ref_input_schema(), state_ref_output_schema(), make_state_ref_exchange,
+        "Hold a StateRef of the conformance payload and resolve it on every exchange.");
+    builder
+        .add_unary("object_cache_stats", empty_schema(), binary_result_schema(),
+                   object_cache_stats_handler,
+                   "Return this worker process's object-cache counters.")
+        .add_unary("object_cache_age", params({arrow::field("seconds", arrow::int64())}),
+                   int_result_schema(), object_cache_age_handler,
+                   "Move every object-cache entry's fetch time back by seconds (test hook).")
+        .add_unary(
+            "resolve_argument_ref",
+            params({arrow::field("ref", arrow::binary()), arrow::field("size", arrow::int64()),
+                    arrow::field("sha256", arrow::utf8())}),
+            str_result_schema(), resolve_argument_ref_handler,
+            "Resolve an argument reference minted by this worker's __upload_url__ grant.");
 
     // A fixed marker rather than a real platform header: the contract under
     // test is capture-and-replay, and a stable name is what lets the shared

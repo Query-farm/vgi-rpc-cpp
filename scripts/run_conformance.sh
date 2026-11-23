@@ -78,6 +78,18 @@ if [[ "$CONFORMANCE_WORKERS" != "0" ]]; then
   fi
 fi
 
+# The only skips the mandatory shared suite may report, each with its reason.
+#
+# - STATE_REF_V1.md §5.4 / §15: this port is single-replica in 3.4 (HTTP
+#   streams live in server memory, nothing is serialized), so the StateRef
+#   cases needing stored tags, cross-replica turns, the cursor rule, codec
+#   bytes or tag expiry (§15 tests 1-stored, 2, 3, 4, 5, 10, 12) skip by
+#   capability with SINGLE_REPLICA_SKIP_REASON.  Matched by a fixed prefix of
+#   that reason (pytest -rs may wrap the rest).
+EXPECTED_SKIP_REASONS=(
+  "single-replica SDK: HTTP stream state is never serialized"
+)
+
 # Wait for a worker to print its discovery line, then echo the payload.
 # $1 = output file, $2 = line prefix, $3 = pid
 await_line() {
@@ -203,10 +215,22 @@ run_pytest_suite() {
         "$REPO_ROOT/tests/conformance/test_socket_concurrency.py" \
         -q -p no:randomly -rs ${PYTEST_PAR[@]+"${PYTEST_PAR[@]}"} 2>&1 | tee "$log"
     [[ "${PIPESTATUS[0]}" -eq 0 ]] || rc=1
-    if grep -q '^SKIPPED' "$log"; then
-      echo "ERROR: the mandatory shared suite skipped tests (see SKIPPED lines above)" >&2
+    # Every skip must carry a reason on EXPECTED_SKIP_REASONS; anything else
+    # is an unimplemented deliverable.  And every listed reason must still be
+    # seen, so an entry cannot outlive the gap it describes.
+    local unexpected reason
+    unexpected="$(grep '^SKIPPED' "$log" | grep -vF "${EXPECTED_SKIP_REASONS[@]/#/-e}" || true)"
+    if [[ -n "$unexpected" ]]; then
+      echo "ERROR: the mandatory shared suite skipped tests for unlisted reasons:" >&2
+      echo "$unexpected" >&2
       rc=1
     fi
+    for reason in "${EXPECTED_SKIP_REASONS[@]}"; do
+      if ! grep '^SKIPPED' "$log" | grep -qF -- "$reason"; then
+        echo "ERROR: expected skip reason no longer seen (remove it from EXPECTED_SKIP_REASONS): $reason" >&2
+        rc=1
+      fi
+    done
     # The multi-protocol / error-model groups must have run, not merely been
     # collected out of existence by a narrowed import. One collection covers
     # every group; each must appear in it.

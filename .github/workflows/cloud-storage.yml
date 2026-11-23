@@ -16,6 +16,8 @@ on:
     paths:
       - "src/external.cpp"
       - "include/vgi_rpc/external.h"
+      - "src/state_ref.cpp"
+      - "include/vgi_rpc/state_ref.h"
       - "tests/conformance/test_cloud_storage.py"
       - "CMakePresets.json"
       - "vcpkg.json"
@@ -25,6 +27,8 @@ on:
     paths:
       - "src/external.cpp"
       - "include/vgi_rpc/external.h"
+      - "src/state_ref.cpp"
+      - "include/vgi_rpc/state_ref.h"
       - "tests/conformance/test_cloud_storage.py"
       - "CMakePresets.json"
       - "vcpkg.json"
@@ -124,4 +128,9 @@ jobs:
       - name: Test (full conformance)
         env:
           CONFORMANCE_WORKER: ${{ github.workspace }}/build/conformance/conformance_worker
+          # One leg at a time, as in ci.yml. echo_binary_over_int32_max
+          # round-trips 2 GiB and costs the client about 8 GiB; five legs run
+          # it, and overlapping them starved the 16 GB runner until it lost
+          # contact with GitHub (run 44956315603, an hour in, no logs).
+          CONFORMANCE_WORKERS: "0"
         run: ./scripts/run_conformance.sh

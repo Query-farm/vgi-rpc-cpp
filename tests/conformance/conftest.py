@@ -1358,3 +1358,76 @@ def conformance_http_grant_port() -> Iterator[int]:
     """
     with spawn_http("--identity", "grants") as port:
         yield port
+
+
+# ---------------------------------------------------------------------------
+# StateRef, the object cache and argument references (protocol 3.4)
+# ---------------------------------------------------------------------------
+#
+# vgi_rpc.conformance._state_ref_pytest (STATE_REF_V1.md §15).  This port is
+# single-replica in 3.4 (§5.4): HTTP stream state lives in server memory and is
+# never serialized, so the cases needing stored tags, cross-replica turns, the
+# cursor rule, codec bytes or tag expiry skip with SINGLE_REPLICA_SKIP_REASON,
+# which is the one reason scripts/run_conformance.sh lets through.  The object
+# cache and argument-reference cases run in full against two workers.
+
+
+@pytest.fixture(scope="session")
+def conformance_state_ref_capabilities() -> frozenset[str]:
+    """Empty for this port (single-replica); the reference serializes state."""
+    if CONFORMANCE_SERVER == "python":
+        return frozenset({"serialized_state"})
+    return frozenset()
+
+
+@pytest.fixture(scope="session")
+def conformance_state_ref_replicas(conformance_fake_storage: str) -> Iterator[Any]:
+    """Two workers sharing a token key and the fake storage.
+
+    No request cap, an object cache bound of ``OBJECT_CACHE_TEST_BYTES``, and
+    ``X-Conformance-Principal`` required on every request.  The cursor-rule
+    flag goes only to the reference, which has one.
+    """
+    from vgi_rpc.conformance._state_ref_pytest import OBJECT_CACHE_TEST_BYTES, StateRefReplicas
+
+    flags = [
+        "--fake-storage",
+        conformance_fake_storage,
+        "--token-key",
+        os.urandom(32).hex(),
+        "--max-request-bytes",
+        "0",
+        "--object-cache-bytes",
+        str(OBJECT_CACHE_TEST_BYTES),
+        "--require-principal",
+    ]
+    if CONFORMANCE_SERVER == "python":
+        flags += ["--cursor-rule", "error"]
+    with spawn_http(*flags) as a, spawn_http(*flags) as b:
+        yield StateRefReplicas(ports=(a, b), storage_url=conformance_fake_storage)
+
+
+@pytest.fixture(scope="session")
+def conformance_state_ref_short_ttl_port(conformance_fake_storage: str) -> Iterator[int]:
+    """``token_ttl`` 2 s.  Reference-only: this port's cases skip before asking."""
+    if CONFORMANCE_SERVER != "python":
+        pytest.skip("single-replica port: no token TTL (STATE_REF_V1.md §5.4)")
+    with spawn_http(
+        "--fake-storage", conformance_fake_storage, "--max-request-bytes", "0", "--token-ttl", "2"
+    ) as port:
+        yield port
+
+
+@pytest.fixture(scope="session")
+def conformance_cursor_budget_ports() -> Iterator[Any]:
+    """The warn / error / floor cursor-rule workers.  Reference-only, as above."""
+    from vgi_rpc.conformance._state_ref_pytest import CursorBudgetPorts
+
+    if CONFORMANCE_SERVER != "python":
+        pytest.skip("single-replica port: no cursor rule (STATE_REF_V1.md §5.4)")
+    with (
+        spawn_http("--max-request-bytes", "32768", "--cursor-rule", "warn") as warn,
+        spawn_http("--max-request-bytes", "32768", "--cursor-rule", "error") as error,
+        spawn_http("--max-request-bytes", "9000", "--cursor-rule", "error") as floor,
+    ):
+        yield CursorBudgetPorts(warn=warn, error=error, floor=floor)

@@ -278,6 +278,47 @@ def test_upload_urls_are_usable_by_a_credential_free_client(s3_worker: int) -> N
     assert got.content == payload
 
 
+def test_grant_object_id_resolves_through_s3(s3_worker: int, s3_client: object) -> None:
+    """Protocol 3.4: a grant names its S3 key, and its ref resolves via the object API.
+
+    ``object_id`` is the key the PUT creates; ``resolve_argument_ref`` then
+    makes the worker mint a presigned GET of that key server-side and verify
+    the bytes -- the S3 half of ``ObjectStore.get``.  Deleting the key turns
+    the next (cache-cold) resolve into ``arguments_ref_missing``.
+    """
+    import hashlib
+
+    import httpx2
+
+    from vgi_rpc.http import request_upload_urls, upload_put_headers
+    from vgi_rpc.rpc import RpcError
+
+    payload = b"an argument stored in S3 " * 64
+    digest = hashlib.sha256(payload).hexdigest()
+    (url,) = request_upload_urls(f"http://127.0.0.1:{s3_worker}", uploads=[(len(payload), digest)])
+    assert url.object_id.startswith("vgi-rpc/"), f"object_id is not the S3 key: {url.object_id!r}"
+    assert url.ref, "the grant carried no argument reference"
+    put = httpx2.put(url.upload_url, content=payload, headers=upload_put_headers(url), timeout=30.0)
+    assert put.status_code in (200, 204), f"PUT failed: {put.status_code} {put.text[:200]}"
+
+    with _connect(s3_worker) as proxy:
+        assert proxy.resolve_argument_ref(ref=url.ref, size=len(payload), sha256=digest) == digest
+
+    gone = b"an S3 argument that is deleted " * 32
+    gone_digest = hashlib.sha256(gone).hexdigest()
+    (gone_url,) = request_upload_urls(
+        f"http://127.0.0.1:{s3_worker}", uploads=[(len(gone), gone_digest)]
+    )
+    put = httpx2.put(
+        gone_url.upload_url, content=gone, headers=upload_put_headers(gone_url), timeout=30.0
+    )
+    assert put.status_code in (200, 204)
+    s3_client.delete_object(Bucket=_BUCKET, Key=gone_url.object_id)  # type: ignore[attr-defined]
+    with _connect(s3_worker) as proxy, pytest.raises(RpcError) as raised:
+        proxy.resolve_argument_ref(ref=gone_url.ref, size=len(gone), sha256=gone_digest)
+    assert raised.value.error_kind == "arguments_ref_missing"
+
+
 # ---------------------------------------------------------------------------
 # GCS
 # ---------------------------------------------------------------------------
@@ -370,3 +411,9 @@ def test_gcs_vends_v4_signed_urls(gcs_worker: int) -> None:
         )
 
     assert urls[0].upload_url != urls[1].upload_url, "each pair must name its own object"
+    # Protocol 3.4: each grant names the key its PUT creates, under the prefix,
+    # and carries a sealed argument reference to it.
+    for pair in urls:
+        assert pair.object_id.startswith("vgi-rpc/"), f"object_id is not the key: {pair.object_id!r}"
+        assert f"/vgi-bucket/{pair.object_id}" in pair.upload_url
+        assert pair.ref
