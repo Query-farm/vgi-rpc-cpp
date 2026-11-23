@@ -119,7 +119,9 @@ bool parse_url(const std::string& url, ParsedUrl& out) {
     return true;
 }
 
-int default_port(const std::string& scheme) { return scheme == "https" ? 443 : 80; }
+int default_port(const std::string& scheme) {
+    return scheme == "https" ? 443 : 80;
+}
 
 bool is_loopback_host(const std::string& host) {
     const std::string h = lower(host);
@@ -157,8 +159,7 @@ std::string s3_error_code(const std::string& body) {
     return code;
 }
 
-std::string json_string(const nlohmann::json& obj, const char* key, const char* op,
-                        bool required) {
+std::string json_string(const nlohmann::json& obj, const char* key, const char* op, bool required) {
     const auto found = obj.find(key);
     if (found == obj.end() || found->is_null()) {
         if (!required) return "";
@@ -166,8 +167,8 @@ std::string json_string(const nlohmann::json& obj, const char* key, const char* 
                           "\"");
     }
     if (!found->is_string() || (required && found->get<std::string>().empty())) {
-        throw VendorError(std::string("blob vendor ") + op + " response has a malformed \"" +
-                          key + "\"");
+        throw VendorError(std::string("blob vendor ") + op + " response has a malformed \"" + key +
+                          "\"");
     }
     return found->get<std::string>();
 }
@@ -175,8 +176,8 @@ std::string json_string(const nlohmann::json& obj, const char* key, const char* 
 int64_t json_size(const nlohmann::json& obj, const char* key, const char* op) {
     const auto found = obj.find(key);
     if (found == obj.end() || !found->is_number_integer() || found->get<int64_t>() < 0) {
-        throw VendorError(std::string("blob vendor ") + op + " response has a malformed \"" +
-                          key + "\"");
+        throw VendorError(std::string("blob vendor ") + op + " response has a malformed \"" + key +
+                          "\"");
     }
     return found->get<int64_t>();
 }
@@ -185,8 +186,8 @@ std::vector<std::string> json_string_list(const nlohmann::json& obj, const char*
     std::vector<std::string> out;
     const auto found = obj.find(key);
     if (found == obj.end() || found->is_null()) return out;
-    if (!found->is_array()) throw VendorError(std::string("blob vendor info has a malformed \"") +
-                                              key + "\"");
+    if (!found->is_array())
+        throw VendorError(std::string("blob vendor info has a malformed \"") + key + "\"");
     for (const auto& item : *found) {
         if (!item.is_string() || item.get<std::string>().empty())
             throw VendorError(std::string("blob vendor info has a malformed \"") + key + "\"");
@@ -336,8 +337,8 @@ struct VendorStorage::Impl {
         for (int attempt = 0; attempt < options.max_attempts; ++attempt) {
             if (attempt > 0) {
                 int delay = std::min(options.backoff_ms * (1 << (attempt - 1)), kMaxBackoffMs);
-                delay = static_cast<int>(delay *
-                                         (0.5 + std::uniform_real_distribution<>(0, 0.5)(rng)));
+                delay =
+                    static_cast<int>(delay * (0.5 + std::uniform_real_distribution<>(0, 0.5)(rng)));
                 std::this_thread::sleep_for(std::chrono::milliseconds(delay));
             }
             auto client = client_for(origin);
@@ -372,16 +373,16 @@ struct VendorStorage::Impl {
             if (!res) {
                 // Never the library's text: it can embed the full signed URL.
                 status = 0;
-                last_error = res.error() == httplib::Error::Read ||
-                                     res.error() == httplib::Error::Write
-                                 ? "timeout or connection reset"
-                                 : "transport error";
+                last_error =
+                    res.error() == httplib::Error::Read || res.error() == httplib::Error::Write
+                        ? "timeout or connection reset"
+                        : "transport error";
                 continue;
             }
             if (method != "GET") {
                 outcome.status = res->status;
-                outcome.body = res->body.size() > body_cap ? res->body.substr(0, body_cap)
-                                                           : res->body;
+                outcome.body =
+                    res->body.size() > body_cap ? res->body.substr(0, body_cap) : res->body;
                 outcome.content_encoding = res->get_header_value("Content-Encoding");
             }
             if (outcome.status == 429 || outcome.status >= 500) {
@@ -408,9 +409,9 @@ struct VendorStorage::Impl {
                                   "application/json", kMaxVendorResponseBytes);
         if (outcome.status < 200 || outcome.status >= 300) {
             auto [code, detail] = vendor_error_detail(outcome.body);
-            throw VendorError("blob vendor " + op + " failed: HTTP " +
-                                  std::to_string(outcome.status) + detail,
-                              outcome.status, code);
+            throw VendorError(
+                "blob vendor " + op + " failed: HTTP " + std::to_string(outcome.status) + detail,
+                outcome.status, code);
         }
         if (outcome.body.empty()) return nlohmann::json::object();
         try {
@@ -501,13 +502,13 @@ struct VendorStorage::Impl {
     // GET a signed URL, pinned and capped.  Returns the body and its coding.
     HttpOutcome download(const std::string& url, int64_t max_bytes) {
         validate(url);
-        auto outcome = send("GET", url, "download", httplib::Headers{{"Accept-Encoding",
-                                                                      "zstd, identity"}},
-                            nullptr, "", static_cast<size_t>(max_bytes));
+        auto outcome =
+            send("GET", url, "download", httplib::Headers{{"Accept-Encoding", "zstd, identity"}},
+                 nullptr, "", static_cast<size_t>(max_bytes));
         if (outcome.status != 200) {
-            throw VendorError("download failed: HTTP " + std::to_string(outcome.status) + ": " +
-                                  redact_url(url),
-                              outcome.status, s3_error_code(outcome.body));
+            throw VendorError(
+                "download failed: HTTP " + std::to_string(outcome.status) + ": " + redact_url(url),
+                outcome.status, s3_error_code(outcome.body));
         }
         return outcome;
     }
@@ -552,8 +553,7 @@ struct VendorStorage::Impl {
     }
 };
 
-VendorStorage::VendorStorage(const std::string& base_url, std::string token,
-                             VendorOptions options)
+VendorStorage::VendorStorage(const std::string& base_url, std::string token, VendorOptions options)
     : impl_(std::make_shared<Impl>()), options_(options) {
     ParsedUrl parsed;
     if (!parse_url(base_url, parsed) || (parsed.scheme != "https" && parsed.scheme != "http")) {
@@ -581,7 +581,9 @@ VendorStorage::VendorStorage(const std::string& base_url, std::string token,
 
 VendorStorage::~VendorStorage() = default;
 
-void VendorStorage::validate_url(const std::string& url) { impl_->validate(url); }
+void VendorStorage::validate_url(const std::string& url) {
+    impl_->validate(url);
+}
 
 std::function<void(const std::string&)> VendorStorage::url_validator() {
     std::weak_ptr<Impl> weak = impl_;
@@ -607,7 +609,8 @@ std::string VendorStorage::upload(const std::string& data, const std::string& co
 std::string VendorStorage::fetch(const std::string& url) {
     const auto outcome = impl_->download(url, options_.max_fetch_bytes);
     const std::string coding = lower(outcome.content_encoding);
-    if (coding == "zstd") return zstd_decompress_bounded(outcome.body, options_.max_decompressed_bytes);
+    if (coding == "zstd")
+        return zstd_decompress_bounded(outcome.body, options_.max_decompressed_bytes);
     if (!coding.empty() && coding != "identity") {
         throw VendorError("external location has unsupported Content-Encoding: " + coding);
     }
@@ -656,10 +659,9 @@ std::string VendorStorage::get(const std::string& object_id, int64_t max_bytes) 
     } catch (const VendorError& error) {
         if (error.code() == "not_found" || error.code() == "not_uploaded" ||
             error.status() == 404) {
-            throw ObjectMissingError("blob vendor object is gone (" +
-                                     (error.code().empty() ? std::to_string(error.status())
-                                                           : error.code()) +
-                                     ")");
+            throw ObjectMissingError(
+                "blob vendor object is gone (" +
+                (error.code().empty() ? std::to_string(error.status()) : error.code()) + ")");
         }
         throw;
     }
@@ -679,7 +681,8 @@ std::string VendorStorage::get(const std::string& object_id, int64_t max_bytes) 
         }
         return std::move(outcome.body);
     } catch (const VendorError& error) {
-        if (error.status() == 404) throw ObjectMissingError("blob vendor object is gone (storage 404)");
+        if (error.status() == 404)
+            throw ObjectMissingError("blob vendor object is gone (storage 404)");
         throw;
     }
 }
@@ -694,9 +697,9 @@ std::shared_ptr<VendorStorage> vendor_storage_from_env() {
     std::string token = env(vendor_env::BLOB_VENDOR_TOKEN);
     if (token.empty()) token = env(vendor_env::BLOB_VENDOR_TOKEN_FALLBACK);
     if (token.empty()) {
-        throw std::invalid_argument(std::string(vendor_env::BLOB_VENDOR_URL) + " is set but neither " +
-                                    vendor_env::BLOB_VENDOR_TOKEN + " nor " +
-                                    vendor_env::BLOB_VENDOR_TOKEN_FALLBACK + " is");
+        throw std::invalid_argument(std::string(vendor_env::BLOB_VENDOR_URL) +
+                                    " is set but neither " + vendor_env::BLOB_VENDOR_TOKEN +
+                                    " nor " + vendor_env::BLOB_VENDOR_TOKEN_FALLBACK + " is");
     }
     return std::make_shared<VendorStorage>(url, token);
 }

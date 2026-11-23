@@ -88,18 +88,18 @@ TEST_CASE("the host pin accepts only its hosts, schemes and prefixes", "[vendor]
     const auto pin = pinned_hosts_validator({"blobs.example.com", "127.0.0.1:9000"}, false);
     CHECK_NOTHROW(pin("https://blobs.example.com/a/b?X-Amz-Signature=x"));
     CHECK_NOTHROW(pin("https://BLOBS.example.com:443/a"));
-    CHECK_THROWS(pin("http://blobs.example.com/a"));             // scheme
-    CHECK_THROWS(pin("https://blobs.example.com:8443/a"));       // port
-    CHECK_THROWS(pin("https://evil.blobs.example.com/a"));       // subdomain
-    CHECK_THROWS(pin("https://user@blobs.example.com/a"));       // userinfo
-    CHECK_THROWS(pin("https://127.0.0.1/a"));                    // wrong port
+    CHECK_THROWS(pin("http://blobs.example.com/a"));        // scheme
+    CHECK_THROWS(pin("https://blobs.example.com:8443/a"));  // port
+    CHECK_THROWS(pin("https://evil.blobs.example.com/a"));  // subdomain
+    CHECK_THROWS(pin("https://user@blobs.example.com/a"));  // userinfo
+    CHECK_THROWS(pin("https://127.0.0.1/a"));               // wrong port
     CHECK_NOTHROW(pin("https://127.0.0.1:9000/a"));
     CHECK_THROWS(pin("not a url"));
 
     const auto loopback = pinned_hosts_validator({"127.0.0.1"}, true, {"http://127.0.0.1/r/"});
     CHECK_NOTHROW(loopback("http://127.0.0.1/r/obj"));
-    CHECK_THROWS(loopback("http://127.0.0.1/other/obj"));        // prefix
-    CHECK_THROWS(loopback("http://127.0.0.1/r/../other/obj"));   // dot-dot
+    CHECK_THROWS(loopback("http://127.0.0.1/other/obj"));       // prefix
+    CHECK_THROWS(loopback("http://127.0.0.1/r/../other/obj"));  // dot-dot
     CHECK_THROWS(pinned_hosts_validator({}, false));
     CHECK_THROWS(pinned_hosts_validator({"https://host/path"}, false));
 
@@ -144,8 +144,8 @@ TEST_CASE("configure_http_from_env without a vendor sets only the request cap", 
 TEST_CASE("configure_http_from_env with a vendor installs it and the caps", "[vendor]") {
     ScopedEnv clear(kClearVendorEnv);
     SECTION("defaults") {
-        ScopedEnv env(Env{{"VGI_BLOB_VENDOR_URL", "http://127.0.0.1:1"},
-                       {"VGI_BLOB_VENDOR_TOKEN", "t"}});
+        ScopedEnv env(
+            Env{{"VGI_BLOB_VENDOR_URL", "http://127.0.0.1:1"}, {"VGI_BLOB_VENDOR_TOKEN", "t"}});
         HttpConfig cfg;
         auto storage = configure_http_from_env(cfg);
         REQUIRE(storage);
@@ -158,11 +158,11 @@ TEST_CASE("configure_http_from_env with a vendor installs it and the caps", "[ve
     }
     SECTION("the lane's thresholds") {
         ScopedEnv env(Env{{"VGI_BLOB_VENDOR_URL", "http://127.0.0.1:1"},
-                       {"VGI_CF_DO_TOKEN", "t"},
-                       {"VGI_RPC_EXTERNALIZE_THRESHOLD_BYTES", "4096"},
-                       {"VGI_RPC_MAX_REQUEST_BYTES", "32768"},
-                       {"VGI_RPC_MAX_UPLOAD_BYTES", "268435456"},
-                       {"VGI_RPC_EXTERNAL_COMPRESSION", "zstd:3"}});
+                          {"VGI_CF_DO_TOKEN", "t"},
+                          {"VGI_RPC_EXTERNALIZE_THRESHOLD_BYTES", "4096"},
+                          {"VGI_RPC_MAX_REQUEST_BYTES", "32768"},
+                          {"VGI_RPC_MAX_UPLOAD_BYTES", "268435456"},
+                          {"VGI_RPC_EXTERNAL_COMPRESSION", "zstd:3"}});
         HttpConfig cfg;
         REQUIRE(configure_http_from_env(cfg));
         CHECK(cfg.externalize_threshold == 4096);
@@ -172,9 +172,9 @@ TEST_CASE("configure_http_from_env with a vendor installs it and the caps", "[ve
     }
     SECTION("an upload cap above an explicit fetch cap") {
         ScopedEnv env(Env{{"VGI_BLOB_VENDOR_URL", "http://127.0.0.1:1"},
-                       {"VGI_BLOB_VENDOR_TOKEN", "t"},
-                       {"VGI_RPC_MAX_UPLOAD_BYTES", "2048"},
-                       {"VGI_RPC_MAX_FETCH_BYTES", "1024"}});
+                          {"VGI_BLOB_VENDOR_TOKEN", "t"},
+                          {"VGI_RPC_MAX_UPLOAD_BYTES", "2048"},
+                          {"VGI_RPC_MAX_FETCH_BYTES", "1024"}});
         HttpConfig cfg;
         CHECK_THROWS_WITH(configure_http_from_env(cfg), ContainsSubstring("refuses to fetch"));
     }
@@ -185,8 +185,8 @@ TEST_CASE("configure_http_from_env with a vendor installs it and the caps", "[ve
     }
     SECTION("an unknown compression") {
         ScopedEnv env(Env{{"VGI_BLOB_VENDOR_URL", "http://127.0.0.1:1"},
-                       {"VGI_BLOB_VENDOR_TOKEN", "t"},
-                       {"VGI_RPC_EXTERNAL_COMPRESSION", "brotli"}});
+                          {"VGI_BLOB_VENDOR_TOKEN", "t"},
+                          {"VGI_RPC_EXTERNAL_COMPRESSION", "brotli"}});
         HttpConfig cfg;
         CHECK_THROWS_WITH(configure_http_from_env(cfg), ContainsSubstring("zstd"));
     }
@@ -234,8 +234,8 @@ TEST_CASE("fake vendor: a client upload grant is signed for exactly its bytes",
     VendorStorage storage(*url, fake_token());
 
     const std::string body(3000, 'c');
-    const auto grant = storage.generate_upload_url(static_cast<int64_t>(body.size()),
-                                                   sha256_hex(body));
+    const auto grant =
+        storage.generate_upload_url(static_cast<int64_t>(body.size()), sha256_hex(body));
     CHECK_FALSE(grant.object_id.empty());
     CHECK(grant.headers.count("content-length") == 0);
     CHECK(grant.headers.count("Content-Length") == 0);
