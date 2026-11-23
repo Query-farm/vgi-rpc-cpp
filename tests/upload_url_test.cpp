@@ -19,6 +19,7 @@
 #include "vgi_rpc/http_client.h"
 #include "vgi_rpc/http_config.h"
 #include "vgi_rpc/metadata.h"
+#include "vgi_rpc/object_cache.h"
 #include "vgi_rpc/request.h"
 #include "vgi_rpc/result.h"
 #include "vgi_rpc/server.h"
@@ -35,6 +36,8 @@
 #include <nlohmann/json.hpp>
 
 #include <atomic>
+#include <functional>
+#include <optional>
 #include <chrono>
 #include <condition_variable>
 #include <map>
@@ -169,6 +172,8 @@ public:
             body["object_url"] = url() + "/blob/" + id;
             body["upload_url"] = url() + "/upload/" + id;
             body["download_url"] = url() + "/download/" + id;
+            body["object_id"] = id;
+            if (request.value("purpose", "") == "object") ++object_puts;
             if (request.contains("size")) {
                 std::lock_guard<std::mutex> lock(mutex_);
                 expected_[id] = {request.at("size").get<int64_t>(),
@@ -210,6 +215,17 @@ public:
             }
             res.set_content(found->second, "application/octet-stream");
         });
+        // The object API's `get(object_id)` (fake storage's /objects/{id}).
+        svr_.Get(R"(/objects/(\d+))", [this](const httplib::Request& req, httplib::Response& res) {
+            ++object_gets;
+            std::lock_guard<std::mutex> lock(mutex_);
+            auto found = objects_.find(req.matches[1]);
+            if (found == objects_.end()) {
+                res.status = 404;
+                return;
+            }
+            res.set_content(found->second, "application/octet-stream");
+        });
         port_ = svr_.bind_to_any_port("127.0.0.1");
         REQUIRE(port_ > 0);
         thread_ = std::thread([this]() { (void)svr_.listen_after_bind(); });
@@ -241,6 +257,13 @@ public:
     std::atomic<int> unsized_uploads{0};
     std::atomic<int> refusals{0};
     std::atomic<int> downloads{0};
+    std::atomic<int> object_puts{0};
+    std::atomic<int> object_gets{0};
+
+    void erase(const std::string& id) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        objects_.erase(id);
+    }
 
 private:
     struct Expected {
@@ -259,9 +282,26 @@ private:
 
 class UploadServer {
 public:
-    explicit UploadServer(const std::string& storage_url) {
+    explicit UploadServer(const std::string& storage_url,
+                          std::function<void(HttpConfig&)> configure = {}) {
         ServerBuilder builder;
         builder.protocol(kProtocol);
+        // Resolves an argument reference for the calling principal and
+        // returns the bytes (protocol 3.4).
+        builder.add_unary("resolve_ref",
+                          arrow::schema({arrow::field("ref", arrow::binary(), false),
+                                         arrow::field("size", arrow::int64(), false),
+                                         arrow::field("sha256", arrow::utf8(), false)}),
+                          result_schema(), [](const Request& request, CallContext& ctx) -> Result {
+                              const auto raw = request.get<std::vector<uint8_t>>("ref");
+                              auto data = ctx.resolve_argument_ref(
+                                  std::string(raw.begin(), raw.end()), request.get<int64_t>("size"),
+                                  request.get<std::string>("sha256"));
+                              arrow::BinaryBuilder out;
+                              VGI_RPC_THROW_NOT_OK(out.Append(*data));
+                              return Result::value(arrow::RecordBatch::Make(
+                                  result_schema(), 1, {out.Finish().ValueOrDie()}));
+                          });
         builder.add_unary(
             "echo_bytes", bytes_schema(), result_schema(),
             [](const Request& request, CallContext&) -> Result {
@@ -279,6 +319,8 @@ public:
         // Room for a 101-entry init body inline; the 64 KiB payloads below
         // still exceed it and are externalized.
         cfg.max_request_bytes = 32 * 1024;
+        cfg.sticky_header_auth = true;
+        if (configure) configure(cfg);
         cfg.on_listen = [this](int port) {
             {
                 std::lock_guard<std::mutex> lock(mutex_);
@@ -356,7 +398,8 @@ TEST_CASE("a v2 request vends one sized URL per entry, in order", "[upload-url]"
     const auto& batch = contents->batches[0].batch;
     REQUIRE(batch->num_rows() == 2);
     REQUIRE(batch->schema()->field_names() ==
-            std::vector<std::string>{"upload_url", "download_url", "expires_at", "upload_headers"});
+            std::vector<std::string>{"upload_url", "download_url", "expires_at", "upload_headers",
+                                     "object_id", "ref"});
     CHECK(batch->schema()->field(3)->type()->Equals(arrow::map(arrow::utf8(), arrow::utf8())));
     CHECK_FALSE(batch->schema()->field(3)->nullable());
     auto headers = std::static_pointer_cast<arrow::MapArray>(batch->column(3));
@@ -491,4 +534,199 @@ TEST_CASE("the client refuses to upload to a v1 server", "[upload-url]") {
     CHECK(init_calls.load() == 0);
     legacy.stop();
     thread.join();
+}
+
+// ---------------------------------------------------------------------------
+// Protocol 3.4: grant columns, argument references, fix 1
+// ---------------------------------------------------------------------------
+
+namespace {
+
+struct Grant {
+    std::string upload_url;
+    std::string object_id;
+    std::string ref;
+};
+
+Grant grant_for(const UploadServer& server, const std::string& payload,
+                const std::string& principal) {
+    httplib::Client client("127.0.0.1", server.port());
+    httplib::Headers headers;
+    if (!principal.empty()) headers.emplace("X-Conformance-Principal", principal);
+    auto res = client.Post("/vgi/__upload_url__/init", headers,
+                           init_v2({{static_cast<int64_t>(payload.size()), sha256_hex(payload)}}),
+                           kArrowContentType);
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    auto reader = std::make_shared<arrow::io::BufferReader>(arrow::Buffer::FromString(res->body));
+    auto contents = read_ipc_stream(reader);
+    REQUIRE(contents);
+    const auto& batch = contents->batches.at(0).batch;
+    Grant grant;
+    grant.upload_url =
+        std::static_pointer_cast<arrow::StringArray>(batch->GetColumnByName("upload_url"))
+            ->GetString(0);
+    grant.object_id =
+        std::static_pointer_cast<arrow::StringArray>(batch->GetColumnByName("object_id"))
+            ->GetString(0);
+    grant.ref =
+        std::static_pointer_cast<arrow::BinaryArray>(batch->GetColumnByName("ref"))->GetString(0);
+    const std::string rest = grant.upload_url.substr(grant.upload_url.find("://") + 3);
+    const std::string origin = "http://" + rest.substr(0, rest.find('/'));
+    httplib::Client put(origin);
+    auto put_res =
+        put.Put(rest.substr(rest.find('/')), {{"x-amz-checksum-sha256", sha256_b64(payload)}},
+                payload, "application/octet-stream");
+    REQUIRE(put_res);
+    REQUIRE(put_res->status == 204);
+    return grant;
+}
+
+/// Call resolve_ref; returns {status-ok, body-or-error-message}.
+std::pair<bool, std::string> resolve_ref(const UploadServer& server, const Grant& grant,
+                                         const std::string& payload, const std::string& principal,
+                                         std::optional<int64_t> size = std::nullopt) {
+    arrow::BinaryBuilder ref;
+    arrow::Int64Builder sizes;
+    arrow::StringBuilder sha;
+    REQUIRE(ref.Append(grant.ref).ok());
+    REQUIRE(sizes.Append(size.value_or(static_cast<int64_t>(payload.size()))).ok());
+    REQUIRE(sha.Append(sha256_hex(payload)).ok());
+    auto schema = arrow::schema({arrow::field("ref", arrow::binary(), false),
+                                 arrow::field("size", arrow::int64(), false),
+                                 arrow::field("sha256", arrow::utf8(), false)});
+    auto batch = arrow::RecordBatch::Make(
+        schema, 1,
+        {ref.Finish().ValueOrDie(), sizes.Finish().ValueOrDie(), sha.Finish().ValueOrDie()});
+    httplib::Client client("127.0.0.1", server.port());
+    client.set_decompress(false);
+    httplib::Headers headers{{"Accept-Encoding", "identity"},
+                             {"X-VGI-Accept-Encoding", "identity"}};
+    if (!principal.empty()) headers.emplace("X-Conformance-Principal", principal);
+    auto res = client.Post(std::string("/vgi/") + kProtocol + "/resolve_ref", headers,
+                           ipc_body(batch, routing("resolve_ref", kProtocol)), kArrowContentType);
+    REQUIRE(res);
+    if (res->get_header_value("X-VGI-RPC-Error") == "true") {
+        return {false, error_message(res->body)};
+    }
+    auto reader = std::make_shared<arrow::io::BufferReader>(arrow::Buffer::FromString(res->body));
+    auto contents = read_ipc_stream(reader);
+    REQUIRE(contents);
+    for (const auto& b : contents->batches) {
+        if (b.batch && b.batch->num_rows() == 1) {
+            return {true,
+                    std::static_pointer_cast<arrow::BinaryArray>(b.batch->column(0))->GetString(0)};
+        }
+    }
+    return {false, "no result row"};
+}
+
+}  // namespace
+
+TEST_CASE("a grant's ref resolves for the granting principal only", "[upload-url][argref]") {
+    VerifyingStorage storage;
+    // Each fixture storage numbers its ids from 1; the process-wide cache
+    // must not carry one test's object into the next.
+    default_object_cache().clear();
+    // The 64 KiB result comes back inline rather than as a pointer batch.
+    UploadServer server(storage.url(), [](HttpConfig& cfg) {
+        cfg.externalize_threshold = 1 << 20;
+        cfg.compression = false;
+    });
+    const std::string payload = big_payload();
+    const Grant grant = grant_for(server, payload, "alice");
+    CHECK_FALSE(grant.object_id.empty());
+    CHECK_FALSE(grant.ref.empty());
+
+    auto [ok, body] = resolve_ref(server, grant, payload, "alice");
+    INFO(body);
+    REQUIRE(ok);
+    CHECK(body == payload);
+    // A second resolve is served from the object cache: one GET in all.
+    auto again = resolve_ref(server, grant, payload, "alice");
+    CHECK(again.first);
+    CHECK(storage.object_gets == 1);
+
+    auto other = resolve_ref(server, grant, payload, "bob");
+    CHECK_FALSE(other.first);
+    CHECK_THAT(other.second, ContainsSubstring("argument reference is invalid for this caller"));
+    auto anonymous = resolve_ref(server, grant, payload, "");
+    CHECK_FALSE(anonymous.first);
+
+    auto wrong_size = resolve_ref(server, grant, payload, "alice", payload.size() + 1);
+    CHECK_FALSE(wrong_size.first);
+    CHECK_THAT(wrong_size.second, ContainsSubstring("does not match the size and sha256"));
+}
+
+TEST_CASE("a deleted argument object reports arguments_ref_missing", "[upload-url][argref]") {
+    VerifyingStorage storage;
+    // Each fixture storage numbers its ids from 1; the process-wide cache
+    // must not carry one test's object into the next.
+    default_object_cache().clear();
+    UploadServer server(storage.url(), [](HttpConfig& cfg) { cfg.compression = false; });
+    const std::string payload = "an argument whose object is deleted";
+    const Grant grant = grant_for(server, payload, "alice");
+    storage.erase(grant.object_id);
+    auto [ok, body] = resolve_ref(server, grant, payload, "alice");
+    CHECK_FALSE(ok);
+    CHECK_THAT(body, ContainsSubstring("argument object is gone"));
+}
+
+TEST_CASE("fix 1: the upload cap defaults to the fetch cap and is always advertised",
+          "[upload-url][fix1]") {
+    VerifyingStorage storage;
+    SECTION("defaults: 256 MiB both ways") {
+        UploadServer server(storage.url(), [](HttpConfig& cfg) { cfg.max_upload_bytes = -1; });
+        httplib::Client client("127.0.0.1", server.port());
+        auto res = client.Options("/vgi/health");
+        REQUIRE(res);
+        CHECK(res->get_header_value("VGI-Max-Upload-Bytes") == std::to_string(256LL << 20));
+    }
+    SECTION("an explicit fetch cap bounds the default upload cap") {
+        UploadServer server(storage.url(), [](HttpConfig& cfg) {
+            cfg.max_upload_bytes = -1;
+            cfg.max_fetch_bytes = 4096;
+        });
+        httplib::Client client("127.0.0.1", server.port());
+        auto res = client.Options("/vgi/health");
+        REQUIRE(res);
+        CHECK(res->get_header_value("VGI-Max-Upload-Bytes") == "4096");
+    }
+    SECTION("a larger explicit upload cap raises the default fetch cap") {
+        UploadServer server(storage.url(),
+                            [](HttpConfig& cfg) { cfg.max_upload_bytes = int64_t{1} << 30; });
+        httplib::Client client("127.0.0.1", server.port());
+        auto res = client.Options("/vgi/health");
+        REQUIRE(res);
+        CHECK(res->get_header_value("VGI-Max-Upload-Bytes") == std::to_string(int64_t{1} << 30));
+    }
+}
+
+TEST_CASE("fix 1: an explicit fetch cap below an explicit upload cap refuses to start",
+          "[upload-url][fix1]") {
+    VerifyingStorage storage;
+    ServerBuilder builder;
+    builder.protocol(kProtocol);
+    builder.add_unary("noop", bytes_schema(), result_schema(),
+                      [](const Request& request, CallContext&) -> Result {
+                          return Result::value(arrow::RecordBatch::Make(
+                              result_schema(), 1, {request.batch()->column(0)}));
+                      });
+    auto server = builder.build();
+    HttpConfig cfg;
+    cfg.external_storage_url = storage.url();
+    cfg.max_fetch_bytes = 1 << 20;
+    cfg.max_upload_bytes = 2 << 20;
+    CHECK_THROWS_WITH(server->serve_http(cfg), ContainsSubstring("max_upload_bytes"));
+}
+
+TEST_CASE("the externalization threshold is not advertised as a request cap",
+          "[upload-url][fix1]") {
+    VerifyingStorage storage;
+    UploadServer server(storage.url(), [](HttpConfig& cfg) { cfg.max_request_bytes = -1; });
+    httplib::Client client("127.0.0.1", server.port());
+    auto res = client.Options("/vgi/health");
+    REQUIRE(res);
+    CHECK_FALSE(res->has_header("VGI-Max-Request-Bytes"));
+    CHECK(res->get_header_value("VGI-Upload-URL-Support") == "2");
 }

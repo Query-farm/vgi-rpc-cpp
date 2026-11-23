@@ -81,6 +81,16 @@ Code default_error_code(std::string_view exception_type, std::string_view kind) 
         {"introspection_refused", Code::PERMISSION_DENIED},
         {"grant_refused", Code::PERMISSION_DENIED},
         {"token_unresolved", Code::NOT_FOUND},
+        // Protocol 3.4 large values (STATE_REF_V1.md §6, decisions 6 and 10).
+        {"invalid_state_ref", Code::INVALID_ARGUMENT},
+        {"state_ref_missing", Code::NOT_FOUND},
+        {"state_ref_too_large", Code::RESOURCE_EXHAUSTED},
+        {"state_ref_misuse", Code::FAILED_PRECONDITION},
+        {"cursor_too_large", Code::RESOURCE_EXHAUSTED},
+        {"storage_unavailable", Code::UNAVAILABLE},
+        {"invalid_arguments_ref", Code::INVALID_ARGUMENT},
+        {"arguments_ref_integrity", Code::DATA_LOSS},
+        {"arguments_ref_missing", Code::NOT_FOUND},
     };
     if (!kind.empty()) {
         for (const auto& entry : kKinds) {

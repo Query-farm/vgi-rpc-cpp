@@ -1787,19 +1787,39 @@ public:
         const auto response = post_inline(control_method, path(control_method, "/init"),
                                           control_body, control_id, options, true, sticky_session);
         auto decoded = decode(response, ResponseShape::UNARY, false, nullptr, sticky_session);
+        // The four v2 columns are read by name and must have their v2 types;
+        // anything else is ignored -- protocol 3.4 servers append `object_id`
+        // and `ref` (STATE_REF_V1.md §10.2), and later ones may append more.
         const auto expected_schema = upload_url_response_schema();
-        if (!schema_equals(decoded.schema, expected_schema) || decoded.data.size() != 1 ||
-            !decoded.data.front().batch || decoded.data.front().batch->num_rows() != count) {
+        const bool shaped = decoded.schema && decoded.data.size() == 1 &&
+                            decoded.data.front().batch &&
+                            decoded.data.front().batch->num_rows() == count;
+        if (shaped) {
+            for (const auto& field : expected_schema->fields()) {
+                const auto found = decoded.schema->GetFieldByName(field->name());
+                if (!found || !found->type()->Equals(field->type())) {
+                    throw HttpClientError("upload URL response has an invalid Arrow shape");
+                }
+            }
+        } else {
             throw HttpClientError("upload URL response has an invalid Arrow shape");
         }
         const auto& batch = decoded.data.front().batch;
-        auto upload_urls = std::dynamic_pointer_cast<arrow::StringArray>(batch->column(0));
-        auto downloads = std::dynamic_pointer_cast<arrow::StringArray>(batch->column(1));
-        auto expirations = std::dynamic_pointer_cast<arrow::TimestampArray>(batch->column(2));
-        auto header_maps = std::dynamic_pointer_cast<arrow::MapArray>(batch->column(3));
+        auto upload_urls =
+            std::dynamic_pointer_cast<arrow::StringArray>(batch->GetColumnByName("upload_url"));
+        auto downloads =
+            std::dynamic_pointer_cast<arrow::StringArray>(batch->GetColumnByName("download_url"));
+        auto expirations =
+            std::dynamic_pointer_cast<arrow::TimestampArray>(batch->GetColumnByName("expires_at"));
+        auto header_maps =
+            std::dynamic_pointer_cast<arrow::MapArray>(batch->GetColumnByName("upload_headers"));
         if (!upload_urls || !downloads || !expirations || !header_maps) {
             throw HttpClientError("upload URL response has invalid Arrow column types");
         }
+        // Optional protocol 3.4 grant columns; a client need not use them.
+        auto object_ids =
+            std::dynamic_pointer_cast<arrow::StringArray>(batch->GetColumnByName("object_id"));
+        auto refs = std::dynamic_pointer_cast<arrow::BinaryArray>(batch->GetColumnByName("ref"));
         std::vector<HttpUploadUrl> urls;
         urls.reserve(static_cast<size_t>(count));
         for (int64_t row = 0; row < count; ++row) {
@@ -1824,6 +1844,8 @@ public:
             }
             url.download_url = downloads->GetString(row);
             if (!expirations->IsNull(row)) url.expires_at_us = expirations->Value(row);
+            if (object_ids && !object_ids->IsNull(row)) url.object_id = object_ids->GetString(row);
+            if (refs && !refs->IsNull(row)) url.ref = refs->GetString(row);
             try {
                 external_http->validate_url(url.upload_url);
                 external_http->validate_url(url.download_url);

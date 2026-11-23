@@ -737,6 +737,7 @@ void Server::serve_unary(const MethodInfo& method_info, const ProtocolIdentity& 
     auto log_sink = std::make_shared<LogSink>(server_id_, request_id);
     CallContext ctx(log_sink, server_id_, request_id, transport_kind);
     ctx.set_identity(auth, peer_evidence);
+    ctx.set_call_identity(owner.name, method_info.name);
     serve_unary_impl(method_info, owner, request, request_id, output, ctx, call_shm);
 }
 
@@ -750,6 +751,7 @@ bool Server::serve_stream(const MethodInfo& method_info, const ProtocolIdentity&
     auto log_sink = std::make_shared<LogSink>(server_id_, request_id);
     CallContext ctx(log_sink, server_id_, request_id, transport_kind);
     ctx.set_identity(auth, peer_evidence);
+    ctx.set_call_identity(owner.name, method_info.name);
 
     // Access-log state for the (single) record emitted at the normal end of the
     // stream.  Factory-init failures return early and are not logged.
@@ -799,6 +801,8 @@ bool Server::serve_stream(const MethodInfo& method_info, const ProtocolIdentity&
     };
 
     try {
+        // The only place state_ref() is allowed (STATE_REF_V1.md §2.1).
+        CallContext::StreamInitScope init_scope(ctx);
         stream_result = method_info.stream_factory(request, ctx);
     } catch (const std::exception& e) {
         // exception_type_of maps the C++ class exactly as the old per-class
@@ -902,6 +906,7 @@ bool Server::serve_stream(const MethodInfo& method_info, const ProtocolIdentity&
                 cancelled_flag = true;
                 CallContext cancel_ctx(log_sink, server_id_, request_id, transport_kind);
                 cancel_ctx.set_identity(auth, peer_evidence);
+                cancel_ctx.set_call_identity(owner.name, method_info.name);
                 try {
                     state->on_cancel(cancel_ctx);
                 } catch (const std::exception& e) {
@@ -938,6 +943,7 @@ bool Server::serve_stream(const MethodInfo& method_info, const ProtocolIdentity&
             OutputCollector out(output_schema, is_producer, server_id_, request_id);
             CallContext stream_ctx(log_sink, server_id_, request_id, transport_kind);
             stream_ctx.set_identity(auth, peer_evidence);
+            stream_ctx.set_call_identity(owner.name, method_info.name);
 
             state->process(input_ab, out, stream_ctx);
 

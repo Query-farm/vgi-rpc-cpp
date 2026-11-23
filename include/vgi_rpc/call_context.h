@@ -21,6 +21,7 @@
 #include "vgi_rpc/errors.h"
 #include "vgi_rpc/session.h"
 #include "vgi_rpc/identity.h"
+#include "vgi_rpc/state_ref.h"
 
 namespace vgi_rpc {
 
@@ -107,7 +108,68 @@ public:
     // Idempotent.
     void close_session();
 
+    // --- StateRef and argument references (protocol 3.4) ---
+    //
+    // STATE_REF_V1.md.  This port is single-replica in 3.4 (§5.4): a StateRef
+    // stays in memory on every transport, so these never touch storage.
+
+    // Wrap an immutable per-stream value.  Valid only on the context handed
+    // to a stream method itself; anywhere else -- a unary call, a stream's
+    // process/produce/exchange (the first producer turn folded into an HTTP
+    // init included), on_cancel -- throws StateRefMisuseError
+    // (`state_ref_misuse`, FAILED_PRECONDITION).  Within one init, the same
+    // bytes (or the same record instance) return the same ref.  Never call it
+    // again on a later turn: copy the ref into the next state.
+    StateRef state_ref(std::string value);
+    // A record, serialized as an Arrow IPC stream for the byte form; a typed
+    // resolve returns this very instance.
+    StateRef state_ref(const std::shared_ptr<arrow::RecordBatch>& record);
+
+    // The value's bytes, on any turn of any transport.  Valid while `ref` (or
+    // a copy of it) is alive.  Throws InvalidStateRefError for an empty ref.
+    const std::string& resolve(const StateRef& ref) const;
+    // Typed variant for a record ref: the original instance while in memory,
+    // else the record decoded from its bytes.
+    std::shared_ptr<arrow::RecordBatch> resolve_record(const StateRef& ref) const;
+
+    // Resolve an argument reference minted by this server's
+    // `__upload_url__/init` grant, for this request's principal, with the
+    // size and SHA-256 hex it was sent with (STATE_REF_V1.md §10.2).  Goes
+    // through the process's object cache.  Errors: invalid_arguments_ref,
+    // arguments_ref_integrity, arguments_ref_missing, storage_unavailable.
+    // Only the HTTP transport vends grants; elsewhere this is
+    // invalid_arguments_ref.
+    std::shared_ptr<const std::string> resolve_argument_ref(const std::string& ref, int64_t size,
+                                                            const std::string& sha256_hex) const;
+
+    // Transport plumbing.
+    void set_state_ref_runtime(std::shared_ptr<const StateRefRuntime> runtime) noexcept {
+        state_ref_runtime_ = std::move(runtime);
+    }
+    // The protocol and method this context serves, for error messages.
+    void set_call_identity(std::string protocol, std::string method) {
+        protocol_ = std::move(protocol);
+        method_ = std::move(method);
+    }
+    const std::string& protocol_name() const noexcept { return protocol_; }
+    const std::string& method_name() const noexcept { return method_; }
+
+    // Brackets the call of a stream method (the factory).  Only inside it is
+    // state_ref() allowed; the transport opens the scope immediately before
+    // the call and closes it immediately after, whatever the outcome.
+    class VGI_RPC_EXPORT StreamInitScope {
+    public:
+        explicit StreamInitScope(CallContext& ctx);
+        ~StreamInitScope();
+        StreamInitScope(const StreamInitScope&) = delete;
+        StreamInitScope& operator=(const StreamInitScope&) = delete;
+
+    private:
+        CallContext& ctx_;
+    };
+
 private:
+    struct StateRefMemo;
     std::shared_ptr<LogSink> sink_;
     std::string server_id_;
     std::string request_id_;
@@ -117,6 +179,11 @@ private:
     PeerEvidenceSet peer_evidence_;
     std::optional<int64_t> response_limit_bytes_;
     std::optional<int64_t> preferred_response_bytes_;
+    std::shared_ptr<const StateRefRuntime> state_ref_runtime_;
+    std::string protocol_;
+    std::string method_;
+    // Non-null only while a stream method runs: the init turn's memo.
+    std::shared_ptr<StateRefMemo> state_ref_memo_;
 };
 
 }  // namespace vgi_rpc

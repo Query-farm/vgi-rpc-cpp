@@ -75,11 +75,20 @@ response without guessing whether an older worker ignored the request header.
 | Response batching target | `preferred_response_bytes` |
 | Request caps | `max_request_bytes`, `hosting_max_request_bytes` |
 | External locations (pointer batches) | `external_storage_url`, `externalize_threshold` |
+| Upload URLs v2, grant `object_id` / `ref` (protocol 3.4) | `max_upload_bytes`, `max_fetch_bytes` |
 | Bounded request decoding and response negotiation (zstd + gzip) | `compression` |
 | CORS, including `Cross-Origin-Resource-Policy` | `cors_origin` |
 | Sticky sessions (AEAD-sealed tokens, TTL, drain) | `sticky`, `sticky_default_ttl`, `sticky_echo_headers` |
 | Standardized 401s with `VGI-Auth-Reason` | `reject_all` |
 | Proxy proof (HMAC-SHA256 proof-of-hop) | `proof_mode`, `proof_origin_id`, `proof_secrets` |
+
+`VGI-Max-Request-Bytes` is advertised only when a request cap is configured;
+the externalization threshold is a response-side knob and is never advertised
+in its place (a cap below 16 KiB starts with a warning). With external storage,
+`VGI-Max-Upload-Bytes` is always advertised and never exceeds the inbound fetch
+cap: `max_upload_bytes` defaults to `max_fetch_bytes`, which defaults to
+256 MiB (raised to an explicit larger `max_upload_bytes`); an explicit fetch cap
+below an explicit upload cap refuses to start.
 
 Stream state travels as two tokens split by lifetime — a call token minted
 once by `/init` and a cursor re-minted every turn — so a continuation does not

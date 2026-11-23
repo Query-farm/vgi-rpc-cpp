@@ -64,6 +64,8 @@ add_library(vgi_rpc
     src/crypto.cpp
     src/errors.cpp
     src/external.cpp
+    src/object_cache.cpp
+    src/state_ref.cpp
     src/proxy_proof.cpp
     src/session.cpp
     src/shm.cpp

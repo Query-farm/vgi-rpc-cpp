@@ -611,6 +611,8 @@ public:
             body["object_url"] = "http://127.0.0.1:1/blob";
             body["upload_url"] = "http://127.0.0.1:1/blob/put";
             body["download_url"] = "http://127.0.0.1:1/blob/get";
+            // Protocol 3.4: a grant names the object it creates.
+            body["object_id"] = "blob";
             // The charset is load bearing, unhappily.  vgi's external-storage
             // client advertises `Accept-Encoding: br, gzip, deflate` (cpp-httplib
             // adds it unasked) while calling `set_decompress(false)`, so a store

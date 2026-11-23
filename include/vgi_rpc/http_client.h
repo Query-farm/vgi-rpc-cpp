@@ -115,6 +115,11 @@ struct HttpUploadUrl {
     std::optional<int64_t> expires_at_us;
     // Headers the PUT MUST carry, verbatim (e.g. x-amz-checksum-sha256).
     std::map<std::string, std::string> upload_headers;
+    // Protocol 3.4 grant columns, empty from an older server: the storage id
+    // of the object the PUT creates, and the sealed argument reference to it
+    // (STATE_REF_V1.md §10.2).  Opaque to the client.
+    std::string object_id;
+    std::string ref;
 };
 
 struct HttpClientConfig {

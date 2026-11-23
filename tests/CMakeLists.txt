@@ -50,6 +50,7 @@ target_compile_definitions(grants_test PRIVATE
 vgi_rpc_add_test(client_external_test)
 vgi_rpc_add_test(external_ref_test)
 vgi_rpc_add_test(upload_url_test)
+vgi_rpc_add_test(state_ref_test)
 target_link_libraries(external_ref_test PRIVATE zstd::libzstd)
 vgi_rpc_add_test(client_test)
 vgi_rpc_add_test(http_routing_test)

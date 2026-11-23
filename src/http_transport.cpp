@@ -24,6 +24,8 @@
 #include "vgi_rpc/crypto.h"
 #include "vgi_rpc/errors.h"
 #include "vgi_rpc/external.h"
+#include "vgi_rpc/object_cache.h"
+#include "vgi_rpc/state_ref.h"
 #include "vgi_rpc/grants.h"
 #include "vgi_rpc/log_sink.h"
 #include "vgi_rpc/metadata.h"
@@ -81,6 +83,10 @@ constexpr const char* ACCEPT_MAX_RESPONSE_BYTES_SUPPORT_HEADER =
     "VGI-Accept-Max-Response-Bytes-Support";
 constexpr int64_t MAX_SAFE_RESPONSE_BYTES = 9'007'199'254'740'991LL;
 constexpr int64_t MIN_RESPONSE_BYTES = 64LL << 10;
+// Inbound fetch cap when none is configured (and no larger upload cap is).
+constexpr int64_t kDefaultMaxFetchBytes = 256LL * 1024 * 1024;
+// STATE_REF_V1.md §9: a request cap below this is warned about at startup.
+constexpr int64_t kCursorRuleFloorBytes = 16384;
 constexpr const char* AUTH_REASON_HEADER = "VGI-Auth-Reason";
 // The upload-URL protocol this server speaks, as advertised in
 // `VGI-Upload-URL-Support`.  v1 ("true", a bare `count`) is retired.
@@ -108,6 +114,10 @@ std::shared_ptr<arrow::Schema> upload_url_response_schema() {
                      /*nullable=*/false),
         arrow::field("upload_headers", arrow::map(arrow::utf8(), arrow::utf8()),
                      /*nullable=*/false),
+        // Protocol 3.4 grant columns (STATE_REF_V1.md §10.2), appended so a
+        // client reading the four v2 columns by name is unaffected.
+        arrow::field("object_id", arrow::utf8(), /*nullable=*/false),
+        arrow::field("ref", arrow::binary(), /*nullable=*/false),
     });
 }
 
@@ -885,6 +895,33 @@ public:
             throw std::invalid_argument(
                 "peer authentication policy requires at least one identity provider");
         }
+        // Fix 1 (protocol 3.4): never advertise an upload the server would then
+        // refuse to fetch.  The fetch cap defaults to 256 MiB, raised to an
+        // explicit upload cap above it; the upload cap defaults to the fetch
+        // cap.  Only an explicit, contradictory pair refuses to start.
+        if (cfg_.max_fetch_bytes >= 0 && cfg_.max_upload_bytes > 0 &&
+            cfg_.max_upload_bytes > cfg_.max_fetch_bytes) {
+            throw std::invalid_argument(
+                "max_upload_bytes (" + std::to_string(cfg_.max_upload_bytes) +
+                ") exceeds the server's inbound fetch cap (max_fetch_bytes = " +
+                std::to_string(cfg_.max_fetch_bytes) +
+                "): clients would upload requests the server then refuses to fetch. Raise "
+                "max_fetch_bytes or lower max_upload_bytes.");
+        }
+        if (cfg_.max_fetch_bytes < 0) {
+            cfg_.max_fetch_bytes = std::max(kDefaultMaxFetchBytes, cfg_.max_upload_bytes);
+        }
+        if (cfg_.max_upload_bytes <= 0) cfg_.max_upload_bytes = cfg_.max_fetch_bytes;
+        // STATE_REF_V1.md §9 floor.  This port has no serialized stream state
+        // and so no cursor rule to disable, but the operator still learns that
+        // the cap is below what the protocol's budgets assume.
+        if (const auto cap =
+                configured_limit(cfg_.max_request_bytes, cfg_.hosting_max_request_bytes);
+            cap && *cap < kCursorRuleFloorBytes) {
+            std::cerr << "vgi_rpc: warning: max_request_bytes (" << *cap
+                      << ") is below 16384: the cursor rule is disabled and stream continuations "
+                         "may not fit\n";
+        }
         if (!cfg.external_storage_url.empty()) {
             // Throws for a scheme this build cannot serve, so an operator who
             // configured a bucket learns at startup rather than on the first
@@ -895,12 +932,21 @@ public:
             storage_config.region = cfg.external_storage_region;
             storage_config.endpoint_url = cfg.external_storage_endpoint;
             storage_config.signing_account = cfg.external_storage_signing_account;
-            storage_config.max_fetch_bytes = cfg.max_fetch_bytes;
+            storage_config.max_fetch_bytes = cfg_.max_fetch_bytes;
             storage_config.max_decompressed_bytes = cfg.max_decompressed_fetch_bytes;
             storage_config.max_redirects = cfg.max_external_redirects;
             storage_config.url_validator = cfg.external_url_validator;
             storage_ = make_external_storage(storage_config);
         }
+        // Argument references resolve through the server's object store and
+        // the process-wide object cache.  A backend without the object API
+        // leaves `store` null, and resolution refuses with
+        // invalid_arguments_ref (as do grants: no object_id to seal).
+        auto runtime = std::make_shared<StateRefRuntime>();
+        runtime->token_key = cfg_.token_key;
+        runtime->store = dynamic_cast<ObjectStore*>(storage_.get());
+        runtime->max_fetch_bytes = cfg_.max_fetch_bytes;
+        state_ref_runtime_ = std::move(runtime);
     }
 
     void run();
@@ -982,6 +1028,7 @@ private:
     SessionRegistry sessions_;
     ProofVerifier proof_;
     std::unique_ptr<ExternalStorage> storage_;
+    std::shared_ptr<const StateRefRuntime> state_ref_runtime_;
 
     std::mutex streams_mutex_;
     std::unordered_map<std::string, std::shared_ptr<HttpStreamSession>> streams_;
@@ -1018,12 +1065,11 @@ void HttpServer::stamp_capabilities(httplib::Response& res) const {
         // "2": upload URLs v2, `__upload_url__/init` takes (size, sha256)
         // entries.  A clean break -- no server answers the retired count shape.
         res.set_header("VGI-Upload-URL-Support", UPLOAD_URL_PROTOCOL_VERSION);
-        // The threshold doubles as the inline-request ceiling: a body over it
-        // is what the client externalizes instead, so advertising one number
-        // keeps the two sides from disagreeing about where the line is.
-        if (!configured_request_limit) {
-            res.set_header("VGI-Max-Request-Bytes", std::to_string(cfg_.externalize_threshold));
-        }
+        // Always advertised beside upload URLs, and never above the fetch cap
+        // (fix 1, resolved at startup).  `VGI-Max-Request-Bytes` is
+        // `max_request_bytes` alone: the externalization threshold is a
+        // response-side knob and is no longer advertised as a request cap
+        // (STATE_REF_V1.md §9).
         res.set_header("VGI-Max-Upload-Bytes", std::to_string(cfg_.max_upload_bytes));
     }
     // Present-but-empty is a server positively stating it speaks no
@@ -1889,18 +1935,33 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
         try {
             std::vector<UploadUrl> urls;
             urls.reserve(entries.size());
+            std::vector<std::string> refs;
+            refs.reserve(entries.size());
             for (const auto& entry : entries) {
                 urls.push_back(storage_->generate_upload_url(entry.size, entry.sha256));
+                // Protocol 3.4: the object this PUT creates, and a reference
+                // to it sealed for *this* request's principal -- the grant is
+                // authenticated by the same chain as every protocol method,
+                // above, so the same client presenting the ref opens it.
+                if (urls.back().object_id.empty()) {
+                    throw std::runtime_error("the upload URL provider returned no object_id");
+                }
+                refs.push_back(mint_argument_ref(cfg_.token_key, resolved.auth, entry.size,
+                                                 entry.sha256, urls.back().object_id));
             }
             const auto schema = upload_url_response_schema();
-            arrow::StringBuilder up, down;
+            arrow::StringBuilder up, down, object_ids;
+            arrow::BinaryBuilder ref_column;
             arrow::TimestampBuilder exp(arrow::timestamp(arrow::TimeUnit::MICRO, "UTC"),
                                         arrow::default_memory_pool());
             auto key_builder = std::make_shared<arrow::StringBuilder>();
             auto item_builder = std::make_shared<arrow::StringBuilder>();
             arrow::MapBuilder headers(arrow::default_memory_pool(), key_builder, item_builder,
                                       schema->field(3)->type());
-            for (const auto& url : urls) {
+            for (size_t u = 0; u < urls.size(); ++u) {
+                const auto& url = urls[u];
+                VGI_RPC_THROW_NOT_OK(object_ids.Append(url.object_id));
+                VGI_RPC_THROW_NOT_OK(ref_column.Append(refs[u]));
                 VGI_RPC_THROW_NOT_OK(up.Append(url.upload_url));
                 VGI_RPC_THROW_NOT_OK(down.Append(url.download_url));
                 VGI_RPC_THROW_NOT_OK(exp.Append(url.expires_at_us));
@@ -1917,10 +1978,11 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
                     VGI_RPC_THROW_NOT_OK(item_builder->Append(value));
                 }
             }
-            auto out_batch =
-                arrow::RecordBatch::Make(schema, static_cast<int64_t>(urls.size()),
-                                         {unwrap(up.Finish()), unwrap(down.Finish()),
-                                          unwrap(exp.Finish()), unwrap(headers.Finish())});
+            auto out_batch = arrow::RecordBatch::Make(
+                schema, static_cast<int64_t>(urls.size()),
+                {unwrap(up.Finish()), unwrap(down.Finish()), unwrap(exp.Finish()),
+                 unwrap(headers.Finish()), unwrap(object_ids.Finish()),
+                 unwrap(ref_column.Finish())});
             res.status = 200;
             std::string body = build_body([&](const std::shared_ptr<arrow::io::OutputStream>& out) {
                 write_ipc_stream(out, schema, {AnnotatedBatch::data(out_batch)});
@@ -1983,6 +2045,8 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
     auto log_sink = std::make_shared<LogSink>(rpc_.server_id(), request_id);
     CallContext ctx(log_sink, rpc_.server_id(), request_id, TransportKind::HTTP);
     ctx.set_identity(resolved.auth, resolved.evidence);
+    ctx.set_call_identity(routed.protocol, method_name);
+    ctx.set_state_ref_runtime(state_ref_runtime_);
     ctx.set_response_budgets(response_limit, preferred_response);
 
     // Sticky machinery for this request, installed only on HTTP.
@@ -2126,6 +2190,7 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
 
         Stream stream;
         try {
+            CallContext::StreamInitScope init_scope(ctx);
             stream = method_info.stream_factory(request, ctx);
         } catch (const std::exception& e) {
             turn.failed(exception_type_of(e), e.what(), code_name(error_code_of(e)));
@@ -2636,9 +2701,7 @@ void HttpServer::run() {
     svr.set_tcp_nodelay(true);
     const auto configured_request_limit =
         configured_limit(cfg_.max_request_bytes, cfg_.hosting_max_request_bytes);
-    const int64_t rpc_request_limit = configured_request_limit
-                                          ? *configured_request_limit
-                                          : (storage_ ? cfg_.externalize_threshold : -1);
+    const int64_t rpc_request_limit = configured_request_limit ? *configured_request_limit : -1;
     if (rpc_request_limit >= 0) {
         svr.set_payload_max_length(static_cast<size_t>(rpc_request_limit));
     }
@@ -2833,8 +2896,7 @@ void HttpServer::run() {
         }
         const auto configured_request_limit =
             configured_limit(cfg_.max_request_bytes, cfg_.hosting_max_request_bytes);
-        const int64_t cap = configured_request_limit ? *configured_request_limit
-                                                     : (storage_ ? cfg_.externalize_threshold : -1);
+        const int64_t cap = configured_request_limit ? *configured_request_limit : -1;
         std::string body;
         bool decoded_too_large = false;
         const bool read = reader([&](const char* data, size_t size) {

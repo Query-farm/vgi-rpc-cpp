@@ -91,8 +91,11 @@ struct HttpConfig {
     // Response caps.  Negative means unbounded.
     int64_t max_response_bytes = -1;
     int64_t max_externalized_response_bytes = -1;
-    // Inline request cap, applied independently to encoded and decoded bytes.
-    // Negative means unbounded and omits the capability advertisement.
+    // Inline request cap, applied independently to encoded and decoded bytes,
+    // and advertised as `VGI-Max-Request-Bytes`.  Negative means unbounded and
+    // omits the advertisement -- with or without external storage: the
+    // externalization threshold is never advertised in its place (protocol
+    // 3.4, STATE_REF_V1.md §9).  A cap below 16384 starts with a warning.
     int64_t max_request_bytes = -1;
 
     // Externalization: payloads at or above the threshold are uploaded to the
@@ -113,7 +116,11 @@ struct HttpConfig {
     std::string externalize_compression;
     // External pointer fetch safety.  These are independent encoded and
     // decoded limits; the URL policy is evaluated before every network hop.
-    int64_t max_fetch_bytes = 256LL * 1024 * 1024;
+    // Negative (the default) means 256 MiB, raised to `max_upload_bytes` when
+    // that is set larger: the server must be able to fetch every upload it
+    // advertises.  Set explicitly below an explicit `max_upload_bytes`, the
+    // server refuses to start.
+    int64_t max_fetch_bytes = -1;
     int64_t max_decompressed_fetch_bytes = 4LL * 1024 * 1024 * 1024;
     int max_external_redirects = 5;
     std::function<void(const std::string&)> external_url_validator;
@@ -192,7 +199,11 @@ struct HttpConfig {
     // Deriving one from the other made a tight response cap silently forbid
     // large *requests* to any client that honours the advertisement. Appended,
     // like the fields above it, for positional aggregate source compatibility.
-    int64_t max_upload_bytes = int64_t{1} << 31;
+    //
+    // Never above the inbound fetch cap (protocol 3.4 fix 1): zero or negative
+    // (the default) advertises the effective `max_fetch_bytes`, and it is
+    // always advertised whenever upload URLs are.
+    int64_t max_upload_bytes = -1;
 
     // Called once with the bound port, before the accept loop starts.
     //
