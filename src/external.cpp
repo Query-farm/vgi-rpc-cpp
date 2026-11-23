@@ -229,6 +229,17 @@ std::string make_key(const std::string& prefix, const std::string& content_encod
     key += content_encoding == "zstd" ? ".arrow.zst" : ".arrow";
     return key;
 }
+
+// A random key for an object-API write (`put_object`): opaque bytes, not an
+// Arrow stream, so it says so.
+std::string make_object_key(const std::string& prefix) {
+    auto bytes = crypto::random_bytes(16);
+    std::string key = prefix;
+    if (!key.empty() && key.back() != '/') key += '/';
+    key += crypto::hex_encode(bytes.data(), bytes.size());
+    key += ".bin";
+    return key;
+}
 #endif
 
 // ---------------------------------------------------------------------------
@@ -239,7 +250,7 @@ std::string make_key(const std::string& prefix, const std::string& content_encod
 // POST /alloc, then PUT / HEAD / GET on the returned object URL.  Real
 // deployments front an object store with something equivalent, or use the
 // cloud backends below.
-class HttpExternalStorage final : public ExternalStorage {
+class HttpExternalStorage final : public ExternalStorage, public ObjectStore {
 public:
     HttpExternalStorage(std::string base_url, ExternalStorageConfig config)
         : base_url_(std::move(base_url)), config_(std::move(config)) {
@@ -264,6 +275,61 @@ public:
     }
 
     std::string fetch(const std::string& url) override {
+        return fetch_url(url, config_.max_fetch_bytes, /*object_get=*/false);
+    }
+
+    // The object API (STATE_REF_V1.md §10.1) over the fixture contract:
+    // `POST /alloc` with `purpose: "object"` plus the size and digest, then a
+    // verified PUT -- the same shape as a client's sized grant.
+    std::string put_object(const std::string& data) override {
+        const auto digest =
+            crypto::sha256(reinterpret_cast<const uint8_t*>(data.data()), data.size());
+        nlohmann::json body = nlohmann::json::object();
+        body["size"] = static_cast<int64_t>(data.size());
+        body["sha256_b64"] = base64_std(digest.data(), digest.size());
+        body["purpose"] = "object";
+        const UploadUrl urls = allocate(body);
+        if (urls.object_id.empty()) {
+            throw std::runtime_error("external storage alloc returned no object_id");
+        }
+        auto [origin, path] = split_url(urls.upload_url);
+        auto client = make_client(origin);
+        httplib::Headers headers{{"Accept-Encoding", "identity"}};
+        std::string content_type = "application/octet-stream";
+        for (const auto& [name, value] : urls.headers) {
+            std::string lower = name;
+            std::transform(lower.begin(), lower.end(), lower.begin(),
+                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            if (lower == "content-length") continue;
+            if (lower == "content-type") {
+                content_type = value;
+                continue;
+            }
+            headers.emplace(name, value);
+        }
+        auto res = client.Put(path, headers, data, content_type);
+        if (!res || (res->status != 204 && res->status != 200)) {
+            throw std::runtime_error(
+                "external storage object upload failed: " +
+                (res ? std::to_string(res->status) : std::string("no response")));
+        }
+        return urls.object_id;
+    }
+
+    std::string get(const std::string& object_id, int64_t max_bytes) override {
+        if (object_id.empty() || object_id.find('/') != std::string::npos ||
+            object_id.find('?') != std::string::npos || object_id.find('#') != std::string::npos) {
+            throw std::invalid_argument("invalid object id");
+        }
+        return fetch_url(base_url_ + "/objects/" + object_id, max_bytes, /*object_get=*/true);
+    }
+
+    // One bounded GET with per-hop URL validation and redirect handling.
+    // `object_get` is the object API's shape: the stored bytes verbatim (no
+    // Content-Encoding is requested or accepted) and a final 404 reported as
+    // ObjectMissingError rather than a generic failure.
+    std::string fetch_url(const std::string& url, int64_t max_fetch, bool object_get) {
+        if (max_fetch < 0) max_fetch = config_.max_fetch_bytes;
         std::string current = url;
         for (int redirects = 0;; ++redirects) {
             if (config_.url_validator) {
@@ -285,7 +351,8 @@ public:
             // zstd is decoded below; a stored object may carry it whatever the
             // request said, so say so rather than leave the server guessing.
             auto res = client.Get(
-                path, httplib::Headers{{"Accept-Encoding", "zstd, identity"}},
+                path,
+                httplib::Headers{{"Accept-Encoding", object_get ? "identity" : "zstd, identity"}},
                 [&](const httplib::Response& response) {
                     response_status = response.status;
                     location = response.get_header_value("Location");
@@ -294,8 +361,8 @@ public:
                 },
                 [&](const char* data, size_t length) {
                     if (is_redirect(response_status)) return true;
-                    if (length > static_cast<size_t>(config_.max_fetch_bytes) ||
-                        body.size() > static_cast<size_t>(config_.max_fetch_bytes) - length) {
+                    if (length > static_cast<size_t>(max_fetch) ||
+                        body.size() > static_cast<size_t>(max_fetch) - length) {
                         cap_exceeded = true;
                         return false;
                     }
@@ -305,7 +372,7 @@ public:
 
             if (cap_exceeded) {
                 throw std::runtime_error("external location exceeds max_fetch_bytes (" +
-                                         std::to_string(config_.max_fetch_bytes) + ")");
+                                         std::to_string(max_fetch) + ")");
             }
             if (!res) {
                 throw std::runtime_error(
@@ -324,6 +391,11 @@ public:
                 current = resolve_redirect(current, location);
                 continue;
             }
+            if (object_get && res->status == 404) {
+                throw ObjectMissingError(
+                    "storage object is gone (never uploaded, deleted, or "
+                    "expired by lifecycle)");
+            }
             if (res->status != 200) {
                 throw std::runtime_error(
                     "external location fetch failed: " + std::to_string(res->status) +
@@ -333,6 +405,15 @@ public:
             std::transform(content_encoding.begin(), content_encoding.end(),
                            content_encoding.begin(),
                            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            if (object_get) {
+                // Object bytes are stored and verified verbatim; a coding the
+                // request did not ask for would change what the digest covers.
+                if (!content_encoding.empty() && content_encoding != "identity") {
+                    throw std::runtime_error("storage object has unrequested Content-Encoding: " +
+                                             content_encoding);
+                }
+                return body;
+            }
             if (content_encoding == "zstd") {
                 return zstd_decompress_bounded(body, config_.max_decompressed_bytes);
             }
@@ -385,6 +466,11 @@ private:
             url.upload_url = allocation.value("upload_url", legacy);
             url.download_url = allocation.value("download_url", legacy);
             url.expires_at_us = expiry_us(config_.signed_url_ttl_seconds);
+            // Protocol 3.4: the id the object API and grants name the blob by.
+            // Absent from an older storage service; the grant path refuses.
+            if (auto id = allocation.find("object_id"); id != allocation.end() && id->is_string()) {
+                url.object_id = id->get<std::string>();
+            }
             // Headers the storage service signed into the PUT, if any; the
             // fixture's sized allocations name them so a client must send them.
             if (auto found = allocation.find("upload_headers");
@@ -424,7 +510,7 @@ void ensure_aws_initialized() {
     static AwsRuntime runtime;
 }
 
-class S3ExternalStorage final : public ExternalStorage {
+class S3ExternalStorage final : public ExternalStorage, public ObjectStore {
 public:
     S3ExternalStorage(std::string bucket, std::string prefix, const ExternalStorageConfig& config)
         : bucket_(std::move(bucket)),
@@ -493,7 +579,42 @@ public:
         out.download_url = presign("GET", key);
         out.expires_at_us = expiry_us(ttl_);
         out.headers.emplace("x-amz-checksum-sha256", checksum);
+        out.object_id = key;
         return out;
+    }
+
+    // STATE_REF_V1.md §10.1: a PutObject signing the length and the SHA-256,
+    // so S3 itself refuses a body that is not exactly these bytes.
+    std::string put_object(const std::string& data) override {
+        const std::string key = make_object_key(prefix_);
+        const auto digest =
+            crypto::sha256(reinterpret_cast<const uint8_t*>(data.data()), data.size());
+        Aws::S3::Model::PutObjectRequest request;
+        request.SetBucket(bucket_);
+        request.SetKey(key);
+        request.SetContentType("application/octet-stream");
+        request.SetContentLength(static_cast<long long>(data.size()));
+        request.SetChecksumSHA256(base64_std(digest.data(), digest.size()));
+        auto body = Aws::MakeShared<Aws::StringStream>("vgi_rpc");
+        body->write(data.data(), static_cast<std::streamsize>(data.size()));
+        request.SetBody(body);
+        auto outcome = client_->PutObject(request);
+        if (!outcome.IsSuccess()) {
+            throw std::runtime_error("S3 object upload failed: " +
+                                     std::string(outcome.GetError().GetMessage()));
+        }
+        return key;
+    }
+
+    // A presigned GET of the key, fetched through the same bounded, validated
+    // HTTP path as every other storage read.  S3 answers 404 for a key that
+    // is gone, which that path reports as ObjectMissingError.
+    std::string get(const std::string& object_id, int64_t max_bytes) override {
+        if (object_id.empty() || object_id.size() > 1024) {
+            throw std::invalid_argument("invalid object id");
+        }
+        const std::string url = presign("GET", object_id);
+        return HttpExternalStorage(url, config_).fetch_url(url, max_bytes, /*object_get=*/true);
     }
 
 private:
@@ -522,7 +643,7 @@ private:
 
 #ifdef VGI_RPC_WITH_GCS
 
-class GcsExternalStorage final : public ExternalStorage {
+class GcsExternalStorage final : public ExternalStorage, public ObjectStore {
 public:
     GcsExternalStorage(std::string bucket, std::string prefix, const ExternalStorageConfig& config)
         : bucket_(std::move(bucket)),
@@ -565,7 +686,30 @@ public:
         out.expires_at_us = expiry_us(ttl_);
         out.headers.emplace("Content-Type", "application/octet-stream");
         out.headers.emplace("x-goog-content-length-range", range);
+        out.object_id = key;
         return out;
+    }
+
+    // STATE_REF_V1.md §10.1.  GCS cannot check a SHA-256 at storage; the
+    // client library sends the object's MD5 and CRC32C, which GCS verifies,
+    // and every reader verifies the SHA-256 it was promised.
+    std::string put_object(const std::string& data) override {
+        const std::string key = make_object_key(prefix_);
+        auto metadata = client_.InsertObject(bucket_, key, data);
+        if (!metadata) {
+            throw std::runtime_error("GCS object upload failed: " + metadata.status().message());
+        }
+        return key;
+    }
+
+    // A V4-signed GET of the key through the bounded, validated HTTP path;
+    // a 404 is ObjectMissingError.
+    std::string get(const std::string& object_id, int64_t max_bytes) override {
+        if (object_id.empty() || object_id.size() > 1024) {
+            throw std::invalid_argument("invalid object id");
+        }
+        const std::string url = sign("GET", object_id);
+        return HttpExternalStorage(url, config_).fetch_url(url, max_bytes, /*object_get=*/true);
     }
 
 private:

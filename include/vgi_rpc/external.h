@@ -17,6 +17,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -36,6 +37,46 @@ struct UploadUrl {
     /// Content-Length: the client sends exactly the declared size with a plain
     /// Content-Length, which the backend signature covers.
     std::map<std::string, std::string> headers;
+    /// The storage id of the object this PUT creates (protocol 3.4,
+    /// STATE_REF_V1.md §10.2): the S3/GCS key, or the fake storage's blob id.
+    /// `ObjectStore::get` fetches it back by this id.  Every provider MUST set
+    /// it; the server refuses a grant whose provider returned none.
+    std::string object_id;
+};
+
+/// `ObjectStore::get` found no object under the id: never uploaded, deleted,
+/// or expired by the bucket lifecycle.  Distinguishable from a transient
+/// failure, which is any other exception.
+class VGI_RPC_EXPORT ObjectMissingError : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
+
+/// The object API of protocol 3.4 (STATE_REF_V1.md §10.1): store bytes once
+/// and read them back by id, with the download minted server-side.
+///
+/// A separate interface beside `ExternalStorage`, not new members of it, so a
+/// third-party `ExternalStorage` keeps compiling.  "Storage is configured" for
+/// argument references means the server's storage implements this; every
+/// in-tree backend does.
+class VGI_RPC_EXPORT ObjectStore {
+public:
+    virtual ~ObjectStore() = default;
+
+    /// Store `data` as one `rpc`-purpose object and return its id (an S3/GCS
+    /// key, the fake storage's blob id), at most 1024 bytes of UTF-8.  The
+    /// write carries the size and SHA-256 of `data` where the backend can
+    /// verify them.  Objects carry no TTL: operators set a bucket lifecycle
+    /// rule of at least one day on the prefix.
+    virtual std::string put_object(const std::string& data) = 0;
+
+    /// Fetch the object `object_id` names, refusing one larger than
+    /// `max_bytes` (the server's `max_fetch_bytes`).  The download is minted
+    /// here from the id and goes through the same URL validation as every
+    /// other storage fetch.  Throws `ObjectMissingError` when storage reports
+    /// the object absent; any other failure throws something else.  Callers
+    /// verify size and SHA-256 themselves.
+    virtual std::string get(const std::string& object_id, int64_t max_bytes) = 0;
 };
 
 // Where a backend puts objects, and how long the URLs it hands out live.
