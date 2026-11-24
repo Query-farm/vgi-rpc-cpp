@@ -3,6 +3,8 @@
 
 #include "vgi_rpc/server.h"
 #include "vgi_rpc/metadata.h"
+#include "vgi_rpc/protocol_versions.h"
+#include "vgi_rpc/shm.h"
 #include "vgi_rpc/reflection.h"
 #include "vgi_rpc/token_identity.h"
 
@@ -222,6 +224,12 @@ ServerBuilder& ServerBuilder::protocol_version(std::string version) {
     return *this;
 }
 
+ServerBuilder& ServerBuilder::protocol_version_range(std::string protocol, std::string range) {
+    check_not_built("protocol_version_range");
+    version_ranges_.emplace_back(std::move(protocol), std::move(range));
+    return *this;
+}
+
 ServerBuilder& ServerBuilder::on_serve_start(std::function<void(TransportKind)> hook) {
     on_serve_start_ = std::move(hook);
     return *this;
@@ -303,11 +311,6 @@ std::unique_ptr<Server> ServerBuilder::build() {
     primary.name = primary_.name_;
     primary.version = primary_.version_;
     primary.methods = method_map(std::move(primary_.methods_));
-    if (transport_options_enabled_) {
-        // Framework surface, not service surface: `IsApplicationMethod` keeps
-        // it out of the protocol hash and out of every description.
-        register_transport_options(primary.methods, server_id);
-    }
     protocols.push_back(std::move(primary));
     for (auto& extra : extra_protocols_) {
         ServedProtocol hosted;
@@ -315,6 +318,39 @@ std::unique_ptr<Server> ServerBuilder::build() {
         hosted.version = std::move(extra.version_);
         hosted.methods = method_map(std::move(extra.methods_));
         protocols.push_back(std::move(hosted));
+    }
+
+    // Version windows (PROTOCOL_VERSIONS_V1.md §5): exactly the declared
+    // major.minor unless overridden.  A malformed declared version is left for
+    // the constructor's own refusal, which names it.
+    for (auto& protocol : protocols) {
+        if (protocol.version.empty()) continue;
+        try {
+            protocol.version_range = VersionRange::exactly(protocol.version).to_string();
+        } catch (const std::invalid_argument&) {
+        }
+    }
+    for (const auto& [name, range] : version_ranges_) {
+        auto it = std::find_if(protocols.begin(), protocols.end(),
+                               [&](const ServedProtocol& p) { return p.name == name; });
+        if (it == protocols.end() || it->version.empty()) {
+            throw std::invalid_argument(
+                "ServerBuilder::protocol_version_range: '" + name +
+                "' is not a hosted protocol that declares a protocol_version");
+        }
+        it->version_range = VersionRange::parse(range).to_string();
+    }
+    std::vector<std::pair<std::string, VersionRange>> windows;
+    for (const auto& protocol : protocols) {
+        if (!protocol.version_range.empty()) {
+            windows.emplace_back(protocol.name, VersionRange::parse(protocol.version_range));
+        }
+    }
+    const std::string advertised_versions = format_versions(windows);
+    if (transport_options_enabled_) {
+        // Framework surface, not service surface: `IsApplicationMethod` keeps
+        // it out of the protocol hash and out of every description.
+        register_transport_options(protocols.front().methods, server_id, advertised_versions);
     }
 
     // Read at build, so a malformed key refuses to start the worker rather
@@ -388,67 +424,95 @@ std::string Server::protocol_version_error(
     const std::shared_ptr<arrow::KeyValueMetadata>& custom_metadata) const {
     // Gated against the binding the request resolved to, never the primary:
     // a protocol that declared no version enforces nothing, whatever the
-    // primary declares (WIRE_PROTOCOL.md §13).
-    const std::string& server_version = protocol.version;
-    if (server_version.empty()) return {};
-    // The constructor rejected anything unparseable, so the server's own
-    // version is known good by the time a request can reach this.
-    const auto expected = *parse_semver(server_version);
-
-    const std::string header = "VGI client/worker protocol_version mismatch for protocol '" +
-                               protocol.name + "'.\n  Client: ";
-    const auto trailer = "\n  Server: " + server_version + "\n  Direction: ";
+    // primary declares (WIRE_PROTOCOL.md §13).  The window is the binding's
+    // (PROTOCOL_VERSIONS_V1.md §5): exactly its declared major.minor unless
+    // the server overrode it.
+    if (protocol.version.empty() || protocol.version_range.empty()) return {};
+    const VersionRange window = VersionRange::parse(protocol.version_range);
+    const std::string& name = protocol.name;
+    const std::string server_window = "this server supports " + name + " " + window.to_string();
+    const std::string prefix = std::string(ERROR_KIND_PROTOCOL_VERSION_UNSUPPORTED) + ": ";
 
     const auto index = custom_metadata ? custom_metadata->FindKey(keys::PROTOCOL_VERSION) : -1;
     if (index < 0) {
-        return header + "<not declared>" + trailer + "the client did not send a " +
-               std::string(keys::PROTOCOL_VERSION) +
-               " metadata key. This is either a vgi-rpc framework bug or a non-VGI client "
-               "connecting to a VGI worker.";
+        return prefix + "the client did not send " + std::string(keys::PROTOCOL_VERSION) + " for " +
+               name + "; " + server_window +
+               ". This is either a vgi-rpc framework bug or a non-VGI client connecting to a "
+               "VGI worker.";
     }
-
     const auto& declared = custom_metadata->value(index);
     const auto actual = parse_semver(declared);
     if (!actual) {
-        return header + declared + trailer +
-               "client sent a malformed protocol_version. Expected canonical semver "
-               "MAJOR.MINOR.PATCH.";
+        return prefix + "the client sent a malformed protocol_version '" + declared + "' for " +
+               name + " (expected canonical semver MAJOR.MINOR.PATCH); " + server_window + ".";
     }
-    // Exact major+minor match; patch is ignored, since the surface does not
-    // change within one.
-    const std::pair actual_surface{(*actual)[0], (*actual)[1]};
-    const std::pair expected_surface{expected[0], expected[1]};
-    if (actual_surface == expected_surface) return {};
+    const MajorMinor client_mm{(*actual)[0], (*actual)[1]};
+    if (window.contains(client_mm)) return {};
 
-    return header + declared + trailer +
-           (actual_surface < expected_surface
-                ? "client is too old; upgrade the VGI extension/client to a version supporting "
-                  "protocol_version " +
-                      server_version + "."
-                : "server is too old; upgrade the VGI worker to a version supporting "
-                  "protocol_version " +
-                      declared + ".");
+    // The client's own window is informational: quoted, never a reason.
+    std::string supports;
+    const auto client_index = custom_metadata->FindKey(keys::PROTOCOL_VERSIONS_CLIENT);
+    if (client_index >= 0) {
+        const auto parsed = parse_versions(custom_metadata->value(client_index));
+        if (auto it = parsed.find(name); it != parsed.end()) {
+            supports = " (supports " + it->second.to_string() + ")";
+        }
+    }
+    const std::string speaks =
+        "client speaks " + name + " " + format_major_minor(client_mm) + supports;
+    const std::string direction =
+        client_mm < window.min
+            ? "The client is too old (this server is too new for it). Upgrade the client, or use "
+              "a worker that supports " +
+                  name + " " + format_major_minor(client_mm) + "."
+            : "The server is too old (the client is too new for it). Upgrade the worker, or use "
+              "a client that supports " +
+                  name + " " + format_major_minor(window.max) + ".";
+    return prefix + speaks + "; " + server_window + ". " + direction;
 }
 
 ErrorExtras Server::protocol_version_extras(
     const ServedProtocol& protocol,
     const std::shared_ptr<arrow::KeyValueMetadata>& custom_metadata) const {
     std::string declared = "<none>";
+    std::string client_versions;
     if (custom_metadata) {
-        const auto index = custom_metadata->FindKey(keys::PROTOCOL_VERSION);
-        if (index >= 0) declared = custom_metadata->value(index);
+        if (const auto index = custom_metadata->FindKey(keys::PROTOCOL_VERSION); index >= 0) {
+            declared = custom_metadata->value(index);
+        }
+        if (const auto index = custom_metadata->FindKey(keys::PROTOCOL_VERSIONS_CLIENT);
+            index >= 0) {
+            client_versions = custom_metadata->value(index);
+        }
     }
-    // With several bindings, "Server: 2.0.0" alone does not say which server;
-    // the violation names the gated protocol.
+    // With several bindings, a window alone does not say which server; the
+    // violation names the gated protocol.
     PreconditionFailure failure;
-    failure.violations.push_back(PreconditionViolation{"protocol_version", protocol.name,
-                                                       "client declares " + declared +
-                                                           ", server requires " + protocol.version +
-                                                           "; major and minor must match"});
+    failure.violations.push_back(PreconditionViolation{
+        "protocol_version", protocol.name,
+        "client declares " + declared + ", server supports " +
+            (protocol.version_range.empty() ? std::string("<unknown>") : protocol.version_range)});
+    ErrorInfo info;
+    info.metadata[keys::PROTOCOL_VERSIONS] = protocol_versions_;
+    if (!client_versions.empty()) info.metadata[keys::PROTOCOL_VERSIONS_CLIENT] = client_versions;
     ErrorExtras extras;
     extras.code = code_name(Code::FAILED_PRECONDITION);
-    extras.details = nlohmann::json::array({failure.to_json()});
+    extras.details = nlohmann::json::array({failure.to_json(), info.to_json()});
     return extras;
+}
+
+AnnotatedBatch Server::protocol_version_refusal(
+    const ServedProtocol& protocol, const std::shared_ptr<arrow::KeyValueMetadata>& custom_metadata,
+    const std::string& reason, const std::string& request_id) const {
+    auto batch = Result::error(empty_schema(), "ProtocolVersionError", reason, server_id_,
+                               request_id, ERROR_KIND_PROTOCOL_VERSION_UNSUPPORTED,
+                               protocol_version_extras(protocol, custom_metadata))
+                     .annotated_batch();
+    auto md = batch.custom_metadata ? batch.custom_metadata->Copy()
+                                    : std::make_shared<arrow::KeyValueMetadata>();
+    md->Append(keys::PROTOCOL_VERSIONS, protocol_versions_);
+    batch.custom_metadata = std::move(md);
+    return batch;
 }
 
 const ServedProtocol* Server::find_protocol(const std::string& name) const noexcept {
@@ -512,6 +576,24 @@ Server::Server(std::vector<ServedProtocol> protocols, std::string server_id,
     // them.
     for (auto& protocol : protocols_) {
         protocol.binding = {protocol.name, binding_hash_or_throw(protocol.name, protocol.methods)};
+    }
+    // Exactly the gated protocols, in hosting order (PROTOCOL_VERSIONS_V1.md
+    // §4.1 and decision 2): reflection and identity declare no version.
+    {
+        std::vector<std::pair<std::string, VersionRange>> windows;
+        for (const auto& protocol : protocols_) {
+            if (protocol.version.empty()) continue;
+            const std::string range = protocol.version_range.empty()
+                                          ? VersionRange::exactly(protocol.version).to_string()
+                                          : protocol.version_range;
+            windows.emplace_back(protocol.name, VersionRange::parse(range));
+        }
+        for (auto& protocol : protocols_) {
+            if (!protocol.version.empty() && protocol.version_range.empty()) {
+                protocol.version_range = VersionRange::exactly(protocol.version).to_string();
+            }
+        }
+        protocol_versions_ = format_versions(windows);
     }
     reflection_binding_ = {kReflectionProtocolName,
                            binding_hash_or_throw(kReflectionProtocolName, ReflectionMethods())};

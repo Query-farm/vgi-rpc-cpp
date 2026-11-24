@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "vgi_rpc/client.h"
+#include "vgi_rpc/protocol_versions.h"
 
 #include "reflection_client_internal.h"
 
@@ -74,8 +75,8 @@ bool is_reserved_method(const std::string& method) {
 
 std::shared_ptr<arrow::KeyValueMetadata> request_metadata(
     const std::string& method, const std::string& protocol, const std::string& protocol_version,
-    const std::shared_ptr<arrow::KeyValueMetadata>& extras,
-    const std::shared_ptr<ShmSegment>& shm) {
+    const std::shared_ptr<arrow::KeyValueMetadata>& extras, const std::shared_ptr<ShmSegment>& shm,
+    const std::string& client_versions = std::string()) {
     if (method.empty()) throw std::invalid_argument("RPC method must not be empty");
     // Every application request names its protocol (WIRE_PROTOCOL.md §3.1);
     // there is no unrouted fallback.  Refused here, before anything is
@@ -104,6 +105,10 @@ std::shared_ptr<arrow::KeyValueMetadata> request_metadata(
     // still sends nothing, which is what an unversioned protocol expects.
     if (!protocol_version.empty()) {
         replace_metadata(metadata, keys::PROTOCOL_VERSION, protocol_version);
+    }
+    // Informational (PROTOCOL_VERSIONS_V1.md §4.2).
+    if (!client_versions.empty()) {
+        replace_metadata(metadata, keys::PROTOCOL_VERSIONS_CLIENT, client_versions);
     }
     if (shm) {
         std::string name = shm->name();
@@ -182,7 +187,22 @@ public:
         if (options.external_http) {
             external = std::make_unique<ClientExternalHttp>(*options.external_http);
         }
+        if (!options.protocol.empty() && !options.protocol_version.empty()) {
+            // A non-semver version is sent as configured and not negotiated,
+            // as before; a window inconsistent with it is a configuration error.
+            try {
+                parse_major_minor(options.protocol_version);
+                versioning = ClientVersioning::make(options.protocol, options.protocol_version,
+                                                    options.protocol_version_range);
+            } catch (const std::invalid_argument&) {
+                if (!options.protocol_version_range.empty()) throw;
+            }
+        }
     }
+
+    std::optional<ClientVersioning> versioning;
+    EndpointNegotiation negotiation;
+    bool probed = false;
 
     void reserve_call() {
         std::lock_guard<std::mutex> lock(mutex);
@@ -663,8 +683,8 @@ AnnotatedBatch RpcClient::call_unary(const std::string& method,
                                      const std::shared_ptr<arrow::RecordBatch>& params,
                                      std::shared_ptr<arrow::KeyValueMetadata> metadata) {
     if (!params) throw std::invalid_argument("RPC params batch must not be null");
-    auto request_md = request_metadata(method, impl_->options.protocol,
-                                       impl_->options.protocol_version, metadata, impl_->shm);
+    auto request_md = request_metadata(method, impl_->options.protocol, negotiated_version(method),
+                                       metadata, impl_->shm, client_versions(method));
     CallReservation reservation(impl_);
     try {
         write_ipc_stream(impl_->output, params->schema(),
@@ -673,7 +693,8 @@ AnnotatedBatch RpcClient::call_unary(const std::string& method,
         auto response = read_substream(impl_);
         if (!response) throw std::runtime_error("RPC response contains no data batch");
         return std::move(*response);
-    } catch (const RpcException&) {
+    } catch (const RpcException& error) {
+        observe_refusal(error);
         throw;
     } catch (...) {
         impl_->abort_transport();
@@ -687,8 +708,8 @@ ClientStream RpcClient::open_stream(const std::string& method,
                                     std::shared_ptr<arrow::KeyValueMetadata> metadata,
                                     ClientStreamKind kind) {
     if (!params) throw std::invalid_argument("RPC params batch must not be null");
-    auto request_md = request_metadata(method, impl_->options.protocol,
-                                       impl_->options.protocol_version, metadata, impl_->shm);
+    auto request_md = request_metadata(method, impl_->options.protocol, negotiated_version(method),
+                                       metadata, impl_->shm, client_versions(method));
     CallReservation reservation(impl_);
     try {
         write_ipc_stream(impl_->output, params->schema(),
@@ -771,6 +792,12 @@ AnnotatedBatch RpcClient::call_reflection(const std::string& method,
         VGI_RPC_THROW_NOT_OK(impl_->output->Flush());
         auto response = read_substream(impl_);
         if (!response) throw std::runtime_error("RPC response contains no data batch");
+        // Reflection results carry the server's windows on every transport
+        // (PROTOCOL_VERSIONS_V1.md §4.1).
+        if (response->custom_metadata) {
+            const auto index = response->custom_metadata->FindKey(keys::PROTOCOL_VERSIONS);
+            if (index >= 0) impl_->negotiation.observe(response->custom_metadata->value(index));
+        }
         return std::move(*response);
     } catch (const RpcException&) {
         throw;
@@ -778,6 +805,33 @@ AnnotatedBatch RpcClient::call_reflection(const std::string& method,
         impl_->abort_transport();
         throw;
     }
+}
+
+std::string RpcClient::negotiated_version(const std::string& method) {
+    if (!impl_->versioning || is_reserved_method(method)) return impl_->options.protocol_version;
+    // A client that speaks one version has nothing to choose and skips the
+    // probe (decision 11): 3.4 <-> 3.4 traffic is unchanged.  A wider window
+    // reads the server's windows from reflection first; a server without
+    // reflection leaves the connection unlearned.
+    if (!impl_->probed && impl_->versioning->range.min != impl_->versioning->range.max) {
+        impl_->probed = true;
+        try {
+            (void)call_reflection("list_protocols", make_empty_batch(empty_schema()));
+        } catch (const RpcException&) {
+        }
+    }
+    return impl_->negotiation.wire_version(*impl_->versioning);
+}
+
+std::string RpcClient::client_versions(const std::string& method) const {
+    if (!impl_->versioning || is_reserved_method(method)) return {};
+    return impl_->versioning->advertised();
+}
+
+void RpcClient::observe_refusal(const RpcException& error) {
+    if (!impl_->versioning) return;
+    impl_->negotiation.observe_refusal(impl_->versioning->protocol, error.error_kind(),
+                                       error.what(), error);
 }
 
 ProtocolListing RpcClient::protocol_listing() {

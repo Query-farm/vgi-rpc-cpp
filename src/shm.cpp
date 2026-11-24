@@ -511,7 +511,14 @@ std::shared_ptr<arrow::RecordBatch> maybe_write_to_shm(
 
 void register_transport_options(std::unordered_map<std::string, MethodInfo>& methods,
                                 const std::string& server_id) {
+    register_transport_options(methods, server_id, std::nullopt);
+}
+
+void register_transport_options(std::unordered_map<std::string, MethodInfo>& methods,
+                                const std::string& server_id,
+                                const std::optional<std::string>& protocol_versions) {
     auto md = std::make_shared<arrow::KeyValueMetadata>();
+    if (protocol_versions) md->Append("vgi_rpc.protocol_versions", *protocol_versions);
     // Advertised false on a build that cannot map a segment at all, so a peer
     // stays on the pipe instead of writing pointers we could never resolve.
     md->Append(keys::TRANSPORT_SHM, shm_available() ? "true" : "false");

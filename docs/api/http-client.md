@@ -55,6 +55,23 @@ before anything is sent. Reserved `__name__` methods (`__upload_url__`, ...)
 stay flat by design, and reflection, `capabilities()` and health need no
 protocol.
 
+## Protocol version negotiation
+
+`HttpClientConfig::protocol_version` is the newest version the client speaks;
+`protocol_version_range` (`MIN-MAX`, builder `protocol_version_range()`) widens
+the window downward. The client negotiates per endpoint (vgi-rpc
+`PROTOCOL_VERSIONS_V1.md` §6): it reads `VGI-Protocol-Versions` from every
+response (a present header replaces what it learned) and the windows a
+`protocol_version_unsupported` refusal carries, then speaks the highest common
+version with its own patch (`3.5.2` → `3.4.2`). Before it has seen anything it
+sends its newest version. A server without the header is treated as speaking
+the version its refusal names (`Server: X.Y.Z`), else the client's own. The
+client sends its window as `VGI-Client-Protocol-Versions` and
+`vgi_rpc.protocol_versions_client`. A refused call is surfaced, not retried
+(no method is declared idempotent here); the next call speaks the learned
+version. Once it knows no version is common, a call throws
+`NoCommonVersionError` (kind `protocol_version_unsupported`) without sending.
+
 ## HTTPS and authentication
 
 `https://` uses OpenSSL with certificate and hostname verification enabled.

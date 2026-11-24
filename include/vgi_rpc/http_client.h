@@ -178,6 +178,16 @@ struct HttpClientConfig {
     // multi-service routing serves. Appended, again, for positional aggregate
     // source compatibility.
     std::string protocol;
+    // The window this client supports for `protocol` (`MIN-MAX`); empty means
+    // exactly `protocol_version`'s major.minor.  `protocol_version` stays the
+    // newest version spoken; the client negotiates per endpoint
+    // (PROTOCOL_VERSIONS_V1.md §6): it learns the server's windows from every
+    // response's `VGI-Protocol-Versions` and from refusals, speaks the highest
+    // common version (with its own patch), advertises this window as
+    // `VGI-Client-Protocol-Versions`, and fails before sending, with
+    // `NoCommonVersionError`, once it knows no version is common.  Appended
+    // for positional aggregate source compatibility.
+    std::string protocol_version_range;
 };
 
 /// One HTTP/1.1 exchange carried over an authenticated `iroh-http/2` stream.
@@ -296,6 +306,7 @@ public:
     /// Routing key of the protocol to address; see HttpClientConfig::protocol.
     HttpClientBuilder& protocol(std::string protocol);
     HttpClientBuilder& protocol_version(std::string version);
+    HttpClientBuilder& protocol_version_range(std::string range);
     HttpClientBuilder& header(std::string name, std::string value);
     HttpClientBuilder& compression_level(std::optional<int> level);
     HttpClientBuilder& accepted_max_response_bytes(int64_t max_bytes);

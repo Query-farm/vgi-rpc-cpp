@@ -25,6 +25,7 @@
 #include <vgi_rpc/client.h>
 #include <vgi_rpc/errors.h>
 #include <vgi_rpc/http_client.h>
+#include <vgi_rpc/protocol_versions.h>
 
 #include "../src/reflection_client_internal.h"
 
@@ -853,4 +854,69 @@ TEST_CASE("older servers' not-hosted answers are classified, nothing else is",
     CHECK_FALSE(reflection_not_hosted("", "", "RpcError"));
     CHECK_FALSE(reflection_not_hosted("internal", "INTERNAL", "RuntimeError"));
     CHECK_FALSE(reflection_not_hosted("", "UNAVAILABLE", "AuthUnavailableError"));
+}
+
+TEST_CASE("RpcClient negotiates the protocol version over a byte stream",
+          "[reflection][protocol-versions]") {
+    const auto server = GENERATE(Server::CPP, Server::PYTHON);
+    CAPTURE(server_name(server));
+    SKIP_UNLESS_AVAILABLE(server);
+    int to_child = -1;
+    int from_child = -1;
+    const pid_t pid =
+        spawn_process(server_argv(server, Transport::PIPE, ""), &to_child, &from_child);
+    {
+        std::atomic<int64_t> written{0};
+        std::atomic<int64_t> read{0};
+        auto output = std::make_shared<CountingOutput>(to_child, &written);
+        auto input = std::make_shared<CountingInput>(from_child, &read);
+        // A newer client with a window reaching back to the server's version:
+        // it probes list_protocols, learns the server's window and speaks the
+        // common version with its own patch (PROTOCOL_VERSIONS_V1.md §6).
+        RpcClientOptions options = raw_options();
+        const auto server_mm = parse_major_minor(options.protocol_version);
+        options.protocol_version =
+            std::to_string(server_mm.first) + "." + std::to_string(server_mm.second + 1) + ".7";
+        options.protocol_version_range = format_major_minor(server_mm) + "-" +
+                                         std::to_string(server_mm.first) + "." +
+                                         std::to_string(server_mm.second + 1);
+        RpcClient client(ClientTransport::from_streams(input, output), options);
+        CHECK(string_result(client.call_unary("echo_string", string_params("n"))) == "n");
+        client.close();
+    }
+    reap(pid);
+}
+
+TEST_CASE("RpcClient fails before sending once no protocol version is common",
+          "[reflection][protocol-versions]") {
+    const auto server = GENERATE(Server::CPP, Server::PYTHON);
+    CAPTURE(server_name(server));
+    SKIP_UNLESS_AVAILABLE(server);
+    int to_child = -1;
+    int from_child = -1;
+    const pid_t pid =
+        spawn_process(server_argv(server, Transport::PIPE, ""), &to_child, &from_child);
+    {
+        std::atomic<int64_t> written{0};
+        std::atomic<int64_t> read{0};
+        auto output = std::make_shared<CountingOutput>(to_child, &written);
+        auto input = std::make_shared<CountingInput>(from_child, &read);
+        RpcClientOptions options = raw_options();
+        options.protocol_version = "99.0.0";
+        RpcClient client(ClientTransport::from_streams(input, output), options);
+        // A single-version client sends without probing and is refused...
+        try {
+            (void)client.call_unary("echo_string", string_params("x"));
+            FAIL("a 99.0 client was accepted");
+        } catch (const RpcException& error) {
+            CHECK(error.error_kind() == ERROR_KIND_PROTOCOL_VERSION_UNSUPPORTED);
+            CHECK(std::string(error.what()).find("too new") != std::string::npos);
+        }
+        // ...and, having learned the server's window, fails before sending.
+        const int64_t written_before = written.load();
+        CHECK_THROWS_AS(client.call_unary("echo_string", string_params("x")), NoCommonVersionError);
+        CHECK(written.load() == written_before);
+        client.close();
+    }
+    reap(pid);
 }

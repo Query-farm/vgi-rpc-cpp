@@ -51,6 +51,7 @@ vgi_rpc_add_test(client_external_test)
 vgi_rpc_add_test(external_ref_test)
 vgi_rpc_add_test(upload_url_test)
 vgi_rpc_add_test(vendor_test)
+vgi_rpc_add_test(protocol_versions_test)
 if(NOT WIN32)
     # Slow-but-progressing storage transfers finish; stalls fail fast.
     vgi_rpc_add_test(storage_timeout_test)

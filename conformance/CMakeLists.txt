@@ -11,3 +11,10 @@ target_link_libraries(conformance_worker PRIVATE vgi_rpc)
 # that pair and only that pair.
 add_executable(conformance_client_driver conformance_client_driver.cpp)
 target_link_libraries(conformance_client_driver PRIVATE vgi_rpc)
+
+# The `conformance_negotiating_client` runner hook (PROTOCOL_VERSIONS_V1.md §9):
+# this port's HTTP client negotiating protocol versions against a scripted
+# reference server.  Its own binary because the client-driver harness stamps
+# vgi_rpc.protocol_version itself, which is the thing under test.
+add_executable(conformance_negotiating_client conformance_negotiating_client.cpp)
+target_link_libraries(conformance_negotiating_client PRIVATE vgi_rpc)

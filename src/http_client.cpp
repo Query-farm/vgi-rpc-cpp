@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "vgi_rpc/http_client.h"
+#include "vgi_rpc/protocol_versions.h"
 
 #include "vgi_rpc/arrow_utils.h"
 #include "vgi_rpc/crypto.h"
@@ -127,8 +128,8 @@ bool is_reserved_method(const std::string& method) {
 
 std::shared_ptr<arrow::KeyValueMetadata> request_metadata(
     const std::shared_ptr<arrow::KeyValueMetadata>& original, const std::string& method,
-    const std::string& protocol, const std::string& protocol_version,
-    const std::string& request_id) {
+    const std::string& protocol, const std::string& protocol_version, const std::string& request_id,
+    const std::string& client_versions = std::string()) {
     // Every application request names its protocol (WIRE_PROTOCOL.md §3.1),
     // in the path and in the metadata; there is no flat fallback.  Refused
     // before anything is sent.  Reserved `__name__` methods are server-level
@@ -159,6 +160,11 @@ std::shared_ptr<arrow::KeyValueMetadata> request_metadata(
     if (!is_reserved_method(method)) replace_metadata(metadata, keys::PROTOCOL, protocol);
     if (!protocol_version.empty()) {
         replace_metadata(metadata, keys::PROTOCOL_VERSION, protocol_version);
+    }
+    // Informational (PROTOCOL_VERSIONS_V1.md §4.2): the server logs and quotes
+    // it, never refuses on it.
+    if (!client_versions.empty()) {
+        replace_metadata(metadata, keys::PROTOCOL_VERSIONS_CLIENT, client_versions);
     }
     return metadata;
 }
@@ -1114,6 +1120,18 @@ public:
             external_max_upload_bytes = external_options->max_upload_bytes;
             external_http = std::make_unique<ClientExternalHttp>(*external_options);
         }
+        if (!config.protocol.empty() && !config.protocol_version.empty()) {
+            // A window that does not end at the newest version is a
+            // configuration error; a version that is not semver is sent as
+            // configured and not negotiated, as before.
+            try {
+                parse_major_minor(config.protocol_version);
+                versioning = ClientVersioning::make(config.protocol, config.protocol_version,
+                                                    config.protocol_version_range);
+            } catch (const std::invalid_argument&) {
+                if (!config.protocol_version_range.empty()) throw;
+            }
+        }
         if (config.max_request_bytes <= 0 || config.max_response_bytes < 0 ||
             config.max_encoded_response_bytes < 0 || config.max_decoded_response_bytes < 0) {
             throw std::invalid_argument(
@@ -1441,6 +1459,10 @@ public:
             headers.emplace(kAcceptMaxResponseBytesHeader,
                             std::to_string(advertised_max_response_bytes));
             headers.emplace("X-Request-ID", request_id);
+            if (versioning) {
+                headers.erase(CLIENT_PROTOCOL_VERSIONS_HEADER);
+                headers.emplace(CLIENT_PROTOCOL_VERSIONS_HEADER, versioning->advertised());
+            }
             std::string encoded;
             const std::string* payload = &body;
             if (compress) {
@@ -1557,6 +1579,12 @@ public:
                     "encoded HTTP RPC response exceeds max_encoded_response_bytes (" +
                         std::to_string(max_encoded_response_bytes) + ")",
                     0, method, request_id);
+            }
+            // Learned from every response, refusals included, before anything
+            // below can throw: a present header replaces what was cached
+            // (PROTOCOL_VERSIONS_V1.md §6).
+            if (wire_response.has_header(PROTOCOL_VERSIONS_HEADER)) {
+                negotiation.observe(wire_response.get_header_value(PROTOCOL_VERSIONS_HEADER));
             }
             if (wire_response.get_header_value_count(kAcceptMaxResponseBytesSupportHeader) != 1 ||
                 wire_response.get_header_value(kAcceptMaxResponseBytesSupportHeader) != "true") {
@@ -2151,8 +2179,20 @@ public:
     }
 
     HttpClientConfig config;
+    std::optional<ClientVersioning> versioning;
+    mutable EndpointNegotiation negotiation;
 
     ClientExternalHttp* external() const noexcept { return external_http.get(); }
+
+    // The `vgi_rpc.protocol_version` to send: negotiated per endpoint when the
+    // configured version is canonical semver, otherwise exactly as configured.
+    // Throws NoCommonVersionError before sending once no version is common.
+    std::string negotiated_version() const {
+        return versioning ? negotiation.wire_version(*versioning) : config.protocol_version;
+    }
+    std::string client_versions() const {
+        return versioning ? versioning->advertised() : std::string();
+    }
 
     DecodedResponse decode(const BoundedHttpResponse& response, ResponseShape shape,
                            bool has_header, ClientExternalHttp* external_resolver,
@@ -2171,7 +2211,16 @@ public:
             auto decoded = decode_response(response, config, shape, has_header, external_resolver);
             commit_sticky_response(response, sticky_session);
             return decoded;
-        } catch (const RpcRemoteError&) {
+        } catch (const RpcRemoteError& error) {
+            // A version refusal names the server's windows (or, from a server
+            // released before negotiation, its one version): the next call
+            // speaks what it learned.  A refused call is not retried -- only
+            // an idempotent one may be, and none is declared here
+            // (PROTOCOL_VERSIONS_V1.md §6, decision 9).
+            if (versioning) {
+                negotiation.observe_refusal(versioning->protocol, error.error_kind(), error.what(),
+                                            error);
+            }
             // A valid Arrow exception envelope is a protocol-valid response;
             // it may intentionally rotate or close the sticky session.
             commit_sticky_response(response, sticky_session);
@@ -2434,6 +2483,11 @@ HttpClientBuilder& HttpClientBuilder::protocol(std::string protocol) {
     return *this;
 }
 
+HttpClientBuilder& HttpClientBuilder::protocol_version_range(std::string range) {
+    impl_->config.protocol_version_range = std::move(range);
+    return *this;
+}
+
 HttpClientBuilder& HttpClientBuilder::protocol_version(std::string version) {
     if (!impl_) throw std::logic_error("HttpClientBuilder is moved from");
     impl_->config.protocol_version = std::move(version);
@@ -2574,8 +2628,9 @@ AnnotatedBatch HttpClient::call(const std::string& method, const AnnotatedBatch&
     validate_method(method);
     if (!state_) throw HttpClientError("HttpClient is moved from");
     const std::string request_id = logical_request_id(options);
-    const auto metadata = request_metadata(request.custom_metadata, method, state_->config.protocol,
-                                           state_->config.protocol_version, request_id);
+    const auto metadata =
+        request_metadata(request.custom_metadata, method, state_->config.protocol,
+                         state_->negotiated_version(), request_id, state_->client_versions());
     const auto response =
         state_->post(method, state_->method_path(method),
                      encode_ipc(request, metadata, state_->request_serialization_cap()), request_id,
@@ -2863,8 +2918,9 @@ HttpExchangeSession HttpClient::open_exchange(const std::string& method,
         throw std::invalid_argument("exchange input and output schemas must not be null");
     }
     const std::string request_id = logical_request_id(options);
-    const auto metadata = request_metadata(request.custom_metadata, method, state_->config.protocol,
-                                           state_->config.protocol_version, request_id);
+    const auto metadata =
+        request_metadata(request.custom_metadata, method, state_->config.protocol,
+                         state_->negotiated_version(), request_id, state_->client_versions());
     const auto response =
         state_->post(method, state_->method_path(method, "/init"),
                      encode_ipc(request, metadata, state_->request_serialization_cap()), request_id,
@@ -3099,8 +3155,9 @@ HttpStreamSession HttpClient::open_producer(const std::string& method,
     validate_method(method);
     if (!state_) throw HttpClientError("HttpClient is moved from");
     const std::string request_id = logical_request_id(options);
-    const auto metadata = request_metadata(request.custom_metadata, method, state_->config.protocol,
-                                           state_->config.protocol_version, request_id);
+    const auto metadata =
+        request_metadata(request.custom_metadata, method, state_->config.protocol,
+                         state_->negotiated_version(), request_id, state_->client_versions());
     const auto response =
         state_->post(method, state_->method_path(method, "/init"),
                      encode_ipc(request, metadata, state_->request_serialization_cap()), request_id,
@@ -3121,8 +3178,9 @@ HttpStreamSession HttpClient::open_stream_exchange(const std::string& method,
     validate_method(method);
     if (!state_) throw HttpClientError("HttpClient is moved from");
     const std::string request_id = logical_request_id(options);
-    const auto metadata = request_metadata(request.custom_metadata, method, state_->config.protocol,
-                                           state_->config.protocol_version, request_id);
+    const auto metadata =
+        request_metadata(request.custom_metadata, method, state_->config.protocol,
+                         state_->negotiated_version(), request_id, state_->client_versions());
     const auto response =
         state_->post(method, state_->method_path(method, "/init"),
                      encode_ipc(request, metadata, state_->request_serialization_cap()), request_id,

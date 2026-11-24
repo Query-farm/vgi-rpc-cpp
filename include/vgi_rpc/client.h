@@ -314,6 +314,14 @@ struct RpcClientOptions {
     // `nullopt` refuses pointer batches instead, for a deployment that wants
     // its byte-stream client to make no outbound HTTP request of its own.
     std::optional<ClientExternalHttpOptions> external_http{ClientExternalHttpOptions{}};
+    // The window this client supports for `protocol` (`MIN-MAX`); empty means
+    // exactly `protocol_version`'s major.minor.  The client negotiates per
+    // connection (PROTOCOL_VERSIONS_V1.md §6): with a window wider than one
+    // version it reads the server's windows from `list_protocols` before its
+    // first application call; every client learns from refusals, advertises
+    // the window as `vgi_rpc.protocol_versions_client`, and throws
+    // `NoCommonVersionError` before sending once no version is common.
+    std::string protocol_version_range;
 };
 
 struct ClientTransportOptions {
@@ -447,6 +455,10 @@ public:
     void close();
 
 private:
+    // Protocol version negotiation (PROTOCOL_VERSIONS_V1.md §6).
+    std::string negotiated_version(const std::string& method);
+    std::string client_versions(const std::string& method) const;
+    void observe_refusal(const RpcException& error);
     class Impl;
 
     ClientStream open_stream(const std::string& method,

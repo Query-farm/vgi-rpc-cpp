@@ -37,6 +37,7 @@ each of which a C++-only run reported as green.
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import socket
 import subprocess
@@ -1431,3 +1432,65 @@ def conformance_cursor_budget_ports() -> Iterator[Any]:
         spawn_http("--max-request-bytes", "9000", "--cursor-rule", "error") as floor,
     ):
         yield CursorBudgetPorts(warn=warn, error=error, floor=floor)
+
+
+class _NegotiatingClientError(Exception):
+    """A call's failure as the C++ negotiating client reported it."""
+
+    def __init__(self, error_kind: str, error_message: str) -> None:
+        super().__init__(error_message)
+        self.error_kind = error_kind
+        self.error_message = error_message
+
+
+class _NegotiatingClient:
+    """One ``conformance_negotiating_client`` process: ``ping()`` is one line in, one JSON line out."""
+
+    def __init__(self, argv: list[str]) -> None:
+        self._proc = subprocess.Popen(
+            argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True
+        )
+
+    def ping(self) -> str:
+        assert self._proc.stdin is not None and self._proc.stdout is not None
+        self._proc.stdin.write("ping\n")
+        self._proc.stdin.flush()
+        line = self._proc.stdout.readline()
+        if not line:
+            raise RuntimeError("conformance_negotiating_client exited")
+        reply = json.loads(line)
+        if "ok" in reply:
+            return str(reply["ok"])
+        raise _NegotiatingClientError(str(reply.get("error_kind", "")), str(reply.get("error_message", "")))
+
+    def close(self) -> None:
+        if self._proc.stdin is not None:
+            self._proc.stdin.close()
+        try:
+            self._proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            self._proc.kill()
+            self._proc.wait(timeout=10)
+
+
+@pytest.fixture
+def conformance_negotiating_client() -> Callable[..., Any]:
+    """This port's HTTP client, negotiating per PROTOCOL_VERSIONS_V1.md §6 (shared ``TestClientNegotiation``).
+
+    The binary is the ``conformance_negotiating_client`` beside the worker under
+    test (``VGI_RPC_CPP_NEGOTIATING_CLIENT`` overrides).
+    """
+    override = os.environ.get("VGI_RPC_CPP_NEGOTIATING_CLIENT")
+    binary = Path(override) if override else Path(worker_path()).parent / "conformance_negotiating_client"
+    if not binary.is_file() or not os.access(binary, os.X_OK):
+        pytest.skip(f"conformance_negotiating_client not built: {binary}")
+
+    @contextlib.contextmanager
+    def factory(base_url: str, protocol: str, version: str, version_range: str) -> Iterator[_NegotiatingClient]:
+        client = _NegotiatingClient([str(binary), base_url, protocol, version, version_range])
+        try:
+            yield client
+        finally:
+            client.close()
+
+    return factory

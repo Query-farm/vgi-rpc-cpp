@@ -144,6 +144,11 @@ VGI_RPC_EXPORT std::shared_ptr<arrow::RecordBatch> maybe_write_to_shm(
 // empty batch whose custom_metadata carries this server's transport
 // capabilities.  Declared here rather than in describe.h because what it
 // advertises is decided by whether this build can attach a segment at all.
+// `protocol_versions`, when given, rides the reply as `vgi_rpc.protocol_versions`
+// (PROTOCOL_VERSIONS_V1.md §4.1); nullopt omits the key.
+VGI_RPC_EXPORT void register_transport_options(std::unordered_map<std::string, MethodInfo>& methods,
+                                               const std::string& server_id,
+                                               const std::optional<std::string>& protocol_versions);
 VGI_RPC_EXPORT void register_transport_options(std::unordered_map<std::string, MethodInfo>& methods,
                                                const std::string& server_id);
 

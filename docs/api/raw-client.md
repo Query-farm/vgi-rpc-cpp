@@ -32,6 +32,16 @@ peer hosts its methods under. Every application request carries it
 `std::invalid_argument` before anything is sent. Reflection and reserved
 `__name__` methods need none.
 
+## Protocol version negotiation
+
+`RpcClientOptions::protocol_version_range` (`MIN-MAX`) widens the window below
+`protocol_version`. A client with a wider window reads the server's windows
+from `list_protocols` before its first application call; a single-version
+client skips that round trip. Every client learns from refusals, sends its
+window as `vgi_rpc.protocol_versions_client`, speaks the highest common version
+with its own patch, and throws `NoCommonVersionError` before sending once it
+knows no version is common (vgi-rpc `PROTOCOL_VERSIONS_V1.md` §6).
+
 ## Transports
 
 `ClientTransport::spawn()` executes the argument vector directly, never via a

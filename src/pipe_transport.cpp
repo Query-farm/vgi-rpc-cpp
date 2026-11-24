@@ -5,6 +5,7 @@
 #include "vgi_rpc/access_log.h"
 #include "vgi_rpc/arrow_utils.h"
 #include "vgi_rpc/metadata.h"
+#include "vgi_rpc/protocol_versions.h"
 #include "vgi_rpc/reflection.h"
 #include "vgi_rpc/token_identity.h"
 #include <arrow/array/builder_binary.h>
@@ -331,8 +332,14 @@ bool Server::serve_reflection(const std::shared_ptr<arrow::io::OutputStream>& ou
     std::shared_ptr<arrow::Array> arr;
     VGI_RPC_THROW_NOT_OK(b.Finish(&arr));
     auto out_batch = arrow::RecordBatch::Make(schema, 1, {arr});
-    auto result = Result::value(out_batch);
-    write_ipc_stream(output, schema, {result.annotated_batch()});
+    // Reflection is answerable at any version, so its result is where a
+    // client on any transport learns the windows (PROTOCOL_VERSIONS_V1.md
+    // §4.1).  Present even when empty: "negotiates, gates nothing".
+    AnnotatedBatch annotated;
+    annotated.batch = out_batch;
+    annotated.custom_metadata = std::make_shared<arrow::KeyValueMetadata>();
+    annotated.custom_metadata->Append(keys::PROTOCOL_VERSIONS, protocol_versions_);
+    write_ipc_stream(output, schema, {annotated});
     VGI_RPC_THROW_NOT_OK(output->Flush());
     log_framework_call(reflection_binding_, method_name, request_id, request_batch, t0, "", "");
     return true;
@@ -505,11 +512,9 @@ bool Server::serve_one_with_state(const std::shared_ptr<arrow::io::InputStream>&
     // application's version says nothing about them.
     if (method_name.rfind("__", 0) != 0) {
         if (auto reason = protocol_version_error(*target, custom_metadata); !reason.empty()) {
-            auto error_result =
-                Result::error(empty_schema(), "ProtocolVersionError", reason, server_id_,
-                              request_id, ERROR_KIND_PROTOCOL_VERSION_MISMATCH,
-                              protocol_version_extras(*target, custom_metadata));
-            write_ipc_stream(output, empty_schema(), {error_result.annotated_batch()});
+            write_ipc_stream(
+                output, empty_schema(),
+                {protocol_version_refusal(*target, custom_metadata, reason, request_id)});
             VGI_RPC_THROW_NOT_OK(output->Flush());
             return true;
         }

@@ -140,6 +140,10 @@ struct VGI_RPC_EXPORT ServedProtocol {
     std::string version;
     std::unordered_map<std::string, MethodInfo> methods;
     ProtocolIdentity binding;
+    // The major.minor window this protocol accepts (`MIN-MAX`); empty when it
+    // declares no version and so is not gated.  Defaults to exactly
+    // `version`'s major.minor (PROTOCOL_VERSIONS_V1.md §5).
+    std::string version_range;
 };
 
 class VGI_RPC_EXPORT ServerBuilder {
@@ -249,6 +253,15 @@ public:
     // `protocol_version` so version-aware clients can discover it.
     ServerBuilder& protocol_version(std::string version);
 
+    // Override the major.minor window one hosted protocol accepts
+    // (`MIN-MAX`, e.g. "3.3-3.4"); by default a protocol accepts exactly its
+    // declared version's major.minor (PROTOCOL_VERSIONS_V1.md §5).  The window
+    // is what the server advertises in `VGI-Protocol-Versions` and gates on.
+    // It is how a fixture worker impersonates an older server.  `build()`
+    // refuses a name that is not a hosted, versioned protocol, and a
+    // malformed window.
+    ServerBuilder& protocol_version_range(std::string protocol, std::string range);
+
     // Install an optional process-local lifecycle hook.  It runs once, with
     // the concrete transport kind, before that transport dispatches its first
     // request.  A throwing hook leaves startup uncommitted so the next request
@@ -272,6 +285,7 @@ private:
 
     ProtocolBuilder primary_;
     std::vector<ProtocolBuilder> extra_protocols_;
+    std::vector<std::pair<std::string, std::string>> version_ranges_;
     bool include_tracebacks_ = true;
     bool built_ = false;
     std::string server_id_;
@@ -428,11 +442,25 @@ public:
         const ServedProtocol& protocol,
         const std::shared_ptr<arrow::KeyValueMetadata>& custom_metadata) const;
 
-    // The full error batch extras for a version mismatch on `protocol`: the
-    // `PreconditionFailure` naming the protocol and both versions.
+    // The full error batch extras for a version refusal on `protocol`: the
+    // `PreconditionFailure` naming the protocol and both sides, and an
+    // `ErrorInfo` carrying the server's windows (and the client's, when sent).
     ErrorExtras protocol_version_extras(
         const ServedProtocol& protocol,
         const std::shared_ptr<arrow::KeyValueMetadata>& custom_metadata) const;
+
+    // The complete `protocol_version_unsupported` error batch: kind, code,
+    // details, and the `vgi_rpc.protocol_versions` key (PROTOCOL_VERSIONS_V1.md
+    // §4.3).  `reason` is `protocol_version_error`'s message.
+    AnnotatedBatch protocol_version_refusal(
+        const ServedProtocol& protocol,
+        const std::shared_ptr<arrow::KeyValueMetadata>& custom_metadata, const std::string& reason,
+        const std::string& request_id) const;
+
+    // Every gated protocol's window, `name=MIN-MAX, ...`, primary first: the
+    // `VGI-Protocol-Versions` value and the `vgi_rpc.protocol_versions` key.
+    // Empty (but advertised) when nothing is gated.
+    const std::string& protocol_versions() const noexcept { return protocol_versions_; }
 
     // Returns false on EOF (clean shutdown), true when a request was served.
     bool serve_one(const std::shared_ptr<arrow::io::InputStream>& input,
@@ -553,6 +581,7 @@ private:
     std::vector<ServedProtocol> protocols_;
     std::string server_id_;
     bool include_tracebacks_ = true;
+    std::string protocol_versions_;
 
     // Every binding this server hosts, fingerprinted once at construction.
     //

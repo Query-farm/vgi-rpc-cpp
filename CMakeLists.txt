@@ -78,6 +78,7 @@ add_library(vgi_rpc
     src/result.cpp
     src/call_context.cpp
     src/server.cpp
+    src/protocol_versions.cpp
     src/pipe_transport.cpp
     src/socket_transport.cpp
     src/type_tokens.cpp

@@ -23,6 +23,7 @@
 #include "vgi_rpc/client_external.h"
 #include "vgi_rpc/crypto.h"
 #include "vgi_rpc/errors.h"
+#include "vgi_rpc/protocol_versions.h"
 #include "vgi_rpc/external.h"
 #include "vgi_rpc/object_cache.h"
 #include "vgi_rpc/state_ref.h"
@@ -203,6 +204,7 @@ constexpr const char* kOwnCapabilityHeaders[] = {
     "vgi-sticky-default-ttl",
     "vgi-sticky-echo-headers",
     "vgi-proxy-proof-required",
+    "vgi-protocol-versions",
 };
 constexpr const char* SESSION_ACCEPT_HEADER = "VGI-Session-Accept";
 constexpr const char* SESSION_CLOSE_HEADER = "VGI-Session-Close";
@@ -826,6 +828,7 @@ std::optional<std::string> gzip_compress(const std::string& body) {
 constexpr const char* kAllowedRequestHeaders =
     "content-type, accept, accept-encoding, authorization, x-request-id, "
     "x-vgi-accept-encoding, vgi-session, vgi-session-accept, vgi-proxy-proof, "
+    "vgi-client-protocol-versions, "
     "vgi-accept-max-response-bytes, x-conformance-principal, x-conformance-auth-time, "
     "x-conformance-auth-reason";
 
@@ -1082,6 +1085,11 @@ std::string HttpServer::strip_prefix(const std::string& path) const {
 }
 
 void HttpServer::stamp_capabilities(httplib::Response& res) const {
+    // Protocol version negotiation (PROTOCOL_VERSIONS_V1.md §4.1): every
+    // response names the window of every protocol this server gates.  Present
+    // even when empty -- "negotiates, gates nothing" -- which absent does not
+    // say.
+    res.set_header(PROTOCOL_VERSIONS_HEADER, rpc_.protocol_versions());
     res.set_header(ACCEPT_MAX_RESPONSE_BYTES_SUPPORT_HEADER, "true");
     if (auto limit = configured_limit(cfg_.max_response_bytes, cfg_.hosting_max_response_bytes)) {
         res.set_header("VGI-Max-Response-Bytes", std::to_string(*limit));
@@ -1860,11 +1868,10 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
                 res.set_header(RPC_ERROR_HEADER, "true");
                 set_arrow_content(
                     req, res, build_body([&](const std::shared_ptr<arrow::io::OutputStream>& out) {
-                        auto err = Result::error(
-                            empty_schema(), "ProtocolVersionError", reason, rpc_.server_id(),
-                            request_id, ERROR_KIND_PROTOCOL_VERSION_MISMATCH,
-                            rpc_.protocol_version_extras(*routed_protocol, custom_metadata));
-                        write_ipc_stream(out, empty_schema(), {err.annotated_batch()});
+                        write_ipc_stream(
+                            out, empty_schema(),
+                            {rpc_.protocol_version_refusal(*routed_protocol, custom_metadata,
+                                                           reason, request_id)});
                     }));
                 return;
             }
@@ -2752,7 +2759,7 @@ void HttpServer::run() {
     // impossible to diagnose from the outside.  A 500 with the reason is worse
     // than a correct answer and much better than silence.
     svr.set_exception_handler(
-        [](const httplib::Request& req, httplib::Response& res, std::exception_ptr ep) {
+        [this](const httplib::Request& req, httplib::Response& res, std::exception_ptr ep) {
             std::string what = "unknown error";
             try {
                 std::rethrow_exception(ep);
@@ -2763,6 +2770,9 @@ void HttpServer::run() {
             std::cerr << "vgi_rpc: unhandled exception serving " << req.method << " " << req.path
                       << ": " << what << "\n";
             res.status = 500;
+            // A 5xx still advertises (PROTOCOL_VERSIONS_V1.md §4.1): the client
+            // may be reading it to diagnose this very failure.
+            res.set_header(PROTOCOL_VERSIONS_HEADER, rpc_.protocol_versions());
             // `what` routinely quotes peer bytes -- a parser's "last read"
             // excerpt of a storage reply, say -- and a strict dump of invalid
             // UTF-8 throws.  Thrown from here, that is std::terminate: one bad

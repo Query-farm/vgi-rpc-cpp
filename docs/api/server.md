@@ -101,6 +101,33 @@ protocols in registration order, primary first. Dispatch resolves the pair
 `(protocol, method)`, and each protocol is version-gated against its *own*
 declared version (a protocol that declares none enforces nothing).
 
+#### Protocol versions
+
+```cpp
+ServerBuilder& protocol_version_range(std::string protocol, std::string range);
+```
+
+Protocol version negotiation (vgi-rpc `PROTOCOL_VERSIONS_V1.md`). Each
+versioned protocol accepts a major.minor window, by default exactly its
+declared version (`2.0.0` accepts `2.0-2.0`); `protocol_version_range`
+overrides one protocol's window, which is how a fixture worker impersonates an
+older server. `build()` throws for a name that is not a hosted, versioned
+protocol. The server advertises every gated protocol's window, primary first,
+as `name=MIN-MAX, ...` (`Server::protocol_versions()`):
+
+- the `VGI-Protocol-Versions` header on every HTTP response (401, 404, 413,
+  5xx, `HEAD`/`OPTIONS /health` and CORS preflights included; CORS-exposed,
+  and a preflight allows `VGI-Client-Protocol-Versions`);
+- the `vgi_rpc.protocol_versions` metadata key on reflection results,
+  `__transport_options__` replies and refusals, on every transport.
+
+Reflection is never gated. A request outside the window is refused with kind
+`protocol_version_unsupported` and code `FAILED_PRECONDITION`, a message naming
+both windows and which side to upgrade (it keeps `too old` / `too new`), a
+`PreconditionFailure` naming the protocol, and an `ErrorInfo` carrying the
+server's windows (and the client's `vgi_rpc.protocol_versions_client`, which is
+otherwise only quoted, never a reason to refuse).
+
 There is no way to host a subset of a protocol's methods: the protocol is the
 unit of optionality (WIRE_PROTOCOL §3.1). `build()` throws
 `std::invalid_argument` for a name under the reserved `vgi_rpc.` prefix (the

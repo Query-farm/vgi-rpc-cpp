@@ -74,6 +74,7 @@ Code default_error_code(std::string_view exception_type, std::string_view kind) 
         {"protocol_not_supported", Code::UNIMPLEMENTED},
         {"protocol_not_specified", Code::INVALID_ARGUMENT},
         {"protocol_version_mismatch", Code::FAILED_PRECONDITION},
+        {"protocol_version_unsupported", Code::FAILED_PRECONDITION},
         {"session_lost", Code::ABORTED},
         {"server_draining", Code::UNAVAILABLE},
         {"identity_unavailable", Code::UNAVAILABLE},

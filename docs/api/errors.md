@@ -37,8 +37,10 @@ The catalog: `ErrorInfo`, `RetryInfo`, `BadRequest`, `PreconditionFailure`,
 
 Framework errors carry their codes already: `method_not_implemented` and
 `protocol_not_supported` → `UNIMPLEMENTED`, `protocol_not_specified` →
-`INVALID_ARGUMENT`, `protocol_version_mismatch` → `FAILED_PRECONDITION` (with
-a `PreconditionFailure` naming the protocol), `session_lost` → `ABORTED`,
+`INVALID_ARGUMENT`, `protocol_version_unsupported` → `FAILED_PRECONDITION` (with
+a `PreconditionFailure` naming the protocol and an `ErrorInfo` carrying the
+server's `vgi_rpc.protocol_versions`; it replaces `protocol_version_mismatch`,
+which clients still recognise from older servers), `session_lost` → `ABORTED`,
 `server_draining` → `UNAVAILABLE` (with `RetryInfo`), and the identity kinds
 as in WIRE_PROTOCOL §16.
 
