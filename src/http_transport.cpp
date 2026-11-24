@@ -1106,7 +1106,7 @@ void HttpServer::stamp_capabilities(httplib::Response& res) const {
     // Always present: an absent header means "unknown", and the client needs
     // to know whether to expect pointer batches at all.
     res.set_header("VGI-Externalization-Enabled", externalization() ? "true" : "false");
-    if (externalization()) {
+    if (externalization() && cfg_.upload_grants) {
         // "2": upload URLs v2, `__upload_url__/init` takes (size, sha256)
         // entries.  A clean break -- no server answers the retired count shape.
         res.set_header("VGI-Upload-URL-Support", UPLOAD_URL_PROTOCOL_VERSION);
@@ -1949,7 +1949,7 @@ void HttpServer::handle_rpc(const httplib::Request& req, httplib::Response& res,
     // Present only when a backend is configured, so a client that discovers
     // upload-URL support can rely on the route existing.
     if (method_name == "__upload_url__" && is_init) {
-        if (!storage_) {
+        if (!storage_ || !cfg_.upload_grants) {
             // The route does not exist on this server, so nothing was
             // dispatched and there is no call to file -- same shape as the
             // reference, which never registers the route at all.

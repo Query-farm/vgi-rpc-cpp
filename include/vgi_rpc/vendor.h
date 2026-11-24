@@ -166,8 +166,13 @@ VGI_RPC_EXPORT std::shared_ptr<VendorStorage> vendor_storage_from_env();
 ///   inbound pointers are pinned to its hosts, and `VGI-Max-Upload-Bytes` is
 ///   `VGI_RPC_MAX_UPLOAD_BYTES`, else the inbound fetch cap
 ///   (`VGI_RPC_MAX_FETCH_BYTES`, default 256 MiB raised to the upload cap).
+/// - with `VGI_STORAGE_BACKEND=s3|gcs` (or `VGI_STORAGE_S3_BUCKET` /
+///   `VGI_STORAGE_GCS_BUCKET` alone), the same roles run against the
+///   operator's own bucket (`vgi_rpc/storage_env.h`); the build needs the s3 /
+///   gcs vcpkg feature, else this throws naming it.  `VGI_STORAGE_S3_CHECKSUM=
+///   none` turns upload grants off.  A one-line description goes to stderr.
 /// A malformed or contradictory value throws `std::invalid_argument`.
-/// Returns the vendor storage it installed, or null.
+/// Returns the vendor storage it installed, or null (none, or direct storage).
 VGI_RPC_EXPORT std::shared_ptr<VendorStorage> configure_http_from_env(HttpConfig& config);
 
 }  // namespace vgi_rpc

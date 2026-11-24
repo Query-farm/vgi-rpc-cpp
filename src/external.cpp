@@ -24,7 +24,10 @@
 #include <cerrno>
 #include <chrono>
 #include <cstdlib>
+#include <atomic>
+#include <cstdio>
 #include <memory>
+#include <mutex>
 #include <random>
 #include <stdexcept>
 #include <thread>
@@ -32,19 +35,26 @@
 
 #ifdef VGI_RPC_WITH_S3
 #include <aws/core/Aws.h>
+#include <aws/core/auth/AWSCredentialsProvider.h>
 #include <aws/core/auth/AWSCredentialsProviderChain.h>
 #include <aws/core/client/ClientConfiguration.h>
 #include <aws/core/utils/memory/stl/AWSString.h>
 #include <aws/core/utils/stream/PreallocatedStreamBuf.h>
 #include <aws/s3/S3Client.h>
 #include <aws/s3/model/GetObjectRequest.h>
+#include <aws/s3/model/HeadBucketRequest.h>
 #include <aws/s3/model/PutObjectRequest.h>
 #include <sstream>
 #endif
 
 #ifdef VGI_RPC_WITH_GCS
 #include <google/cloud/storage/client.h>
+#include <google/cloud/credentials.h>
+#include <google/cloud/storage/options.h>
 #include <google/cloud/storage/signed_url_options.h>
+
+#include <fstream>
+#include <sstream>
 #include <chrono>
 #endif
 
@@ -588,6 +598,33 @@ public:
           ttl_(config.signed_url_ttl_seconds),
           config_(config) {
         ensure_aws_initialized();
+        if (config.s3_checksum != "sha256" && config.s3_checksum != "none") {
+            throw std::invalid_argument("s3_checksum must be \"sha256\" or \"none\"");
+        }
+        checksum_ = config.s3_checksum == "sha256";
+        if (config.s3_access_key_id.empty() != config.s3_secret_access_key.empty()) {
+            throw std::invalid_argument(
+                "S3 access key id and secret access key must be set together");
+        }
+        if (!config.s3_session_token.empty() && config.s3_access_key_id.empty()) {
+            throw std::invalid_argument("an S3 session token needs an access key id and secret");
+        }
+        // Explicit keys (with an optional session token), else the SDK's
+        // default chain: env (AWS_ACCESS_KEY_ID / _SECRET_ACCESS_KEY /
+        // _SESSION_TOKEN), the shared profile (role_arn + source_profile,
+        // credential_process), SSO, web identity (AWS_WEB_IDENTITY_TOKEN_FILE
+        // + AWS_ROLE_ARN), container credentials (ECS, EKS Pod Identity) and
+        // IMDSv2.  The chain's providers refresh temporary credentials ahead
+        // of expiry; nothing here caches them.
+        if (!config.s3_access_key_id.empty()) {
+            credentials_ = Aws::MakeShared<Aws::Auth::SimpleAWSCredentialsProvider>(
+                "vgi_rpc", Aws::String(config.s3_access_key_id.c_str()),
+                Aws::String(config.s3_secret_access_key.c_str()),
+                Aws::String(config.s3_session_token.c_str()));
+        } else {
+            credentials_ =
+                Aws::MakeShared<Aws::Auth::DefaultAWSCredentialsProviderChain>("vgi_rpc");
+        }
         Aws::Client::ClientConfiguration client_config;
         if (!config.region.empty()) client_config.region = config.region;
         // Connect, then a stall timeout: for the curl client requestTimeoutMs
@@ -625,11 +662,65 @@ public:
                                             ? config.endpoint_url.empty()
                                             : config.s3_addressing_style == "virtual";
         client_ = std::make_unique<Aws::S3::S3Client>(
-            client_config, Aws::Client::AWSAuthV4Signer::PayloadSigningPolicy::Never,
+            credentials_, client_config, Aws::Client::AWSAuthV4Signer::PayloadSigningPolicy::Never,
             virtual_addressing);
+        // Pre-signing is local, so a second client pointed at the public
+        // endpoint signs the URLs clients receive (its host is part of the
+        // signature) without ever sending a request.
+        if (!config.s3_public_endpoint_url.empty() &&
+            config.s3_public_endpoint_url != config.endpoint_url) {
+            Aws::Client::ClientConfiguration public_config = client_config;
+            public_config.endpointOverride = config.s3_public_endpoint_url;
+            public_client_ = std::make_unique<Aws::S3::S3Client>(
+                credentials_, public_config,
+                Aws::Client::AWSAuthV4Signer::PayloadSigningPolicy::Never, virtual_addressing);
+        }
+        if (config.s3_bucket_check == ExternalStorageConfig::BucketCheck::Startup) verify_bucket();
+    }
+
+    // HEAD the bucket once.  A missing bucket, an access refusal and a wrong
+    // region each fail with what to fix (the region S3 reported, when it
+    // did); never the credentials.
+    void verify_bucket() {
+        if (config_.s3_bucket_check == ExternalStorageConfig::BucketCheck::Never) return;
+        std::call_once(verified_, [this] {
+            Aws::S3::Model::HeadBucketRequest request;
+            request.SetBucket(bucket_);
+            auto outcome = client_->HeadBucket(request);
+            if (outcome.IsSuccess()) return;
+            const auto& error = outcome.GetError();
+            const int status = static_cast<int>(error.GetResponseCode());
+            std::string region;
+            const auto& headers = error.GetResponseHeaders();
+            if (auto found = headers.find("x-amz-bucket-region"); found != headers.end()) {
+                region = std::string(found->second.c_str());
+            }
+            std::string what = "S3 bucket '" + bucket_ + "' check failed";
+            if (status == 404) {
+                what +=
+                    ": the bucket does not exist (create it, or fix VGI_STORAGE_S3_BUCKET / "
+                    "VGI_STORAGE_S3_ENDPOINT)";
+            } else if (status == 403) {
+                what +=
+                    ": access denied (the credentials may not use this bucket; check the "
+                    "credential source and its s3:ListBucket/GetObject/PutObject grants)";
+            } else if (status == 301 || !region.empty()) {
+                what += ": the bucket is in another region" +
+                        (region.empty() ? std::string()
+                                        : " (S3 reports '" + region +
+                                              "'; set VGI_STORAGE_S3_REGION=" + region + ")");
+            } else {
+                what += ": HTTP " + std::to_string(status) + " " +
+                        std::string(error.GetExceptionName().c_str()) + " " +
+                        std::string(error.GetMessage().c_str());
+            }
+            verify_error_ = what;
+        });
+        if (!verify_error_.empty()) throw std::runtime_error(verify_error_);
     }
 
     std::string upload(const std::string& data, const std::string& content_encoding) override {
+        verify_bucket();
         const std::string key = make_key(prefix_, content_encoding);
 
         Aws::S3::Model::PutObjectRequest request;
@@ -648,7 +739,7 @@ public:
             throw std::runtime_error("S3 upload failed: " +
                                      std::string(outcome.GetError().GetMessage()));
         }
-        return presign("GET", key);
+        return presign_public("GET", key);
     }
 
     std::string fetch(const std::string& url) override {
@@ -658,7 +749,16 @@ public:
     }
 
     UploadUrl generate_upload_url(int64_t size, const std::string& sha256_hex) override {
+        if (!checksum_) {
+            // Upload v2 needs storage to enforce the SHA-256; without it the
+            // server must not vend grants (HttpConfig::upload_grants = false).
+            throw std::runtime_error(
+                "upload grants are disabled: VGI_STORAGE_S3_CHECKSUM=none (storage does not "
+                "enforce x-amz-checksum-sha256)");
+        }
+        verify_bucket();
         const std::string key = make_key(prefix_, "");
+        const uint64_t ttl = effective_ttl(kUploadGrantMinSeconds);
         UploadUrl out;
         // The PUT signs the exact length and the SHA-256, so S3 itself refuses
         // any other body.  The checksum header goes back to the client; the
@@ -667,14 +767,14 @@ public:
         Aws::Http::HeaderValueCollection signed_headers;
         signed_headers.emplace("content-length", std::to_string(size));
         signed_headers.emplace("x-amz-checksum-sha256", checksum);
-        auto put = client_->GeneratePresignedUrl(bucket_, key, Aws::Http::HttpMethod::HTTP_PUT,
-                                                 signed_headers, static_cast<uint64_t>(ttl_));
+        auto put = signer().GeneratePresignedUrl(bucket_, key, Aws::Http::HttpMethod::HTTP_PUT,
+                                                 signed_headers, ttl);
         if (put.empty()) throw std::runtime_error("S3 pre-signing produced no URL");
         out.upload_url = std::string(put.c_str());
         // Distinct credentials per verb: a client given an upload URL
         // cannot use it to read anything else in the bucket.
-        out.download_url = presign("GET", key);
-        out.expires_at_us = expiry_us(ttl_);
+        out.download_url = presign_public("GET", key);
+        out.expires_at_us = expiry_us(static_cast<int>(ttl));
         out.headers.emplace("x-amz-checksum-sha256", checksum);
         out.object_id = key;
         return out;
@@ -683,6 +783,7 @@ public:
     // STATE_REF_V1.md §10.1: a PutObject signing the length and the SHA-256,
     // so S3 itself refuses a body that is not exactly these bytes.
     std::string put_object(const std::string& data) override {
+        verify_bucket();
         const std::string key = make_object_key(prefix_);
         const auto digest =
             crypto::sha256(reinterpret_cast<const uint8_t*>(data.data()), data.size());
@@ -691,7 +792,9 @@ public:
         request.SetKey(key);
         request.SetContentType("application/octet-stream");
         request.SetContentLength(static_cast<long long>(data.size()));
-        request.SetChecksumSHA256(base64_std(digest.data(), digest.size()));
+        // With checksum "none" the service would not enforce it (or would
+        // refuse the header); every reader verifies the SHA-256 it was given.
+        if (checksum_) request.SetChecksumSHA256(base64_std(digest.data(), digest.size()));
         auto body = Aws::MakeShared<Aws::StringStream>("vgi_rpc");
         body->write(data.data(), static_cast<std::streamsize>(data.size()));
         request.SetBody(body);
@@ -710,25 +813,89 @@ public:
         if (object_id.empty() || object_id.size() > 1024) {
             throw std::invalid_argument("invalid object id");
         }
-        const std::string url = presign("GET", object_id);
-        return HttpExternalStorage(url, config_).fetch_url(url, max_bytes, /*object_get=*/true);
+        verify_bucket();
+        // The worker's own fetch: signed for the internal endpoint, and
+        // checked against it rather than the client-facing validator.
+        const std::string url = presign_with(*client_, "GET", object_id);
+        ExternalStorageConfig internal = config_;
+        internal.url_validator = nullptr;
+        return HttpExternalStorage(url, internal).fetch_url(url, max_bytes, /*object_get=*/true);
     }
 
 private:
-    std::string presign(const char* method, const std::string& key) {
-        auto url = client_->GeneratePresignedUrl(bucket_, key,
-                                                 std::string(method) == "PUT"
-                                                     ? Aws::Http::HttpMethod::HTTP_PUT
-                                                     : Aws::Http::HttpMethod::HTTP_GET,
-                                                 static_cast<uint64_t>(ttl_));
+    // The client whose endpoint goes into URLs handed to clients.
+    Aws::S3::S3Client& signer() { return public_client_ ? *public_client_ : *client_; }
+
+    // contract §4: a pre-signed URL dies with the credentials that signed it,
+    // so its lifetime is min(TTL, expiry - now - 60 s).
+    // Seconds the signing credentials remain valid, or -1 when they carry
+    // no known expiry (static keys; an explicit token without
+    // VGI_STORAGE_S3_SESSION_EXPIRES).
+    int64_t credential_seconds_left() {
+        if (config_.s3_session_expires_epoch > 0) {
+            const auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                                 std::chrono::system_clock::now().time_since_epoch())
+                                 .count();
+            return config_.s3_session_expires_epoch - now;
+        }
+        const auto credentials = credentials_->GetAWSCredentials();
+        const int64_t remaining_ms =
+            (credentials.GetExpiration() - Aws::Utils::DateTime::Now()).count();
+        // Static keys carry the far-future default; only real expiries count.
+        if (remaining_ms > 0 && remaining_ms < int64_t{10} * 365 * 24 * 3600 * 1000) {
+            return remaining_ms / 1000;
+        }
+        return -1;
+    }
+
+    uint64_t effective_ttl(int64_t minimum = 0) {
+        int64_t ttl = ttl_;
+        int64_t left = credential_seconds_left();
+        if (left >= 0 && minimum > 0 && left - 60 < minimum &&
+            config_.s3_session_expires_epoch == 0) {
+            // Addendum A.2: refresh once (the providers renew credentials
+            // close to expiry on access), then sign for what remains.
+            left = credential_seconds_left();
+        }
+        if (left >= 0) {
+            ttl = std::min<int64_t>(ttl, left - 60);
+            if (minimum > 0 && ttl < minimum && !short_warned_.exchange(true)) {
+                std::fprintf(stderr,
+                             "vgi-rpc: S3 credentials expire in %lld s; upload grants are signed "
+                             "for %lld s, under the 15-minute minimum\n",
+                             static_cast<long long>(left), static_cast<long long>(ttl));
+            }
+        }
+        return static_cast<uint64_t>(std::max<int64_t>(ttl, 1));
+    }
+
+    std::string presign_with(Aws::S3::S3Client& client, const char* method,
+                             const std::string& key) {
+        auto url = client.GeneratePresignedUrl(bucket_, key,
+                                               std::string(method) == "PUT"
+                                                   ? Aws::Http::HttpMethod::HTTP_PUT
+                                                   : Aws::Http::HttpMethod::HTTP_GET,
+                                               effective_ttl());
         if (url.empty()) throw std::runtime_error("S3 pre-signing produced no URL");
         return std::string(url.c_str());
+    }
+
+    std::string presign_public(const char* method, const std::string& key) {
+        return presign_with(signer(), method, key);
     }
 
     std::string bucket_;
     std::string prefix_;
     int ttl_;
+    // Contract §4: grants must live at least 15 minutes.
+    static constexpr int64_t kUploadGrantMinSeconds = 15 * 60;
+    bool checksum_ = true;
+    std::atomic<bool> short_warned_{false};
+    std::shared_ptr<Aws::Auth::AWSCredentialsProvider> credentials_;
     std::unique_ptr<Aws::S3::S3Client> client_;
+    std::unique_ptr<Aws::S3::S3Client> public_client_;
+    std::once_flag verified_;
+    std::string verify_error_;
     ExternalStorageConfig config_;
 };
 
@@ -746,11 +913,31 @@ private:
 google::cloud::storage::Client make_gcs_client(const ExternalStorageConfig& config) {
     namespace gcs = google::cloud::storage;
     const auto stall = std::chrono::seconds(stall_seconds(config));
-    return gcs::Client(google::cloud::Options{}
-                           .set<gcs::TransferStallTimeoutOption>(stall)
-                           .set<gcs::TransferStallMinimumRateOption>(1)
-                           .set<gcs::DownloadStallTimeoutOption>(stall)
-                           .set<gcs::DownloadStallMinimumRateOption>(1));
+    auto options = google::cloud::Options{}
+                       .set<gcs::TransferStallTimeoutOption>(stall)
+                       .set<gcs::TransferStallMinimumRateOption>(1)
+                       .set<gcs::DownloadStallTimeoutOption>(stall)
+                       .set<gcs::DownloadStallMinimumRateOption>(1);
+    // VGI_STORAGE_GCS_ENDPOINT (an emulator or a private endpoint).
+    if (!config.gcs_endpoint_url.empty()) {
+        options.set<gcs::RestEndpointOption>(config.gcs_endpoint_url);
+    }
+    // VGI_STORAGE_GCS_CREDENTIALS_FILE; otherwise Application Default
+    // Credentials (GOOGLE_APPLICATION_CREDENTIALS, workload identity, the
+    // metadata server).
+    if (!config.gcs_credentials_file.empty()) {
+        std::ifstream file(config.gcs_credentials_file);
+        if (!file) {
+            throw std::invalid_argument(
+                "cannot read the GCS credentials file named by "
+                "VGI_STORAGE_GCS_CREDENTIALS_FILE");
+        }
+        std::stringstream contents;
+        contents << file.rdbuf();
+        options.set<google::cloud::UnifiedCredentialsOption>(
+            google::cloud::MakeServiceAccountCredentials(contents.str()));
+    }
+    return gcs::Client(std::move(options));
 }
 
 class GcsExternalStorage final : public ExternalStorage, public ObjectStore {
@@ -761,7 +948,27 @@ public:
           ttl_(config.signed_url_ttl_seconds),
           signing_account_(config.signing_account),
           client_(make_gcs_client(config)),
-          config_(config) {}
+          config_(config) {
+        if (config.gcs_verify_at_startup) {
+            auto metadata = client_.GetBucketMetadata(bucket_);
+            if (!metadata) {
+                const auto& status = metadata.status();
+                std::string what = "GCS bucket '" + bucket_ + "' check failed";
+                if (status.code() == google::cloud::StatusCode::kNotFound) {
+                    what +=
+                        ": the bucket does not exist (create it, or fix VGI_STORAGE_GCS_BUCKET "
+                        "/ VGI_STORAGE_GCS_ENDPOINT)";
+                } else if (status.code() == google::cloud::StatusCode::kPermissionDenied) {
+                    what +=
+                        ": access denied (check the credentials and their storage.buckets.get "
+                        "and storage.objects.* permissions)";
+                } else {
+                    what += ": " + status.message();
+                }
+                throw std::runtime_error(what);
+            }
+        }
+    }
 
     std::string upload(const std::string& data, const std::string& content_encoding) override {
         namespace gcs = google::cloud::storage;

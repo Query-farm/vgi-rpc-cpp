@@ -119,6 +119,41 @@ struct ExternalStorageConfig {
     // 5xx are retried with capped exponential backoff (0.25 s doubling, at
     // most 5 s, jittered); a retry resends the whole body.
     int max_attempts = 3;
+    // S3 only.  The endpoint written into pre-signed URLs handed to clients,
+    // when the worker reaches storage through a different address than they
+    // do (Docker-internal http://minio:9000 vs https://s3.example.com).  The
+    // worker's own requests keep using endpoint_url.  Empty: endpoint_url.
+    std::string s3_public_endpoint_url;
+    // S3 only.  Explicit credentials (VGI_STORAGE_S3_ACCESS_KEY_ID / ...);
+    // empty: the SDK's default chain (env incl. AWS_SESSION_TOKEN, shared
+    // profile with role_arn/credential_process, web identity, SSO, container
+    // credentials, instance metadata), refreshed before expiry.
+    std::string s3_access_key_id;
+    std::string s3_secret_access_key;
+    std::string s3_session_token;
+    // S3 only.  When the explicit session token expires (Unix seconds; 0 =
+    // unknown, VGI_STORAGE_S3_SESSION_EXPIRES).  Caps pre-signed URL
+    // lifetimes like the default chain's own expiry does.
+    int64_t s3_session_expires_epoch = 0;
+    // S3 only.  "sha256" (default): upload grants sign x-amz-checksum-sha256
+    // and stored objects send it.  "none": for services that do not enforce
+    // it -- generate_upload_url refuses (the server issues no grants) and
+    // stored objects are verified by their reader instead.
+    std::string s3_checksum = "sha256";
+    // S3 only.  When to HEAD the bucket: never (the default for a storage
+    // built in code), on first use (`VGI_STORAGE_*` configuration), or when
+    // the storage is built (`VGI_STORAGE_S3_VERIFY=1`).  A missing bucket, a
+    // refusal or a wrong region fails with an actionable message.
+    enum class BucketCheck { Never, FirstUse, Startup };
+    BucketCheck s3_bucket_check = BucketCheck::Never;
+    // GCS only.  A custom endpoint (an emulator such as fake-gcs-server) and
+    // a service-account key file; empty: the library defaults and
+    // Application Default Credentials.
+    std::string gcs_endpoint_url;
+    std::string gcs_credentials_file;
+    // GCS only.  Check the bucket when the storage is built
+    // (VGI_STORAGE_GCS_VERIFY), failing with an actionable message.
+    bool gcs_verify_at_startup = false;
 };
 
 // Overrides the default stall timeout (whole seconds, at least 1).

@@ -421,6 +421,196 @@ def test_unknown_addressing_style_is_refused_at_startup(s3_capable_worker: str) 
 
 
 # ---------------------------------------------------------------------------
+# VGI_STORAGE_* (direct-storage contract v1), through --storage-from-env
+# ---------------------------------------------------------------------------
+
+
+@contextlib.contextmanager
+def _env_worker(monkeypatch: pytest.MonkeyPatch, env: dict[str, str]) -> Iterator[int]:
+    """A worker that takes its storage from VGI_STORAGE_* (configure_http_from_env)."""
+    for name in list(os.environ):
+        if name.startswith(("VGI_STORAGE_", "VGI_BLOB_VENDOR")):
+            monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("AWS_EC2_METADATA_DISABLED", "true")
+    monkeypatch.setenv("VGI_RPC_EXTERNALIZE_THRESHOLD_BYTES", "4096")
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    with spawn_http("--storage-from-env") as port:
+        yield port
+
+
+def _s3_env(endpoint: str, **extra: str) -> dict[str, str]:
+    return {
+        "VGI_STORAGE_S3_BUCKET": _BUCKET,
+        "VGI_STORAGE_S3_ENDPOINT": endpoint,
+        "VGI_STORAGE_S3_PREFIX": "env/",
+        "VGI_STORAGE_S3_ACCESS_KEY_ID": _ACCESS_KEY,
+        "VGI_STORAGE_S3_SECRET_ACCESS_KEY": _SECRET_KEY,
+        "VGI_STORAGE_S3_VERIFY": "1",
+        "VGI_STORAGE_ALLOW_PLAIN_HTTP": "1",
+        **extra,
+    }
+
+
+def _objects_under(s3_client: object, prefix: str) -> int:
+    response = s3_client.list_objects_v2(Bucket=_BUCKET, Prefix=prefix)  # type: ignore[attr-defined]
+    return int(response.get("KeyCount", 0))
+
+
+def _grant(port: int, payload: bytes) -> object:
+    import hashlib
+
+    from vgi_rpc.http import request_upload_urls
+
+    return request_upload_urls(
+        f"http://127.0.0.1:{port}", uploads=[(len(payload), hashlib.sha256(payload).hexdigest())]
+    )[0]
+
+
+def test_env_s3_results_land_under_prefix_rpc(
+    s3_endpoint: str, s3_client: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """VGI_STORAGE_S3_*: results externalize to <prefix>rpc/ and come back."""
+    before = _objects_under(s3_client, "env/rpc/")
+    big = "env-storage " * 4000
+    with _env_worker(monkeypatch, _s3_env(s3_endpoint)) as port, _connect(port) as proxy:
+        assert proxy.echo_large_string(value=big) == big
+    assert _objects_under(s3_client, "env/rpc/") > before
+
+
+def test_env_s3_grants_sign_the_checksum_header(
+    s3_endpoint: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A grant signs x-amz-checksum-sha256 as a header (never an unsigned query
+    parameter), so storage refuses a tampered body of the right length."""
+    from urllib.parse import parse_qs, urlsplit
+
+    import httpx2
+
+    from vgi_rpc.http import upload_put_headers
+
+    payload = b"direct storage grant " * 50
+    with _env_worker(monkeypatch, _s3_env(s3_endpoint)) as port:
+        grant = _grant(port, payload)
+    query = {k.lower(): v for k, v in parse_qs(urlsplit(grant.upload_url).query).items()}
+    assert "x-amz-checksum-sha256" in query["x-amz-signedheaders"][0].split(";")
+    assert "x-amz-checksum-sha256" not in query
+    tampered = bytes([payload[0] ^ 1]) + payload[1:]
+    bad = httpx2.put(grant.upload_url, content=tampered, headers=upload_put_headers(grant), timeout=30)
+    assert bad.status_code in (400, 403), bad.status_code
+    good = httpx2.put(grant.upload_url, content=payload, headers=upload_put_headers(grant), timeout=30)
+    assert good.status_code in (200, 204), good.text[:200]
+
+
+def test_env_s3_checksum_none_issues_no_grants(
+    s3_endpoint: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """VGI_STORAGE_S3_CHECKSUM=none: results still externalize; no upload grants."""
+    import httpx2
+
+    from vgi_rpc.http import http_capabilities
+
+    big = "checksum none " * 4000
+    with _env_worker(monkeypatch, _s3_env(s3_endpoint, VGI_STORAGE_S3_CHECKSUM="none")) as port:
+        caps = http_capabilities(f"http://127.0.0.1:{port}")
+        assert not caps.upload_url_support
+        head = httpx2.get(f"http://127.0.0.1:{port}/health", timeout=10)
+        assert "vgi-upload-url-support" not in {k.lower() for k in head.headers}
+        with _connect(port) as proxy:
+            assert proxy.echo_large_string(value=big) == big
+        with pytest.raises(Exception):  # noqa: B017, PT011 - 404: no grants here
+            _grant(port, b"refused")
+
+
+def test_env_s3_public_endpoint_signs_client_urls(
+    s3_endpoint: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """VGI_STORAGE_S3_PUBLIC_ENDPOINT goes into the URLs clients get; the worker
+    still talks to VGI_STORAGE_S3_ENDPOINT."""
+    from urllib.parse import urlsplit
+
+    import httpx2
+
+    from vgi_rpc.http import upload_put_headers
+
+    port_number = urlsplit(s3_endpoint).port
+    public = f"http://localhost:{port_number}"
+    payload = b"public endpoint grant"
+    env = _s3_env(s3_endpoint, VGI_STORAGE_S3_PUBLIC_ENDPOINT=public)
+    with _env_worker(monkeypatch, env) as port:
+        grant = _grant(port, payload)
+        big = "public endpoint " * 4000
+        with _connect(port) as proxy:
+            assert proxy.echo_large_string(value=big) == big
+    assert urlsplit(grant.upload_url).netloc == f"localhost:{port_number}"
+    put = httpx2.put(grant.upload_url, content=payload, headers=upload_put_headers(grant), timeout=30)
+    assert put.status_code in (200, 204), put.text[:200]
+
+
+def test_env_s3_session_token_credentials(
+    s3_endpoint: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Temporary credentials from STS AssumeRole (RustFS validates the token)."""
+    import boto3
+    from urllib.parse import parse_qs, urlsplit
+
+    sts = boto3.client(
+        "sts",
+        endpoint_url=s3_endpoint,
+        region_name="us-east-1",
+        aws_access_key_id=_ACCESS_KEY,
+        aws_secret_access_key=_SECRET_KEY,
+    )
+    try:
+        credentials = sts.assume_role(
+            RoleArn="arn:aws:iam::000000000000:role/vgi-test",
+            RoleSessionName="vgi-rpc-cpp",
+            DurationSeconds=3600,
+        )["Credentials"]
+    except Exception as exc:  # noqa: BLE001
+        _skip(f"the S3 server issues no STS session tokens ({type(exc).__name__})")
+    env = _s3_env(
+        s3_endpoint,
+        VGI_STORAGE_S3_ACCESS_KEY_ID=credentials["AccessKeyId"],
+        VGI_STORAGE_S3_SECRET_ACCESS_KEY=credentials["SecretAccessKey"],
+        VGI_STORAGE_S3_SESSION_TOKEN=credentials["SessionToken"],
+        VGI_STORAGE_S3_SESSION_EXPIRES=credentials["Expiration"].isoformat(),
+    )
+    payload = b"session token grant"
+    big = "session token " * 4000
+    with _env_worker(monkeypatch, env) as port:
+        with _connect(port) as proxy:
+            assert proxy.echo_large_string(value=big) == big
+        grant = _grant(port, payload)
+    query = {k.lower(): v for k, v in parse_qs(urlsplit(grant.upload_url).query).items()}
+    assert "x-amz-security-token" in query
+    assert int(query["x-amz-expires"][0]) <= 3600 - 60
+
+    # A token the server does not know fails the startup check, not a request.
+    env["VGI_STORAGE_S3_SESSION_TOKEN"] = "not-a-real-token"
+    with pytest.raises(RuntimeError):
+        with _env_worker(monkeypatch, env):
+            pass
+
+
+def test_env_s3_verify_reports_a_missing_bucket(s3_capable_worker: str, s3_endpoint: str) -> None:
+    env = {
+        **{k: v for k, v in os.environ.items() if not k.startswith(("VGI_STORAGE_", "VGI_BLOB_VENDOR"))},
+        **_s3_env(s3_endpoint, VGI_STORAGE_S3_BUCKET="no-such-bucket-vgi"),
+        "AWS_EC2_METADATA_DISABLED": "true",
+    }
+    proc = subprocess.run(
+        [s3_capable_worker, "--http", "--storage-from-env"],
+        capture_output=True,
+        timeout=60,
+        check=False,
+        env=env,
+    )
+    assert proc.returncode != 0
+    assert b"does not exist" in proc.stderr, proc.stderr[-400:]
+
+
+# ---------------------------------------------------------------------------
 # GCS
 # ---------------------------------------------------------------------------
 

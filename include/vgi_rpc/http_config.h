@@ -296,6 +296,14 @@ struct HttpConfig {
     // ExternalStorageConfig::s3_addressing_style.  Appended for positional
     // aggregate source compatibility.
     std::string external_storage_s3_addressing_style;
+
+    // False: never vend upload grants -- no `VGI-Upload-URL-Support` /
+    // `VGI-Max-Upload-Bytes`, and `__upload_url__` answers 404 -- while
+    // results still externalize and the object store still serves argument
+    // and StateRef objects.  For storage that does not enforce
+    // x-amz-checksum-sha256 (`VGI_STORAGE_S3_CHECKSUM=none`).  Appended for
+    // positional aggregate source compatibility.
+    bool upload_grants = true;
 };
 
 }  // namespace vgi_rpc

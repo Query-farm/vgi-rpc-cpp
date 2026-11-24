@@ -55,6 +55,8 @@ vgi_rpc_add_test(protocol_versions_test)
 if(NOT WIN32)
     # Slow-but-progressing storage transfers finish; stalls fail fast.
     vgi_rpc_add_test(storage_timeout_test)
+    # VGI_STORAGE_* parsing (direct-storage contract v1).
+    vgi_rpc_add_test(storage_env_test)
 endif()
 vgi_rpc_add_test(state_ref_test)
 target_link_libraries(external_ref_test PRIVATE zstd::libzstd)

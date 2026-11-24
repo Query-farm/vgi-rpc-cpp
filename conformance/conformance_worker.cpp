@@ -11,6 +11,7 @@
 #include "vgi_rpc/server.h"
 #include "vgi_rpc/stream.h"
 #include "vgi_rpc/token_identity.h"
+#include "vgi_rpc/vendor.h"
 #include "vgi_rpc/metadata.h"
 #include "vgi_rpc/wire.h"
 #include "vgi_rpc/arrow_utils.h"
@@ -28,6 +29,7 @@
 #include <cmath>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <iostream>
 #include <limits>
@@ -2029,6 +2031,7 @@ int main(int argc, char** argv) {
     http_cfg.test_drain_endpoint = true;
     bool sticky_echo = true;
     bool max_request_bytes_given = false;
+    bool storage_from_env = false;
     int64_t access_log_max_record_bytes = vgi_rpc::kDefaultMaxRecordBytes;
     if (const char* env = std::getenv("VGI_RPC_ACCESS_LOG_MAX_RECORD_BYTES")) {
         try {
@@ -2105,6 +2108,10 @@ int main(int argc, char** argv) {
             http_cfg.external_storage_region = take_value(i);
         } else if (arg == "--storage-endpoint") {
             http_cfg.external_storage_endpoint = take_value(i);
+        } else if (arg == "--storage-from-env") {
+            // configure_http_from_env: VGI_STORAGE_* / VGI_BLOB_VENDOR_URL
+            // (direct-storage contract v1), as a worker binary reads them.
+            storage_from_env = true;
         } else if (arg == "--storage-addressing-style") {
             http_cfg.external_storage_s3_addressing_style = take_value(i);
         } else if (arg == "--storage-signing-account") {
@@ -2226,6 +2233,15 @@ int main(int argc, char** argv) {
                     arg == "--access-log-backup-count") &&
                    i + 1 < argc) {
             ++i;  // rotation knobs: accepted so the harness can launch us
+        }
+    }
+
+    if (storage_from_env) {
+        try {
+            vgi_rpc::configure_http_from_env(http_cfg);
+        } catch (const std::exception& error) {
+            std::fprintf(stderr, "conformance_worker: %s\n", error.what());
+            return 2;
         }
     }
 

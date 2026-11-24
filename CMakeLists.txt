@@ -65,6 +65,7 @@ add_library(vgi_rpc
     src/errors.cpp
     src/external.cpp
     src/vendor.cpp
+    src/storage_env.cpp
     src/object_cache.cpp
     src/state_ref.cpp
     src/proxy_proof.cpp

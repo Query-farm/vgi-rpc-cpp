@@ -6,9 +6,11 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <iostream>
 #include <map>
+#include <optional>
 #include <random>
 #include <set>
 #include <stdexcept>
@@ -21,6 +23,7 @@
 #include "external_internal.h"
 #include "vgi_rpc/crypto.h"
 #include "vgi_rpc/http_config.h"
+#include "vgi_rpc/storage_env.h"
 
 namespace vgi_rpc {
 
@@ -214,6 +217,11 @@ struct HttpOutcome {
     std::string body;
     std::string content_encoding;
 };
+
+bool truthy_env(const char* name) {
+    const std::string value = lower(env(name));
+    return value == "1" || value == "true" || value == "yes" || value == "on";
+}
 
 int64_t positive_env(const char* name) {
     const std::string raw = env(name);
@@ -717,8 +725,20 @@ std::shared_ptr<VendorStorage> vendor_storage_from_env() {
 std::shared_ptr<VendorStorage> configure_http_from_env(HttpConfig& config) {
     const int64_t max_request = positive_env(vendor_env::MAX_REQUEST_BYTES);
     if (max_request > 0) config.max_request_bytes = max_request;
-    auto storage = vendor_storage_from_env();
-    if (!storage) return nullptr;
+    // Direct-storage contract v1 §1: vendor, s3, gcs or none.
+    const StorageBackend backend = storage_backend_from_env();
+    if (backend == StorageBackend::None) return nullptr;
+    std::shared_ptr<VendorStorage> storage;
+    std::optional<DirectStorageSettings> direct;
+    if (backend == StorageBackend::Vendor) {
+        storage = vendor_storage_from_env();
+        if (!storage) {
+            throw std::invalid_argument(std::string(storage_env::BACKEND) + "=vendor needs " +
+                                        vendor_env::BLOB_VENDOR_URL);
+        }
+    } else {
+        direct = direct_storage_settings_from_env();
+    }
 
     const int64_t threshold = positive_env(vendor_env::EXTERNALIZE_THRESHOLD_BYTES);
     const std::string compression = lower(env(vendor_env::EXTERNAL_COMPRESSION));
@@ -740,6 +760,39 @@ std::shared_ptr<VendorStorage> configure_http_from_env(HttpConfig& config) {
     }
     const int64_t max_fetch = fetch > 0 ? fetch : std::max(kDefaultMaxFetchBytes, upload);
 
+    if (direct) {
+        direct->config.max_fetch_bytes = max_fetch;
+        direct->config.url_validator = direct_storage_url_validator(*direct);
+        // Throws for a backend this build lacks (the s3 / gcs vcpkg
+        // features), and with VGI_STORAGE_S3_VERIFY=1 for a bucket it cannot
+        // use -- both before the server starts.
+        config.external_storage = make_external_storage(direct->config);
+        config.external_storage_url.clear();
+        config.externalize_threshold = threshold > 0 ? threshold : kDefaultThreshold;
+        config.externalize_compression = coding;
+        config.max_fetch_bytes = max_fetch;
+        config.max_upload_bytes = upload > 0 ? upload : max_fetch;
+        config.upload_grants = direct->upload_grants;
+        if (!config.external_url_validator)
+            config.external_url_validator = direct->config.url_validator;
+        std::fprintf(stderr, "vgi-rpc: direct storage: %s\n", direct->describe().c_str());
+        for (const auto& warning : direct->warnings) {
+            std::fprintf(stderr, "vgi-rpc: warning: %s\n", warning.c_str());
+        }
+        if (!direct->upload_grants) {
+            std::fprintf(stderr,
+                         "vgi-rpc: %s=none: no upload grants; large requests and argument "
+                         "references stay inline, results are still externalized\n",
+                         storage_env::S3_CHECKSUM);
+        }
+        if (truthy_env("VGI_ORCHARD_HOSTED")) {
+            std::fprintf(stderr,
+                         "vgi-rpc: Orchard hosted mode with direct %s storage (the operator's "
+                         "choice; hosted deployments normally use the blob vendor)\n",
+                         backend == StorageBackend::S3 ? "s3" : "gcs");
+        }
+        return nullptr;
+    }
     storage->set_max_fetch_bytes(max_fetch);
     config.external_storage = storage;
     config.external_storage_url.clear();
