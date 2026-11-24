@@ -235,7 +235,8 @@ std::optional<DirectStorageSettings> direct_storage_settings_from_env() {
         out.config.gcs_endpoint_url = url(GCS_ENDPOINT);
         out.config.gcs_credentials_file = get(GCS_CREDENTIALS_FILE);
         out.config.gcs_verify_at_startup = boolean(GCS_VERIFY, false);
-        signed_endpoint = out.config.gcs_endpoint_url;
+        // google-cloud-cpp signs V4 URLs for storage.googleapis.com whatever
+        // the API endpoint, so the endpoint never reaches a client URL.
     }
     if (!signed_endpoint.empty() && scheme_of(signed_endpoint) == "http" && !out.allow_plain_http) {
         throw std::invalid_argument(
@@ -291,9 +292,10 @@ std::function<void(const std::string&)> direct_storage_url_validator(
             }
         }
     } else {
-        hosts.push_back(settings.config.gcs_endpoint_url.empty()
-                            ? std::string("storage.googleapis.com")
-                            : authority_of(settings.config.gcs_endpoint_url));
+        // V4 signed URLs always name storage.googleapis.com (google-cloud-cpp
+        // has no path-style custom host); VGI_STORAGE_GCS_ENDPOINT moves only
+        // the worker's own API calls.
+        hosts.push_back("storage.googleapis.com");
     }
     const bool allow_http = settings.allow_plain_http;
     return [hosts, allow_http](const std::string& candidate) {

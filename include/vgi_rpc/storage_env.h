@@ -21,8 +21,9 @@
 /// (`sha256` | `none`), `_ACCESS_KEY_ID` / `_SECRET_ACCESS_KEY` /
 /// `_SESSION_TOKEN` (else the AWS default chain), `_SESSION_EXPIRES` (RFC 3339
 /// or epoch seconds; caps URL lifetimes for an explicit token), `_VERIFY`.
-/// GCS: `VGI_STORAGE_GCS_BUCKET`, `_PREFIX`, `_ENDPOINT`, `_CREDENTIALS_FILE`,
-/// `_VERIFY`.
+/// GCS: `VGI_STORAGE_GCS_BUCKET`, `_PREFIX`, `_ENDPOINT` (the worker's API
+/// calls only: V4 signed URLs always name storage.googleapis.com),
+/// `_CREDENTIALS_FILE`, `_VERIFY`.
 ///
 /// Objects go under `<prefix>rpc/` (results, upload grants, StateRef and
 /// argument objects).  With `_PUBLIC_ENDPOINT` the worker must still be able
