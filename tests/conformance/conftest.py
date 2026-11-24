@@ -202,6 +202,13 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
     for item in items:
         if item.cls is not None and item.cls.__name__ == "TestResourceSoak":
             item.add_marker(pytest.mark.timeout(120), append=False)
+        elif item.cls is not None and item.cls.__name__ == "TestClientNegotiation":
+            # Each test starts the reference's scripted wsgiref server (whose
+            # bind does a reverse lookup of 127.0.0.1 -- seconds on macOS
+            # runners) and spawns the negotiating-client binary. The module
+            # itself declares 30 s; the suite's blanket five seconds is what
+            # timed out on macOS (run 45468561036), not the client.
+            item.add_marker(pytest.mark.timeout(30), append=False)
         elif CONFORMANCE_ROLE == "client" and item.cls is not None and item.cls.__name__ == "TestLargeData":
             # Every multi-megabyte batch crosses the control channel twice more
             # than it otherwise would, base64 inside JSON in both directions.
