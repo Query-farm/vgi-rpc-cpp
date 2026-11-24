@@ -125,7 +125,9 @@ jobs:
         # pytest additionally drives the shared capability-gated suite in
         # vgi_rpc.conformance._pytest_suite, which the CLI runner cannot reach.
         run: |
-          git clone --depth 1 https://github.com/Query-farm/vgi-rpc-python.git ../vgi-rpc
+          # The reference's protocol-3.4 branch until its 3.4 patch release
+          # (protocol version negotiation) reaches main; then back to main.
+          git clone --depth 1 --branch protocol-3.4 https://github.com/Query-farm/vgi-rpc-python.git ../vgi-rpc
           python -m pip install --upgrade pip
           # No httpx2 pin: the reference now requires httpx2>=2.12 and handles
           # its Content-Encoding behaviour itself, so the old 2.9.1 pin is

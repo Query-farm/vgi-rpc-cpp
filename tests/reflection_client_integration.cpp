@@ -881,7 +881,18 @@ TEST_CASE("RpcClient negotiates the protocol version over a byte stream",
                                          std::to_string(server_mm.first) + "." +
                                          std::to_string(server_mm.second + 1);
         RpcClient client(ClientTransport::from_streams(input, output), options);
-        CHECK(string_result(client.call_unary("echo_string", string_params("n"))) == "n");
+        // A server released before negotiation (the reference at its released
+        // version) advertises nothing, so the first call goes out at the
+        // client's newest and is refused; the refusal names the server's one
+        // version, which the next call speaks (§6, legacy fallback).
+        std::optional<AnnotatedBatch> reply;
+        try {
+            reply = client.call_unary("echo_string", string_params("n"));
+        } catch (const RpcException& error) {
+            REQUIRE(is_version_refusal_kind(error.error_kind()));
+        }
+        if (!reply) reply = client.call_unary("echo_string", string_params("n"));
+        CHECK(string_result(*reply) == "n");
         client.close();
     }
     reap(pid);
@@ -909,8 +920,10 @@ TEST_CASE("RpcClient fails before sending once no protocol version is common",
             (void)client.call_unary("echo_string", string_params("x"));
             FAIL("a 99.0 client was accepted");
         } catch (const RpcException& error) {
-            CHECK(error.error_kind() == ERROR_KIND_PROTOCOL_VERSION_UNSUPPORTED);
-            CHECK(std::string(error.what()).find("too new") != std::string::npos);
+            // protocol_version_unsupported, or protocol_version_mismatch from
+            // a server released before negotiation.
+            CHECK(is_version_refusal_kind(error.error_kind()));
+            CHECK(std::string(error.what()).find("too old") != std::string::npos);
         }
         // ...and, having learned the server's window, fails before sending.
         const int64_t written_before = written.load();
