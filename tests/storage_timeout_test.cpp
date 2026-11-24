@@ -40,7 +40,9 @@ constexpr size_t kSlowPutBytes = 16 * 1024 * 1024;
 std::atomic<int> slow_get{0}, slow_put{0}, stall_get{0}, stall_put{0}, flaky{0};
 std::atomic<long> put_received{0};
 
-void sleep_ms(int ms) { std::this_thread::sleep_for(std::chrono::milliseconds(ms)); }
+void sleep_ms(int ms) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+}
 
 bool send_all(int fd, const char* data, size_t n) {
     while (n > 0) {
@@ -131,8 +133,8 @@ private:
                     "application/json");
         } else if (path == "/slow-get" || path == "/objects/slow-get") {
             ++slow_get;
-            const std::string line = "HTTP/1.1 200 OK\r\nContent-Length: " +
-                                     std::to_string(kSlowGetBytes) + "\r\n\r\n";
+            const std::string line =
+                "HTTP/1.1 200 OK\r\nContent-Length: " + std::to_string(kSlowGetBytes) + "\r\n\r\n";
             send_all(fd, line.data(), line.size());
             // 512 KiB in 8 KiB slices every 100 ms: about 6.4 s.
             const std::string chunk(kSlowGetBytes / 64, 'g');
@@ -163,8 +165,7 @@ private:
             respond(fd, "200 OK", "");
         } else if (path == "/stall-get") {
             ++stall_get;
-            const std::string line =
-                "HTTP/1.1 200 OK\r\nContent-Length: 1000000\r\n\r\npartial";
+            const std::string line = "HTTP/1.1 200 OK\r\nContent-Length: 1000000\r\n\r\npartial";
             send_all(fd, line.data(), line.size());
             char c;
             while (::recv(fd, &c, 1, 0) > 0) {
