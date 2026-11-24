@@ -41,6 +41,8 @@ concurrency:
   cancel-in-progress: true
 
 env:
+  # RustFS 1.0.0-beta.12 (glibc) for the S3 tests, as in vgi-rpc-java.
+  S3_TEST_IMAGE: ghcr.io/rustfs/rustfs@sha256:29c02251c085cb04edce556304a9ec0f8fba0c40300266cf4f3d953783fe2450
   # Build every vcpkg port with the CMake (and ninja) that vcpkg pins for
   # this baseline, not whatever the runner image ships. The macOS image moved
   # to CMake 4.5.0, which rejects boost-locale 1.90 at configure time
@@ -69,6 +71,13 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.13"
+
+      # RustFS stands in for S3: it validates SigV4, and its pinned image is
+      # pullable (minio/minio is "denied" now and dl.min.io answers 410, which
+      # once left every S3 test skipped while this lane stayed green). Pulled
+      # here so the fixture's readiness wait never includes the download.
+      - name: Pull RustFS
+        run: docker pull "$S3_TEST_IMAGE"
 
       - name: Install vgi-rpc Python reference and test tooling
         run: |
@@ -115,12 +124,21 @@ jobs:
       - name: Build
         run: cmake --build build --parallel
 
-      # Docker is preinstalled on the runner, so the S3 group drives MinIO;
-      # the GCS group needs nothing but openssl for a throwaway signing key.
+      # The S3 group drives RustFS under Docker; the GCS group needs
+      # nothing but openssl for a throwaway signing key.
+      # VGI_RPC_REQUIRE_CLOUD_TESTS turns every skip in the module into a
+      # failure; the summary line is checked too, so a skip added later
+      # without the helper still reds the lane.
       - name: Test (cloud storage backends)
         env:
           VGI_RPC_CPP_WORKER: ${{ github.workspace }}/build/conformance/conformance_worker
-        run: python -m pytest tests/conformance/test_cloud_storage.py -v -p no:randomly
+          VGI_RPC_REQUIRE_CLOUD_TESTS: "1"
+        run: |
+          set -o pipefail
+          python -m pytest tests/conformance/test_cloud_storage.py -v -rs -p no:randomly | tee cloud-tests.log
+          if grep -Eq "[0-9]+ skipped" cloud-tests.log; then
+            echo "::error::cloud storage tests were skipped"; exit 1
+          fi
 
       # A build with the backends on must still pass everything else — the
       # storage refactor runs through every externalisation path.

@@ -14,8 +14,15 @@ Two things must be present or the S3 group skips:
 
 * a worker built with the S3 backend (``VCPKG_MANIFEST_FEATURES=s3`` plus
   ``-DVGI_RPC_WITH_S3=ON``), which the default build is not;
-* an S3-compatible server — MinIO under Docker, or a `moto` server if
-  ``moto[server]`` happens to be installed.
+* an S3-compatible server: RustFS under Docker (pinned image, overridable
+  with ``S3_TEST_IMAGE``), a ``minio`` binary named by ``MINIO_BIN``, or a
+  `moto` server if ``moto[server]`` is installed.  RustFS validates SigV4,
+  so a pre-signed URL that is not bound to its signature fails here.
+
+With ``VGI_RPC_REQUIRE_CLOUD_TESTS=1`` (the cloud-storage CI lane) every one
+of those skips is a failure instead: the lane once stayed green for weeks
+with every S3 test skipped, after the minio/minio image stopped being
+pullable.
 
 The GCS group covers signing only, and says so. V4 signing is a local RSA
 operation over a canonical string, so a throwaway key verifies it completely
@@ -41,6 +48,20 @@ import pytest
 from conftest import spawn_http, worker_path
 
 _BUCKET = "vgi-rpc-conformance"
+_REQUIRED = os.environ.get("VGI_RPC_REQUIRE_CLOUD_TESTS") == "1"
+
+
+def _skip(reason: str) -> None:
+    """Skip, or fail when the lane requires every cloud test to run."""
+    if _REQUIRED:
+        pytest.fail(f"VGI_RPC_REQUIRE_CLOUD_TESTS=1 but: {reason}")
+    pytest.skip(reason)
+# RustFS 1.0.0-beta.12 (glibc), multi-architecture manifest; the image
+# vgi-rpc-java's storage lane uses.
+_RUSTFS_IMAGE = (
+    "ghcr.io/rustfs/rustfs"
+    "@sha256:29c02251c085cb04edce556304a9ec0f8fba0c40300266cf4f3d953783fe2450"
+)
 _ACCESS_KEY = "vgirpctest"
 _SECRET_KEY = "vgirpctestsecret"
 
@@ -79,32 +100,53 @@ def s3_capable_worker() -> str:
             proc.kill()
     stderr = proc.stderr.read() if proc.stderr else b""
     if b"requires a build with the 's3' vcpkg feature" in stderr:
-        pytest.skip("worker was built without the S3 backend")
-    pytest.skip(f"S3 probe worker exited unexpectedly: {stderr.decode()[:200]}")
+        _skip("worker was built without the S3 backend")
+    _skip(f"S3 probe worker exited unexpectedly: {stderr.decode()[:200]}")
 
 
 @pytest.fixture(scope="module")
-def s3_endpoint(s3_capable_worker: str) -> Iterator[str]:
+def s3_endpoint(
+    s3_capable_worker: str, tmp_path_factory: pytest.TempPathFactory
+) -> Iterator[str]:
     """A local S3-compatible server with the bucket created, yielding its URL."""
-    boto3 = pytest.importorskip("boto3", reason="boto3 is not installed")
+    try:
+        import boto3
+    except ImportError:
+        _skip("boto3 is not installed")
 
     port = _free_port()
     proc: subprocess.Popen[bytes] | None = None
     container = ""
+    minio = os.environ.get("MINIO_BIN")
 
-    if shutil.which("docker"):
-        container = f"vgi-rpc-minio-{port}"
+    if minio:
+        data = tmp_path_factory.mktemp("minio")
+        proc = subprocess.Popen(
+            [minio, "server", str(data), "--address", f"127.0.0.1:{port}",
+             "--console-address", f"127.0.0.1:{_free_port()}"],
+            env={**os.environ, "MINIO_ROOT_USER": _ACCESS_KEY,
+                 "MINIO_ROOT_PASSWORD": _SECRET_KEY},
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    elif shutil.which("docker"):
+        container = f"vgi-rpc-rustfs-{port}"
         proc = subprocess.Popen(
             ["docker", "run", "--rm", "--name", container,
              "-p", f"127.0.0.1:{port}:9000",
-             "-e", f"MINIO_ROOT_USER={_ACCESS_KEY}",
-             "-e", f"MINIO_ROOT_PASSWORD={_SECRET_KEY}",
-             "minio/minio:latest", "server", "/data"],
+             "-e", f"RUSTFS_ACCESS_KEY={_ACCESS_KEY}",
+             "-e", f"RUSTFS_SECRET_KEY={_SECRET_KEY}",
+             "-e", "RUSTFS_CONSOLE_ENABLE=false",
+             "-e", "RUSTFS_OBS_LOGGER_LEVEL=error",
+             os.environ.get("S3_TEST_IMAGE", _RUSTFS_IMAGE)],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
     else:
-        pytest.importorskip("flask", reason="neither Docker nor moto[server] is available")
+        try:
+            import flask  # noqa: F401
+        except ImportError:
+            _skip("no Docker, MINIO_BIN or moto[server] is available")
         proc = subprocess.Popen(
             [sys.executable, "-m", "moto.server", "-p", str(port), "-H", "127.0.0.1"],
             stdout=subprocess.DEVNULL,
@@ -120,7 +162,7 @@ def s3_endpoint(s3_capable_worker: str) -> Iterator[str]:
             aws_access_key_id=_ACCESS_KEY,
             aws_secret_access_key=_SECRET_KEY,
         )
-        deadline = time.monotonic() + 60
+        deadline = time.monotonic() + 120
         while True:
             try:
                 client.create_bucket(Bucket=_BUCKET)
@@ -129,7 +171,7 @@ def s3_endpoint(s3_capable_worker: str) -> Iterator[str]:
                 if "BucketAlreadyOwnedByYou" in str(exc):
                     break
                 if time.monotonic() > deadline:
-                    pytest.skip(f"no S3-compatible server became ready: {exc}")
+                    _skip(f"no S3-compatible server became ready: {exc}")
                 time.sleep(0.5)
         yield endpoint
     finally:
@@ -394,7 +436,7 @@ def gcs_service_account(tmp_path_factory: pytest.TempPathFactory) -> str:
 
     openssl = shutil.which("openssl")
     if not openssl:
-        pytest.skip("openssl is needed to generate a signing key")
+        _skip("openssl is needed to generate a signing key")
 
     tmp = tmp_path_factory.mktemp("gcs")
     pem = tmp / "key.pem"
@@ -428,7 +470,7 @@ def gcs_worker(gcs_service_account: str) -> Iterator[int]:
             # spawn_http would not have reached here.
             yield port
     except RuntimeError as exc:
-        pytest.skip(f"worker could not serve gs:// ({exc})")
+        _skip(f"worker could not serve gs:// ({exc})")
     finally:
         if saved_creds is None:
             os.environ.pop("GOOGLE_APPLICATION_CREDENTIALS", None)
