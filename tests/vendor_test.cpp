@@ -66,6 +66,13 @@ std::optional<std::string> fake_vendor() {
     return std::string(url);
 }
 
+// CI sets VGI_TEST_REQUIRE_FAKE_VENDOR=1 where it starts the fake vendor, so
+// a lost URL fails the lane instead of skipping every round trip.
+bool fake_vendor_required() {
+    const char* required = std::getenv("VGI_TEST_REQUIRE_FAKE_VENDOR");
+    return required && std::string(required) == "1";
+}
+
 std::string fake_token() {
     const char* token = std::getenv("VGI_TEST_FAKE_VENDOR_TOKEN");
     return token && *token ? token : "test-token";
@@ -195,6 +202,7 @@ TEST_CASE("configure_http_from_env with a vendor installs it and the caps", "[ve
 TEST_CASE("fake vendor: objects round-trip by id and a deleted one is missing",
           "[vendor][fake-vendor]") {
     const auto url = fake_vendor();
+    if (!url && fake_vendor_required()) FAIL("VGI_TEST_FAKE_VENDOR_URL is not set");
     if (!url) SKIP("VGI_TEST_FAKE_VENDOR_URL is not set");
     VendorStorage storage(*url, fake_token());
 
@@ -216,6 +224,7 @@ TEST_CASE("fake vendor: objects round-trip by id and a deleted one is missing",
 TEST_CASE("fake vendor: results upload and inbound pointers fetch through the pin",
           "[vendor][fake-vendor]") {
     const auto url = fake_vendor();
+    if (!url && fake_vendor_required()) FAIL("VGI_TEST_FAKE_VENDOR_URL is not set");
     if (!url) SKIP("VGI_TEST_FAKE_VENDOR_URL is not set");
     VendorStorage storage(*url, fake_token());
 
@@ -230,6 +239,7 @@ TEST_CASE("fake vendor: results upload and inbound pointers fetch through the pi
 TEST_CASE("fake vendor: a client upload grant is signed for exactly its bytes",
           "[vendor][fake-vendor]") {
     const auto url = fake_vendor();
+    if (!url && fake_vendor_required()) FAIL("VGI_TEST_FAKE_VENDOR_URL is not set");
     if (!url) SKIP("VGI_TEST_FAKE_VENDOR_URL is not set");
     VendorStorage storage(*url, fake_token());
 

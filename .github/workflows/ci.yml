@@ -196,6 +196,27 @@ jobs:
       - name: Test (unit)
         run: ctest --test-dir build --output-on-failure -E conformance
 
+      # The blob-vendor round trips in vendor_test skip without a vendor; this
+      # step starts vgi-rpc-python's fake vendor and requires them to run.
+      - name: Test (blob vendor client vs the fake vendor)
+        if: matrix.conformance
+        run: |
+          log="$RUNNER_TEMP/fake-vendor.log"
+          vgi-rpc-fake-vendor --test-routes --token "test-token=tenant-a" > "$log" 2>&1 &
+          pid=$!
+          url=""
+          for _ in $(seq 1 120); do
+            url="$(sed -n 's/^URL://p' "$log" | head -1)"
+            [ -n "$url" ] && break
+            sleep 0.5
+          done
+          [ -n "$url" ] || { echo "::error::fake vendor did not start"; cat "$log"; kill "$pid"; exit 1; }
+          rc=0
+          VGI_TEST_FAKE_VENDOR_URL="$url" VGI_TEST_REQUIRE_FAKE_VENDOR=1 \
+            ./build/tests/vendor_test "[fake-vendor]" || rc=$?
+          kill "$pid" || true
+          exit "$rc"
+
       # Cross-port drift. Everything above establishes that this port agrees
       # with itself and with the spec as this repository reads it; nothing
       # above compares it to another implementation. These two tools do, and
