@@ -319,6 +319,65 @@ def test_grant_object_id_resolves_through_s3(s3_worker: int, s3_client: object) 
     assert raised.value.error_kind == "arguments_ref_missing"
 
 
+def _upload_url_for(port: int) -> str:
+    import hashlib
+
+    from vgi_rpc.http import request_upload_urls
+
+    payload = b"addressing style probe"
+    urls = request_upload_urls(
+        f"http://127.0.0.1:{port}", uploads=[(len(payload), hashlib.sha256(payload).hexdigest())]
+    )
+    return urls[0].upload_url
+
+
+def test_custom_endpoint_presigns_path_style_by_default(s3_worker: int, s3_endpoint: str) -> None:
+    """MinIO and Ceph need path-style URLs on the configured endpoint's host."""
+    from urllib.parse import urlsplit
+
+    url = urlsplit(_upload_url_for(s3_worker))
+    assert f"{url.scheme}://{url.netloc}" == s3_endpoint
+    assert url.path.startswith(f"/{_BUCKET}/")
+
+
+def test_addressing_style_virtual_presigns_the_bucket_host(
+    s3_endpoint: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``virtual`` puts the bucket in the host (Wasabi, R2 and AWS accept it).
+
+    Pre-signing is local, so only the URL is checked: ``<bucket>.localhost``
+    need not resolve.
+    """
+    from urllib.parse import urlsplit
+
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", _ACCESS_KEY)
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", _SECRET_KEY)
+    monkeypatch.setenv("AWS_EC2_METADATA_DISABLED", "true")
+
+    port = urlsplit(s3_endpoint).port
+    with spawn_http(
+        "--external-storage", f"s3://{_BUCKET}/vgi-rpc",
+        "--storage-endpoint", f"http://localhost:{port}",
+        "--storage-region", "auto",
+        "--storage-addressing-style", "virtual",
+    ) as worker:
+        url = urlsplit(_upload_url_for(worker))
+    assert url.netloc == f"{_BUCKET}.localhost:{port}"
+    assert not url.path.startswith(f"/{_BUCKET}/")
+
+
+def test_unknown_addressing_style_is_refused_at_startup(s3_capable_worker: str) -> None:
+    proc = subprocess.run(
+        [s3_capable_worker, "--http", "--external-storage", f"s3://{_BUCKET}/p",
+         "--storage-endpoint", "http://127.0.0.1:1", "--storage-addressing-style", "dns"],
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
+    assert proc.returncode != 0
+    assert b"s3_addressing_style" in proc.stderr
+
+
 # ---------------------------------------------------------------------------
 # GCS
 # ---------------------------------------------------------------------------

@@ -14,6 +14,7 @@
 
 #include "vgi_rpc/annotated_batch.h"
 #include "vgi_rpc/export.h"
+#include "vgi_rpc/external.h"
 
 namespace vgi_rpc {
 
@@ -32,9 +33,12 @@ struct ClientExternalHttpOptions {
     int64_t max_decoded_bytes = 4LL * 1024 * 1024 * 1024;
     int64_t max_upload_bytes = 256LL * 1024 * 1024;
     int64_t max_upload_response_bytes = 64LL * 1024;
-    std::chrono::milliseconds connect_timeout{10000};
-    std::chrono::milliseconds read_timeout{60000};
-    std::chrono::milliseconds write_timeout{60000};
+    // Each bounds one socket read or write (a stall), never the whole
+    // transfer.  The read/write defaults follow
+    // VGI_RPC_STORAGE_STALL_TIMEOUT_SECONDS (else 30 s).
+    std::chrono::milliseconds connect_timeout{30000};
+    std::chrono::milliseconds read_timeout{std::chrono::seconds(storage_stall_timeout_seconds())};
+    std::chrono::milliseconds write_timeout{std::chrono::seconds(storage_stall_timeout_seconds())};
 };
 
 class VGI_RPC_EXPORT ExternalHttpError : public std::runtime_error {

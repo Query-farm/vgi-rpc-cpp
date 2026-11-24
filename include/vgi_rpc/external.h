@@ -89,8 +89,14 @@ struct ExternalStorageConfig {
     int signed_url_ttl_seconds = 3600;
     // S3 only.  Empty means the SDK's own resolution (env, profile, IMDS).
     std::string region;
-    // S3 only.  Set for an S3-compatible service such as MinIO or LocalStack.
+    // S3 only.  Set for an S3-compatible service such as MinIO, Ceph, Wasabi,
+    // Backblaze B2, LocalStack or Cloudflare R2 (region "auto").  http:// is
+    // accepted.  Pre-signed URLs carry this host.
     std::string endpoint_url;
+    // S3 only.  "path" (https://endpoint/bucket/key) or "virtual"
+    // (https://bucket.endpoint/key).  Empty: path with endpoint_url (MinIO and
+    // Ceph need it; R2 accepts both), virtual for AWS.
+    std::string s3_addressing_style;
     // GCS only.  The service account whose key signs URLs.  Normally derived
     // from the ambient credentials; naming it is required when they do not
     // carry a signing email — under impersonation, or against an emulator.
@@ -102,7 +108,26 @@ struct ExternalStorageConfig {
     int64_t max_decompressed_bytes = 4LL * 1024 * 1024 * 1024;
     int max_redirects = 5;
     std::function<void(const std::string&)> url_validator;
+    // Storage HTTP timeouts.  A request fails only when no bytes move for
+    // `stall_timeout_seconds` (each socket read or write, and the S3/GCS
+    // SDKs' low-speed checks); there is no whole-request deadline, so a slow
+    // transfer that keeps progressing is never cut off.  Zero means
+    // VGI_RPC_STORAGE_STALL_TIMEOUT_SECONDS, else 30.
+    int stall_timeout_seconds = 0;
+    int connect_timeout_seconds = 30;
+    // Attempts per storage request.  Connect errors, resets, stalls, 429 and
+    // 5xx are retried with capped exponential backoff (0.25 s doubling, at
+    // most 5 s, jittered); a retry resends the whole body.
+    int max_attempts = 3;
 };
+
+// Overrides the default stall timeout (whole seconds, at least 1).
+inline constexpr const char* STORAGE_STALL_TIMEOUT_ENV = "VGI_RPC_STORAGE_STALL_TIMEOUT_SECONDS";
+// VGI_RPC_STORAGE_STALL_TIMEOUT_SECONDS, or 30 when unset or malformed.
+VGI_RPC_EXPORT int storage_stall_timeout_seconds();
+// Sleep before retry `attempt` (>= 1): 0.25 s doubling, capped at 5 s,
+// jittered to [0.5, 1.0) of that.
+VGI_RPC_EXPORT void storage_retry_backoff(int attempt);
 
 // One object store.  Uploaded objects persist: configure a lifecycle rule on
 // the bucket to expire them, because nothing here deletes them.

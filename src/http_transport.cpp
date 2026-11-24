@@ -967,6 +967,7 @@ public:
             storage_config.signed_url_ttl_seconds = cfg.signed_url_ttl_seconds;
             storage_config.region = cfg.external_storage_region;
             storage_config.endpoint_url = cfg.external_storage_endpoint;
+            storage_config.s3_addressing_style = cfg.external_storage_s3_addressing_style;
             storage_config.signing_account = cfg.external_storage_signing_account;
             storage_config.max_fetch_bytes = cfg_.max_fetch_bytes;
             storage_config.max_decompressed_bytes = cfg.max_decompressed_fetch_bytes;

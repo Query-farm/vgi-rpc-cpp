@@ -314,11 +314,21 @@ struct VendorStorage::Impl {
     std::function<void(const std::string&)> pin;
     std::chrono::steady_clock::time_point pin_fetched_at;
 
-    httplib::Client client_for(const std::string& origin) const {
+    // cpp-httplib's read/write timeouts bound each socket operation, not the
+    // request: a stall timeout.  Signed-URL transfers (`storage`) use the
+    // storage stall timeout and no whole-request deadline, so a slow transfer
+    // that keeps moving is never cut off; the vendor's small JSON calls use
+    // timeout_seconds.
+    httplib::Client client_for(const std::string& origin, bool storage) const {
         httplib::Client client(origin);
-        client.set_connection_timeout(std::min(options.timeout_seconds, 10), 0);
-        client.set_read_timeout(options.timeout_seconds, 0);
-        client.set_write_timeout(options.timeout_seconds, 0);
+        const int idle = storage
+                             ? (options.stall_timeout_seconds > 0 ? options.stall_timeout_seconds
+                                                                  : storage_stall_timeout_seconds())
+                             : options.timeout_seconds;
+        client.set_connection_timeout(
+            options.connect_timeout_seconds > 0 ? options.connect_timeout_seconds : 30, 0);
+        client.set_read_timeout(idle, 0);
+        client.set_write_timeout(idle, 0);
         // A redirect could carry the token or a signed URL somewhere unvetted.
         client.set_follow_location(false);
         client.set_decompress(false);
@@ -341,7 +351,7 @@ struct VendorStorage::Impl {
                     static_cast<int>(delay * (0.5 + std::uniform_real_distribution<>(0, 0.5)(rng)));
                 std::this_thread::sleep_for(std::chrono::milliseconds(delay));
             }
-            auto client = client_for(origin);
+            auto client = client_for(origin, op == "upload" || op == "download");
             HttpOutcome outcome;
             bool over_cap = false;
             httplib::Result res{nullptr, httplib::Error::Unknown};

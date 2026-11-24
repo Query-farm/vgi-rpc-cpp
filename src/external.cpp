@@ -21,9 +21,13 @@
 #include <array>
 #include <algorithm>
 #include <cctype>
+#include <cerrno>
 #include <chrono>
+#include <cstdlib>
 #include <memory>
+#include <random>
 #include <stdexcept>
+#include <thread>
 #include <utility>
 
 #ifdef VGI_RPC_WITH_S3
@@ -45,6 +49,24 @@
 #endif
 
 namespace vgi_rpc {
+
+int storage_stall_timeout_seconds() {
+    const char* text = std::getenv(STORAGE_STALL_TIMEOUT_ENV);
+    if (text == nullptr || *text == '\0' || *text == '-') return 30;
+    char* end = nullptr;
+    errno = 0;
+    const unsigned long value = std::strtoul(text, &end, 10);
+    if (errno != 0 || *end != '\0' || value < 1 || value > 86400) return 30;
+    return static_cast<int>(value);
+}
+
+void storage_retry_backoff(int attempt) {
+    if (attempt < 1) return;
+    static thread_local std::mt19937 rng{std::random_device{}()};
+    double delay = 0.25 * static_cast<double>(1 << std::min(attempt - 1, 5));
+    delay = std::min(delay, 5.0) * (0.5 + std::uniform_real_distribution<>(0, 0.5)(rng));
+    std::this_thread::sleep_for(std::chrono::milliseconds(static_cast<int>(delay * 1000)));
+}
 
 // Shared with the blob-vendor backend (src/vendor.cpp): src/external_internal.h.
 namespace external_internal {
@@ -109,14 +131,35 @@ std::pair<std::string, std::string> split_url(const std::string& url) {
 // Accept-Encoding of its own, so each request below names exactly what this
 // backend decodes: a storage server free to compress would otherwise answer
 // `/alloc` in a codec nothing here can read.
-httplib::Client make_client(const std::string& origin) {
+//
+// cpp-httplib's read and write timeouts bound each socket operation (and
+// SO_RCVTIMEO/SO_SNDTIMEO each syscall, under TLS too), not the request, so
+// they are stall timeouts: a slow transfer that keeps moving never hits them.
+// No set_max_timeout: a whole-request deadline would cut such a transfer off.
+int stall_seconds(const ExternalStorageConfig& config) {
+    return config.stall_timeout_seconds > 0 ? config.stall_timeout_seconds
+                                            : storage_stall_timeout_seconds();
+}
+
+httplib::Client make_client(const std::string& origin, const ExternalStorageConfig& config) {
     httplib::Client client(origin);
-    client.set_connection_timeout(10, 0);
-    client.set_read_timeout(60, 0);
-    client.set_write_timeout(60, 0);
+    const int stall = stall_seconds(config);
+    client.set_connection_timeout(
+        config.connect_timeout_seconds > 0 ? config.connect_timeout_seconds : 30, 0);
+    client.set_read_timeout(stall, 0);
+    client.set_write_timeout(stall, 0);
     client.set_follow_location(false);
     client.set_decompress(false);
     return client;
+}
+
+// Connect errors, resets, stalls, 429 and 5xx: worth another attempt.
+bool transient(const httplib::Result& res) {
+    return !res || res->status == 429 || res->status >= 500;
+}
+
+int attempts(const ExternalStorageConfig& config) {
+    return config.max_attempts > 0 ? config.max_attempts : 3;
 }
 
 // A response coded in something other than what the request accepted.  Raised
@@ -269,12 +312,16 @@ public:
     std::string upload(const std::string& data, const std::string& content_encoding) override {
         const UploadUrl urls = allocate(content_encoding);
         auto [origin, path] = split_url(urls.upload_url);
-        auto client = make_client(origin);
+        auto client = make_client(origin, config_);
 
         httplib::Headers headers{{"Accept-Encoding", "identity"}};
         if (!content_encoding.empty()) headers.emplace("Content-Encoding", content_encoding);
 
         auto res = client.Put(path, headers, data, "application/octet-stream");
+        for (int attempt = 1; transient(res) && attempt < attempts(config_); ++attempt) {
+            storage_retry_backoff(attempt);
+            res = client.Put(path, headers, data, "application/octet-stream");
+        }
         if (!res || (res->status != 204 && res->status != 200)) {
             throw std::runtime_error(
                 "external storage upload failed: " +
@@ -302,7 +349,7 @@ public:
             throw std::runtime_error("external storage alloc returned no object_id");
         }
         auto [origin, path] = split_url(urls.upload_url);
-        auto client = make_client(origin);
+        auto client = make_client(origin, config_);
         httplib::Headers headers{{"Accept-Encoding", "identity"}};
         std::string content_type = "application/octet-stream";
         for (const auto& [name, value] : urls.headers) {
@@ -317,6 +364,10 @@ public:
             headers.emplace(name, value);
         }
         auto res = client.Put(path, headers, data, content_type);
+        for (int attempt = 1; transient(res) && attempt < attempts(config_); ++attempt) {
+            storage_retry_backoff(attempt);
+            res = client.Put(path, headers, data, content_type);
+        }
         if (!res || (res->status != 204 && res->status != 200)) {
             throw std::runtime_error(
                 "external storage object upload failed: " +
@@ -351,33 +402,43 @@ public:
             }
 
             auto [origin, path] = split_url(current);
-            auto client = make_client(origin);
+            auto client = make_client(origin, config_);
             std::string body;
             std::string location;
             std::string content_encoding;
             int response_status = 0;
             bool cap_exceeded = false;
-            // zstd is decoded below; a stored object may carry it whatever the
-            // request said, so say so rather than leave the server guessing.
-            auto res = client.Get(
-                path,
-                httplib::Headers{{"Accept-Encoding", object_get ? "identity" : "zstd, identity"}},
-                [&](const httplib::Response& response) {
-                    response_status = response.status;
-                    location = response.get_header_value("Location");
-                    content_encoding = response.get_header_value("Content-Encoding");
-                    return true;
-                },
-                [&](const char* data, size_t length) {
-                    if (is_redirect(response_status)) return true;
-                    if (length > static_cast<size_t>(max_fetch) ||
-                        body.size() > static_cast<size_t>(max_fetch) - length) {
-                        cap_exceeded = true;
-                        return false;
-                    }
-                    body.append(data, length);
-                    return true;
-                });
+            httplib::Result res{nullptr, httplib::Error::Unknown};
+            for (int attempt = 0; attempt < attempts(config_); ++attempt) {
+                if (attempt > 0) storage_retry_backoff(attempt);
+                body.clear();
+                location.clear();
+                content_encoding.clear();
+                response_status = 0;
+                // zstd is decoded below; a stored object may carry it whatever the
+                // request said, so say so rather than leave the server guessing.
+                res = client.Get(
+                    path,
+                    httplib::Headers{
+                        {"Accept-Encoding", object_get ? "identity" : "zstd, identity"}},
+                    [&](const httplib::Response& response) {
+                        response_status = response.status;
+                        location = response.get_header_value("Location");
+                        content_encoding = response.get_header_value("Content-Encoding");
+                        return true;
+                    },
+                    [&](const char* data, size_t length) {
+                        if (is_redirect(response_status)) return true;
+                        if (length > static_cast<size_t>(max_fetch) ||
+                            body.size() > static_cast<size_t>(max_fetch) - length) {
+                            cap_exceeded = true;
+                            return false;
+                        }
+                        body.append(data, length);
+                        return true;
+                    });
+                if (cap_exceeded || !transient(res)) break;
+            }
 
             if (cap_exceeded) {
                 throw std::runtime_error("external location exceeds max_fetch_bytes (" +
@@ -456,7 +517,7 @@ private:
 
     UploadUrl allocate(const nlohmann::json& body) {
         auto [origin, _] = split_url(base_url_);
-        auto client = make_client(origin);
+        auto client = make_client(origin, config_);
 
         auto res = client.Post("/alloc", httplib::Headers{{"Accept-Encoding", "identity"}},
                                body.dump(), "application/json");
@@ -529,16 +590,43 @@ public:
         ensure_aws_initialized();
         Aws::Client::ClientConfiguration client_config;
         if (!config.region.empty()) client_config.region = config.region;
+        // Connect, then a stall timeout: for the curl client requestTimeoutMs
+        // is CURLOPT_LOW_SPEED_TIME (below lowSpeedLimit = 1 byte/s for that
+        // long), and httpRequestTimeoutMs = 0 leaves no whole-request deadline.
+        // The SDK's own retry strategy handles transient failures.
+        client_config.connectTimeoutMs =
+            1000L * (config.connect_timeout_seconds > 0 ? config.connect_timeout_seconds : 30);
+        client_config.requestTimeoutMs = 1000L * stall_seconds(config);
+        client_config.httpRequestTimeoutMs = 0;
+        client_config.lowSpeedLimit = 1;
+        if (!config.s3_addressing_style.empty() && config.s3_addressing_style != "path" &&
+            config.s3_addressing_style != "virtual") {
+            throw std::invalid_argument("s3_addressing_style must be \"path\" or \"virtual\"");
+        }
         if (!config.endpoint_url.empty()) {
             client_config.endpointOverride = config.endpoint_url;
-            // An S3-compatible service is usually addressed by path rather
-            // than by a virtual host, which has no DNS entry locally.
-            client_ = std::make_unique<Aws::S3::S3Client>(
-                client_config, Aws::Client::AWSAuthV4Signer::PayloadSigningPolicy::Never,
-                /*useVirtualAddressing=*/false);
-        } else {
-            client_ = std::make_unique<Aws::S3::S3Client>(client_config);
+            // Many S3-compatible services reject the SDK's default flexible
+            // checksums (an aws-chunked body with a CRC trailer).  Send them
+            // only where an operation requires them -- this backend names
+            // SHA-256 itself wherever it wants storage to verify -- unless the
+            // operator chose otherwise in the environment.
+            if (std::getenv("AWS_REQUEST_CHECKSUM_CALCULATION") == nullptr) {
+                client_config.checksumConfig.requestChecksumCalculation =
+                    Aws::Client::RequestChecksumCalculation::WHEN_REQUIRED;
+            }
+            if (std::getenv("AWS_RESPONSE_CHECKSUM_VALIDATION") == nullptr) {
+                client_config.checksumConfig.responseChecksumValidation =
+                    Aws::Client::ResponseChecksumValidation::WHEN_REQUIRED;
+            }
         }
+        // An S3-compatible service is usually addressed by path rather than
+        // by a virtual host, which has no DNS entry locally.
+        const bool virtual_addressing = config.s3_addressing_style.empty()
+                                            ? config.endpoint_url.empty()
+                                            : config.s3_addressing_style == "virtual";
+        client_ = std::make_unique<Aws::S3::S3Client>(
+            client_config, Aws::Client::AWSAuthV4Signer::PayloadSigningPolicy::Never,
+            virtual_addressing);
     }
 
     std::string upload(const std::string& data, const std::string& content_encoding) override {
@@ -652,6 +740,19 @@ private:
 
 #ifdef VGI_RPC_WITH_GCS
 
+// A stall timeout on uploads and downloads (below one byte per second for
+// that long), not a whole-transfer deadline; the library's retry policy
+// handles transient failures.
+google::cloud::storage::Client make_gcs_client(const ExternalStorageConfig& config) {
+    namespace gcs = google::cloud::storage;
+    const auto stall = std::chrono::seconds(stall_seconds(config));
+    return gcs::Client(google::cloud::Options{}
+                           .set<gcs::TransferStallTimeoutOption>(stall)
+                           .set<gcs::TransferStallMinimumRateOption>(1)
+                           .set<gcs::DownloadStallTimeoutOption>(stall)
+                           .set<gcs::DownloadStallMinimumRateOption>(1));
+}
+
 class GcsExternalStorage final : public ExternalStorage, public ObjectStore {
 public:
     GcsExternalStorage(std::string bucket, std::string prefix, const ExternalStorageConfig& config)
@@ -659,7 +760,7 @@ public:
           prefix_(std::move(prefix)),
           ttl_(config.signed_url_ttl_seconds),
           signing_account_(config.signing_account),
-          client_(google::cloud::storage::Client()),
+          client_(make_gcs_client(config)),
           config_(config) {}
 
     std::string upload(const std::string& data, const std::string& content_encoding) override {

@@ -290,6 +290,12 @@ struct HttpConfig {
     // `external_storage_url`, which must then be empty.  Appended for
     // positional aggregate source compatibility.
     std::shared_ptr<ExternalStorage> external_storage;
+
+    // S3 only: "path", "virtual", or empty for the default (path with
+    // external_storage_endpoint, virtual for AWS); see
+    // ExternalStorageConfig::s3_addressing_style.  Appended for positional
+    // aggregate source compatibility.
+    std::string external_storage_s3_addressing_style;
 };
 
 }  // namespace vgi_rpc

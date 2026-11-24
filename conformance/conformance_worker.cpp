@@ -2105,6 +2105,8 @@ int main(int argc, char** argv) {
             http_cfg.external_storage_region = take_value(i);
         } else if (arg == "--storage-endpoint") {
             http_cfg.external_storage_endpoint = take_value(i);
+        } else if (arg == "--storage-addressing-style") {
+            http_cfg.external_storage_s3_addressing_style = take_value(i);
         } else if (arg == "--storage-signing-account") {
             http_cfg.external_storage_signing_account = take_value(i);
         } else if (arg == "--signed-url-ttl") {
@@ -2246,6 +2248,8 @@ int main(int argc, char** argv) {
         published->storage_config.signed_url_ttl_seconds = http_cfg.signed_url_ttl_seconds;
         published->storage_config.region = http_cfg.external_storage_region;
         published->storage_config.endpoint_url = http_cfg.external_storage_endpoint;
+        published->storage_config.s3_addressing_style =
+            http_cfg.external_storage_s3_addressing_style;
         published->storage_config.signing_account = http_cfg.external_storage_signing_account;
         published->compression = http_cfg.externalize_compression;
     }

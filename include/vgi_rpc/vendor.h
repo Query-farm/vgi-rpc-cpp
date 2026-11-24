@@ -83,7 +83,14 @@ private:
 
 /// Tuning for a vendor client.  The defaults match the other ports.
 struct VendorOptions {
+    /// Idle timeout of the vendor's own JSON calls (/v1/info, grants).
     int timeout_seconds = 30;
+    /// Signed-URL PUT/GET stall timeout: fails only when no bytes move for
+    /// this long; no whole-request deadline.  Zero means
+    /// VGI_RPC_STORAGE_STALL_TIMEOUT_SECONDS, else 30.
+    int stall_timeout_seconds = 0;
+    /// TCP + TLS connect timeout of every request.
+    int connect_timeout_seconds = 30;
     /// Transport errors, 429 and 5xx are retried with exponential backoff.
     int max_attempts = 3;
     int backoff_ms = 250;
