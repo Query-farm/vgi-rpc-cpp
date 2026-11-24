@@ -173,6 +173,26 @@ def _python_http_argv(extra_args: tuple[str, ...]) -> list[str]:
     return argv
 
 
+_real_getfqdn = socket.getfqdn
+
+
+def _loopback_getfqdn(name: str = "") -> str:
+    """``socket.getfqdn`` without a reverse lookup for loopback addresses.
+
+    ``http.server.HTTPServer.server_bind`` calls ``getfqdn(host)``, so every
+    wsgiref server the shared suite starts on ``127.0.0.1`` (the scripted
+    reference server of ``TestClientNegotiation``) waits for a PTR lookup of
+    127.0.0.1 -- which on macOS runners stalled past 30 s (run 45473573846).
+    The answer is only ever used as a display name.
+    """
+    if name in ("127.0.0.1", "::1", "localhost"):
+        return "localhost"
+    return _real_getfqdn(name)
+
+
+socket.getfqdn = _loopback_getfqdn
+
+
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
     """Scope the run to its role, then bound the heavier topologies' timeouts.
 
